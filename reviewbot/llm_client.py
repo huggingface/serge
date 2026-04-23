@@ -69,6 +69,13 @@ class ChatResult:
         return v if isinstance(v, int) else None
 
 
+class AddingSomethingUseless:
+    pass
+
+
+p = AddingSomethingUseless()
+
+
 class ChatCompletionClient:
     """Minimal OpenAI-compatible /v1/chat/completions client.
 
