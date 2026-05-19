@@ -1,12 +1,16 @@
 import unittest
 
+from reviewbot.llm_client import ChatResult, ToolCall
 from reviewbot.patch import parse_patch
+from reviewbot.tools import ToolEnv
 from reviewbot.reviewer import (
+    _UnparseableLLMOutput,
     _build_annotated_diff_chunks,
     _content_preview,
     _extract_json,
     _merge_chunk_event,
     _merge_chunk_summaries,
+    _run_agentic_loop,
     _summarize_rejected_comments,
 )
 
@@ -114,6 +118,30 @@ class ContentPreviewTests(unittest.TestCase):
         self.assertIn("+900 chars truncated", out)
 
 
+class UnparseableLLMOutputTests(unittest.TestCase):
+    def test_length_finish_reason_gets_actionable_message(self) -> None:
+        exc = _UnparseableLLMOutput(
+            content='{"summary":',
+            finish_reason="length",
+            metrics_line="56 LLM turns · 62 tool calls",
+        )
+
+        msg = exc.user_message()
+        self.assertIn("truncated", msg)
+        self.assertIn("finish_reason=length", msg)
+        self.assertIn("Increase LLM_MAX_TOKENS", msg)
+        self.assertIn("reduce TOOL_MAX_ITERATIONS", msg)
+
+    def test_other_finish_reason_keeps_generic_message(self) -> None:
+        exc = _UnparseableLLMOutput(
+            content="oops",
+            finish_reason="stop",
+            metrics_line="1 LLM turn",
+        )
+
+        self.assertIn("unparseable output", exc.user_message())
+
+
 class DiffChunkingTests(unittest.TestCase):
     def test_large_single_file_is_split_without_losing_positions(self) -> None:
         patch = "@@ -0,0 +1,18 @@\n" + "\n".join(
@@ -121,7 +149,9 @@ class DiffChunkingTests(unittest.TestCase):
         )
         files = [{"filename": "src/big.py", "patch": patch}]
 
-        chunks, skipped = _build_annotated_diff_chunks(files, max_chars=220, skip_paths=set())
+        chunks, skipped = _build_annotated_diff_chunks(
+            files, max_chars=220, skip_paths=set()
+        )
 
         self.assertEqual(skipped, [])
         self.assertGreater(len(chunks), 1)
@@ -169,7 +199,9 @@ class ChunkMergeTests(unittest.TestCase):
 
     def test_merge_chunk_event_escalates_request_changes(self) -> None:
         self.assertEqual(
-            _merge_chunk_event(["COMMENT", "REQUEST_CHANGES", "APPROVE"], comments_count=1),
+            _merge_chunk_event(
+                ["COMMENT", "REQUEST_CHANGES", "APPROVE"], comments_count=1
+            ),
             "REQUEST_CHANGES",
         )
 
@@ -205,6 +237,101 @@ class SummarizeRejectedCommentsTests(unittest.TestCase):
     def test_handles_missing_fields_gracefully(self) -> None:
         out = _summarize_rejected_comments([{}, {"path": "foo.py"}])
         self.assertEqual(out, "?:?, foo.py:?")
+
+
+class _CfgStub:
+    """Lean Config stand-in for _run_agentic_loop, which only reads a
+    handful of fields. Avoids the full Config(**kwargs) dance."""
+
+    def __init__(
+        self,
+        *,
+        llm_max_tokens: int = 1024,
+        tool_max_iterations: int = 30,
+        llm_max_input_tokens: int = 0,
+        llm_reasoning_effort: str | None = None,
+    ) -> None:
+        self.llm_max_tokens = llm_max_tokens
+        self.tool_max_iterations = tool_max_iterations
+        self.llm_max_input_tokens = llm_max_input_tokens
+        self.llm_reasoning_effort = llm_reasoning_effort
+
+
+class _FakeLLM:
+    """Returns a queue of ChatResult objects, one per .complete() call.
+    Final entry is reused if the loop calls beyond the queue (so the
+    "force final answer" tail can always satisfy itself)."""
+
+    def __init__(self, results: list[ChatResult]) -> None:
+        self._results = list(results)
+        self.calls: list[dict] = []
+
+    def complete(self, messages, **kwargs) -> ChatResult:
+        self.calls.append({"messages": list(messages), **kwargs})
+        if len(self._results) > 1:
+            return self._results.pop(0)
+        return self._results[0]
+
+
+class InputTokenBudgetTests(unittest.TestCase):
+    """Cumulative input-token cap should short-circuit the agentic loop
+    and trigger the existing 'force final answer' tail."""
+
+    def test_cap_breaks_loop_and_forces_final_answer(self) -> None:
+        cfg = _CfgStub(llm_max_input_tokens=1_500_000)
+        # Turn 1: tool call, reports 1.2M prompt tokens.
+        # Turn 2 (forced final): returns the answer JSON. Loop should
+        # never run a 3rd turn because the cap fires before it.
+        results = [
+            ChatResult(
+                content="",
+                usage={"prompt_tokens": 1_200_000, "completion_tokens": 50},
+                tool_calls=[ToolCall(id="t0", name="noop", arguments="{}")],
+            ),
+            ChatResult(
+                content='{"summary": "done", "comments": []}',
+                usage={"prompt_tokens": 400_000, "completion_tokens": 30},
+            ),
+        ]
+        llm = _FakeLLM(results)
+        # Loop needs a real ToolEnv so tool_calls aren't short-circuited
+        # by the "tools disabled" branch. /tmp is a real dir on every
+        # platform we run tests on.
+        tool_env = ToolEnv(repo_root="/tmp")
+        chat, metrics = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "review this"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=tool_env,
+            prior_prompt_tokens=400_000,  # prior chunks already used 0.4M
+        )
+        # We expect exactly two complete() calls: the first turn, then
+        # the forced final-answer turn after the cap fires.
+        self.assertEqual(len(llm.calls), 2)
+        # Final-answer call must run without tools.
+        self.assertNotIn("tools", llm.calls[1])
+        self.assertEqual(chat.content, '{"summary": "done", "comments": []}')
+        self.assertEqual(metrics.turns, 2)
+
+    def test_disabled_cap_does_not_short_circuit(self) -> None:
+        cfg = _CfgStub(llm_max_input_tokens=0, tool_max_iterations=2)
+        # No tool calls => loop returns on the first turn naturally.
+        results = [
+            ChatResult(
+                content='{"summary": "ok", "comments": []}',
+                usage={"prompt_tokens": 5_000_000, "completion_tokens": 10},
+            ),
+        ]
+        llm = _FakeLLM(results)
+        _, metrics = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=None,
+            prior_prompt_tokens=10_000_000,
+        )
+        self.assertEqual(metrics.turns, 1)
+        self.assertEqual(len(llm.calls), 1)
 
 
 if __name__ == "__main__":

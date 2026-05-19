@@ -434,7 +434,21 @@ reviewbot-web                            # listens on 0.0.0.0:8080
 ```
 
 Then open `http://localhost:8080`, sign in with GitHub, fill in
-`owner/repo#123` + the trigger comment, and watch the stream.
+`owner/repo#123` + the trigger comment, pick an LLM provider/model,
+and watch the stream.
+
+The web form has provider presets for Hugging Face Router
+(`https://router.huggingface.co/v1`), OpenAI
+(`https://api.openai.com/v1`), and Anthropic
+(`https://api.anthropic.com`), plus a custom base URL field for any
+OpenAI-compatible endpoint. The Anthropic preset defaults to
+`claude-opus-4-6`. `LLM_API_BASE` and `LLM_MODEL` only set the default
+selection shown in the form. HF can use the legacy `LLM_API_KEY`;
+OpenAI, Anthropic, and Custom require `OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, or `CUSTOM_LLM_API_KEY` respectively unless that
+provider is the server's default `LLM_API_BASE`. If a user picks a
+provider with no configured key, the form returns a clear error before
+queueing a review.
 
 For pure local "I just want to click around" testing, set
 `DEV_NO_AUTH=1` to bypass OAuth (the OAuth env vars become optional).

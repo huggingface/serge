@@ -92,7 +92,7 @@ form.card, section.card {
 label { display: block; font-weight: 600; margin-bottom: 6px; }
 .hint { color: var(--muted); font-size: 0.85rem; font-weight: normal; margin-top: 2px; }
 
-input[type="text"], textarea {
+input[type="text"], select, textarea {
   width: 100%;
   padding: 8px 10px;
   border: 1px solid var(--border);
@@ -103,6 +103,19 @@ input[type="text"], textarea {
   font-family: inherit;
 }
 textarea { resize: vertical; min-height: 60px; }
+select { appearance: auto; }
+
+.llm-grid {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(220px, 2fr);
+  gap: 12px;
+  margin-top: 14px;
+}
+#custom-base-row { margin-top: 12px; }
+
+@media (max-width: 640px) {
+  .llm-grid { grid-template-columns: 1fr; }
+}
 
 button {
   padding: 8px 16px;
@@ -377,6 +390,31 @@ pre.console .reasoning {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 .diff-snippet .diff-line.target .text { font-weight: 600; }
+
+.suggestion-preview {
+  margin-top: 10px;
+}
+.suggestion-block {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-top: 8px;
+  background: var(--card);
+}
+.suggestion-header {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.suggestion-diff {
+  border: 0;
+  border-radius: 0;
+  margin: 0;
+}
 
 @media (prefers-color-scheme: dark) {
   .diff-snippet {

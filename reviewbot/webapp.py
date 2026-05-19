@@ -63,10 +63,11 @@ log = logging.getLogger("ai-reviewer.web")
 cfg = Config.from_env(require_app=False, require_web=True)
 log.info(
     "Config: llm_stream=%s, llm_max_tokens=%d, tool_max_iterations=%s, "
-    "max_diff_chars=%d, mention_trigger=%r",
+    "llm_max_input_tokens=%s, max_diff_chars=%d, mention_trigger=%r",
     cfg.llm_stream,
     cfg.llm_max_tokens,
     cfg.tool_max_iterations if cfg.tool_max_iterations > 0 else "unlimited",
+    cfg.llm_max_input_tokens if cfg.llm_max_input_tokens > 0 else "unlimited",
     cfg.max_diff_chars,
     cfg.mention_trigger,
 )
@@ -79,6 +80,18 @@ _STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 # encoded slashes, empty strings) can't leak through into API calls.
 _GH_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _MAX_TRIGGER_COMMENT_CHARS = 4000
+_LLM_PROVIDER_HF = "hf"
+_LLM_PROVIDER_OPENAI = "openai"
+_LLM_PROVIDER_ANTHROPIC = "anthropic"
+_LLM_PROVIDER_CUSTOM = "custom"
+_LLM_PROVIDER_BASES = {
+    _LLM_PROVIDER_HF: "https://router.huggingface.co/v1",
+    _LLM_PROVIDER_OPENAI: "https://api.openai.com/v1",
+    _LLM_PROVIDER_ANTHROPIC: "https://api.anthropic.com",
+}
+_LLM_PROVIDER_DEFAULT_MODELS = {
+    _LLM_PROVIDER_ANTHROPIC: "claude-opus-4-6",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +180,9 @@ class Job:
     target_repo: str
     target_number: int
     trigger_comment: str
+    llm_provider: str
+    llm_api_base: str
+    llm_model: Optional[str]
     created_at: float
     status: str = "running"  # running | done | error | discarded | published
     draft: Optional[ReviewDraft] = None
@@ -199,6 +215,104 @@ if _crashed:
         "Marked %d job(s) left in 'running' state as crashed (server restart)",
         _crashed,
     )
+
+
+def _infer_llm_provider(api_base: str) -> str:
+    normalized = api_base.rstrip("/")
+    for provider, base in _LLM_PROVIDER_BASES.items():
+        if normalized == base or normalized == base.removesuffix("/v1"):
+            return provider
+    return _LLM_PROVIDER_CUSTOM
+
+
+def _normalize_llm_base_url(raw: str) -> str:
+    base = raw.strip().rstrip("/")
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="bad_llm_base_url")
+    return base
+
+
+def _llm_selection_from_payload(payload: dict[str, Any]) -> tuple[str, str, Optional[str]]:
+    default_provider = _infer_llm_provider(cfg.llm_api_base)
+    provider = (payload.get("llm_provider") or default_provider).strip().lower()
+    if provider not in (
+        _LLM_PROVIDER_HF,
+        _LLM_PROVIDER_OPENAI,
+        _LLM_PROVIDER_ANTHROPIC,
+        _LLM_PROVIDER_CUSTOM,
+    ):
+        raise HTTPException(status_code=400, detail="bad_llm_provider")
+
+    if provider == _LLM_PROVIDER_CUSTOM:
+        raw_base = (payload.get("llm_base_url") or "").strip()
+        if not raw_base:
+            raw_base = cfg.llm_api_base if default_provider == _LLM_PROVIDER_CUSTOM else ""
+        if not raw_base:
+            raise HTTPException(status_code=400, detail="llm_base_url_required")
+        api_base = _normalize_llm_base_url(raw_base)
+    else:
+        api_base = _LLM_PROVIDER_BASES[provider]
+
+    model = (
+        payload.get("llm_model")
+        or _LLM_PROVIDER_DEFAULT_MODELS.get(provider)
+        or cfg.llm_model
+        or ""
+    ).strip() or None
+    return provider, api_base, model
+
+
+def _configured_llm_api_key_for_provider(provider: str) -> Optional[str]:
+    default_provider = _infer_llm_provider(cfg.llm_api_base)
+    if provider == _LLM_PROVIDER_HF:
+        return (
+            os.environ.get("HF_API_KEY")
+            or os.environ.get("HUGGINGFACE_API_KEY")
+            or os.environ.get("HF_TOKEN")
+            or cfg.llm_api_key
+        )
+    if provider == _LLM_PROVIDER_OPENAI:
+        return os.environ.get("OPENAI_API_KEY") or (
+            cfg.llm_api_key if default_provider == _LLM_PROVIDER_OPENAI else None
+        )
+    if provider == _LLM_PROVIDER_ANTHROPIC:
+        return os.environ.get("ANTHROPIC_API_KEY") or (
+            cfg.llm_api_key if default_provider == _LLM_PROVIDER_ANTHROPIC else None
+        )
+    return os.environ.get("CUSTOM_LLM_API_KEY") or (
+        cfg.llm_api_key if default_provider == _LLM_PROVIDER_CUSTOM else None
+    )
+
+
+def _llm_key_hint(provider: str) -> str:
+    if provider == _LLM_PROVIDER_HF:
+        return "Set HF_API_KEY, HUGGINGFACE_API_KEY, HF_TOKEN, or LLM_API_KEY."
+    if provider == _LLM_PROVIDER_OPENAI:
+        return "Set OPENAI_API_KEY."
+    if provider == _LLM_PROVIDER_ANTHROPIC:
+        return "Set ANTHROPIC_API_KEY."
+    return "Set CUSTOM_LLM_API_KEY, or make the custom endpoint the default LLM_API_BASE with LLM_API_KEY."
+
+
+def _require_llm_api_key_for_provider(provider: str) -> None:
+    if _configured_llm_api_key_for_provider(provider):
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=f"No API key is configured for provider '{provider}'. {_llm_key_hint(provider)}",
+    )
+
+
+def _llm_api_key_for_provider(provider: str) -> str:
+    key = _configured_llm_api_key_for_provider(provider)
+    if key:
+        return key
+    raise RuntimeError(f"No API key configured for provider {provider!r}")
+
+
+def _llm_bill_to_for_provider(provider: str) -> Optional[str]:
+    return cfg.llm_bill_to if provider == _LLM_PROVIDER_HF else None
 
 
 def _prune_store() -> None:
@@ -377,7 +491,13 @@ def _run_review_worker(job: Job) -> None:
         # Shallow-clone so the LLM has browse tools (matches Action mode,
         # which gets a checkout via actions/checkout). If the clone fails
         # we still run the review — just without tools.
-        worker_cfg = cfg
+        worker_cfg = dataclasses.replace(
+            cfg,
+            llm_api_base=job.llm_api_base,
+            llm_api_key=_llm_api_key_for_provider(job.llm_provider),
+            llm_model=job.llm_model,
+            llm_bill_to=_llm_bill_to_for_provider(job.llm_provider),
+        )
         if not _bool_env_safe("WEB_DISABLE_CHECKOUT", False):
             _push_event(job, "step", "clone")
             _push_event(job, "log", "Cloning PR head…")
@@ -391,7 +511,7 @@ def _run_review_worker(job: Job) -> None:
                     "log",
                     f"Clone ready in {time.monotonic() - t0:.1f}s ({clone_path})",
                 )
-                worker_cfg = dataclasses.replace(cfg, repo_checkout_path=clone_path)
+                worker_cfg = dataclasses.replace(worker_cfg, repo_checkout_path=clone_path)
             else:
                 _push_event(
                     job,
@@ -423,10 +543,7 @@ def _run_review_worker(job: Job) -> None:
     except _UnparseableLLMOutput as exc:
         job.status = "error"
         job.raw_llm_output = exc.content
-        job.error = (
-            f"LLM returned unparseable output (finish_reason={exc.finish_reason}, "
-            f"{exc.metrics_line})"
-        )
+        job.error = exc.user_message()
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -560,19 +677,13 @@ def _serve_static(name: str) -> HTMLResponse:
 
 
 def _powered_by_html() -> str:
-    """Render the "powered by <model>" badge that sits next to the Serge
-    brand. Returns an empty string when llm_model is unset (the reviewer
-    auto-discovers a model from the endpoint in that case, so there's
-    nothing concrete to credit yet)."""
-    model = (cfg.llm_model or "").strip()
-    if not model:
-        return ""
-    url = f"https://huggingface.co/{model}"
+    """Render the fixed Inference Providers badge next to the Serge brand."""
+    url = "https://huggingface.co/docs/inference-providers/en/index"
     return (
         '<span class="powered-by">powered by '
         f'<a href="{_html.escape(url, quote=True)}" '
         f'target="_blank" rel="noopener noreferrer">'
-        f'{_html.escape(model)}</a></span>'
+        "HF Inference Providers</a></span>"
     )
 
 
@@ -726,6 +837,45 @@ def list_reviews(request: Request) -> JSONResponse:
     )
 
 
+@app.get("/llm-options")
+def llm_options(request: Request) -> JSONResponse:
+    _require_user(request)
+    provider = _infer_llm_provider(cfg.llm_api_base)
+    custom_base = cfg.llm_api_base if provider == _LLM_PROVIDER_CUSTOM else ""
+    return JSONResponse(
+        {
+            "default_provider": provider,
+            "default_model": cfg.llm_model or "",
+            "custom_base_url": custom_base,
+            "providers": [
+                {
+                    "id": _LLM_PROVIDER_HF,
+                    "label": "HF",
+                    "base_url": _LLM_PROVIDER_BASES[_LLM_PROVIDER_HF],
+                },
+                {
+                    "id": _LLM_PROVIDER_OPENAI,
+                    "label": "OpenAI",
+                    "base_url": _LLM_PROVIDER_BASES[_LLM_PROVIDER_OPENAI],
+                },
+                {
+                    "id": _LLM_PROVIDER_ANTHROPIC,
+                    "label": "Anthropic",
+                    "base_url": _LLM_PROVIDER_BASES[_LLM_PROVIDER_ANTHROPIC],
+                    "default_model": _LLM_PROVIDER_DEFAULT_MODELS[
+                        _LLM_PROVIDER_ANTHROPIC
+                    ],
+                },
+                {
+                    "id": _LLM_PROVIDER_CUSTOM,
+                    "label": "Custom",
+                    "base_url": custom_base,
+                },
+            ],
+        }
+    )
+
+
 @app.post("/reviews")
 async def submit_review(request: Request) -> JSONResponse:
     _require_same_origin(request)
@@ -741,6 +891,8 @@ async def submit_review(request: Request) -> JSONResponse:
     if len(trigger_comment) > _MAX_TRIGGER_COMMENT_CHARS:
         raise HTTPException(status_code=413, detail="comment_too_long")
     owner, repo, number = _parse_pr_ref(pr_ref)
+    llm_provider, llm_api_base, llm_model = _llm_selection_from_payload(payload)
+    _require_llm_api_key_for_provider(llm_provider)
 
     job = Job(
         id=uuid.uuid4().hex,
@@ -749,6 +901,9 @@ async def submit_review(request: Request) -> JSONResponse:
         target_repo=repo,
         target_number=number,
         trigger_comment=trigger_comment,
+        llm_provider=llm_provider,
+        llm_api_base=llm_api_base,
+        llm_model=llm_model,
         created_at=time.time(),
     )
     job.loop = asyncio.get_running_loop()
@@ -761,6 +916,9 @@ async def submit_review(request: Request) -> JSONResponse:
         target_repo=job.target_repo,
         target_number=job.target_number,
         trigger_comment=job.trigger_comment,
+        llm_provider=job.llm_provider,
+        llm_api_base=job.llm_api_base,
+        llm_model=job.llm_model,
         created_at=job.created_at,
         status=job.status,
     )
@@ -768,7 +926,17 @@ async def submit_review(request: Request) -> JSONResponse:
     threading.Thread(
         target=_run_review_worker, args=(job,), name=f"job-{job.id}", daemon=True
     ).start()
-    log.info("queued job %s for %s/%s#%d by %s", job.id, owner, repo, number, user)
+    log.info(
+        "queued job %s for %s/%s#%d by %s using %s model=%s base=%s",
+        job.id,
+        owner,
+        repo,
+        number,
+        user,
+        llm_provider,
+        llm_model or "<auto>",
+        llm_api_base,
+    )
     return JSONResponse(
         {
             "id": job.id,
@@ -865,6 +1033,9 @@ def _load_job_from_store(job_id: str) -> Optional[Job]:
         target_repo=row["target_repo"],
         target_number=row["target_number"],
         trigger_comment=row["trigger_comment"],
+        llm_provider=row.get("llm_provider") or _infer_llm_provider(cfg.llm_api_base),
+        llm_api_base=row.get("llm_api_base") or cfg.llm_api_base,
+        llm_model=row.get("llm_model") or cfg.llm_model,
         created_at=row["created_at"],
         status=row["status"],
         error=row["error"],
@@ -896,6 +1067,9 @@ def review_info(
             "status": job.status,
             "target": f"{job.target_owner}/{job.target_repo}#{job.target_number}",
             "trigger_comment": job.trigger_comment,
+            "llm_provider": job.llm_provider,
+            "llm_base_url": job.llm_api_base,
+            "llm_model": job.llm_model or "",
             "error": job.error,
         }
     )

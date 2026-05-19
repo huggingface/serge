@@ -7,12 +7,16 @@ import unittest
 from reviewbot.context_script import ContextScriptResult, run_context_script
 
 
-def _write_script(dir_: str, body: str, *, executable: bool = True, name: str = "ctx") -> str:
+def _write_script(
+    dir_: str, body: str, *, executable: bool = True, name: str = "ctx"
+) -> str:
     path = os.path.join(dir_, name)
     with open(path, "w") as f:
         f.write(body)
     if executable:
-        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        os.chmod(
+            path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+        )
     return path
 
 
@@ -63,7 +67,12 @@ class ContextScriptTests(unittest.TestCase):
                 title="My PR",
                 body="desc",
                 files=[
-                    {"filename": "a.py", "status": "modified", "additions": 3, "deletions": 1},
+                    {
+                        "filename": "a.py",
+                        "status": "modified",
+                        "additions": 3,
+                        "deletions": 1,
+                    },
                     {"filename": "b.py", "status": "added"},
                 ],
                 timeout_seconds=10,
@@ -120,7 +129,7 @@ class ContextScriptTests(unittest.TestCase):
     def test_invalid_json_falls_back_to_plain_text(self) -> None:
         # Looks like JSON but isn't valid → treated as plain text.
         with tempfile.TemporaryDirectory() as d:
-            _write_script(d, '#!/bin/sh\necho \'{"context": broken\'\n')
+            _write_script(d, "#!/bin/sh\necho '{\"context\": broken'\n")
             result = run_context_script(
                 "ctx", title="t", body="b", files=[], timeout_seconds=5, cwd=d
             )

@@ -32,6 +32,25 @@
         <div class="hint">Plays the role of the comment you'd normally post on GitHub. Mention <code>@serge</code> + any extra instructions.</div>
         <textarea id="comment" name="comment" rows="5" placeholder="@serge please focus on the new auth flow"></textarea>
       </div>
+      <div class="llm-grid">
+        <div>
+          <label for="llm-provider">Provider</label>
+          <select id="llm-provider" name="llm_provider">
+            <option value="hf">HF</option>
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="custom">Custom</option>
+          </select>
+        </div>
+        <div>
+          <label for="llm-model">Model</label>
+          <input type="text" id="llm-model" name="llm_model" required placeholder="model name">
+        </div>
+      </div>
+      <div id="custom-base-row" style="display: none;">
+        <label for="llm-base-url">Base URL</label>
+        <input type="text" id="llm-base-url" name="llm_base_url" placeholder="https://example.com/v1">
+      </div>
       <div class="presets">
         <span class="hint">Presets:</span>
         <button type="button" class="secondary preset" data-preset="first-pass">First-pass</button>

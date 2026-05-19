@@ -184,6 +184,11 @@ Rules for comments:
 - Only reference lines that appear with an [Rxxxx] or [Lxxxx] prefix in
   the diff you were given. Lines without such a prefix are NOT valid.
 - Prefer RIGHT-side comments for issues in newly added code.
+- When you can give a precise, directly applicable replacement for the
+  commented line or small range, include a GitHub suggested-change block
+  in the inline comment using a fenced ```suggestion block. Use this
+  only for confident, minimal fixes; do not use suggestions for broad
+  rewrites, vague advice, or code you have not verified.
 - If you have no inline comments, return "comments": [].
 - If the PR looks good, set "event" to "APPROVE" with an empty comments
   array. Use "REQUEST_CHANGES" only for clear correctness/security issues.

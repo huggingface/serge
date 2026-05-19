@@ -59,6 +59,10 @@ class ReviewDraft:
     comments: list[DraftComment] = field(default_factory=list)
     rejected_count: int = 0
     metrics_line: str = ""
+    # Number of diff chunks that were skipped because the cumulative input
+    # token budget (llm_max_input_tokens) was hit mid-review. Zero in the
+    # normal case; non-zero means the review didn't cover every hunk.
+    truncated_chunks: int = 0
 
 
 @dataclass
@@ -581,6 +585,7 @@ def _run_agentic_loop(
     cfg: Config,
     tool_env: Optional[ToolEnv],
     emit: Optional[Callable[[str, str], None]] = None,
+    prior_prompt_tokens: int = 0,
 ) -> tuple[ChatResult, _AggregateMetrics]:
     """Run a tool-augmented chat loop until the model emits a final
     (non-tool) response, falling back to a final non-tool turn if the
@@ -618,6 +623,13 @@ def _run_agentic_loop(
     iter_cap: Optional[int] = (
         cfg.tool_max_iterations if cfg.tool_max_iterations > 0 else None
     )
+    # Hard cap on cumulative *input* tokens for the whole review. Once
+    # the running prompt-token total (prior chunks + this chunk) crosses
+    # this threshold we stop spinning the tool loop and force a final
+    # answer. ``llm_max_input_tokens <= 0`` disables the cap.
+    input_tokens_cap: Optional[int] = (
+        cfg.llm_max_input_tokens if cfg.llm_max_input_tokens > 0 else None
+    )
     # Absolute backstop: at least twice the configured blind-turn cap,
     # but never below 60. Prevents a runaway model from chaining tool
     # calls indefinitely while still leaving real investigations room
@@ -634,6 +646,23 @@ def _run_agentic_loop(
             )
             break
         if iter_cap is not None and blind_tool_turns >= iter_cap:
+            break
+        if (
+            input_tokens_cap is not None
+            and prior_prompt_tokens + metrics.prompt_tokens >= input_tokens_cap
+        ):
+            cumulative = prior_prompt_tokens + metrics.prompt_tokens
+            log.warning(
+                "Input token budget hit (%d >= %d); bailing out for final answer",
+                cumulative,
+                input_tokens_cap,
+            )
+            if emit is not None:
+                emit(
+                    "log",
+                    f"Input token budget hit ({cumulative} >= {input_tokens_cap}); "
+                    "asking for a final review without tools",
+                )
             break
         if iter_cap is not None:
             label = f"{blind_tool_turns}/{iter_cap}"
@@ -886,6 +915,20 @@ class _UnparseableLLMOutput(Exception):
         self.finish_reason = finish_reason
         self.metrics_line = metrics_line
 
+    def user_message(self) -> str:
+        if self.finish_reason == "length":
+            return (
+                "LLM response was truncated before it produced valid review JSON "
+                f"(finish_reason=length, {self.metrics_line}). Increase "
+                "LLM_MAX_TOKENS for this provider, or narrow the review scope / "
+                "reduce TOOL_MAX_ITERATIONS so the final answer has enough output "
+                "budget."
+            )
+        return (
+            "LLM returned unparseable output "
+            f"(finish_reason={self.finish_reason}, {self.metrics_line})"
+        )
+
 
 def prepare_review(
     cfg: Config,
@@ -1005,8 +1048,31 @@ def prepare_review(
     all_events: list[str] = []
     all_summaries: list[tuple[int, str]] = []
     rejected_count = 0
+    skipped_chunks_for_budget = 0
 
     for idx, chunk in enumerate(diff_chunks, start=1):
+        if (
+            cfg.llm_max_input_tokens > 0
+            and total_metrics.prompt_tokens >= cfg.llm_max_input_tokens
+        ):
+            remaining = len(diff_chunks) - idx + 1
+            log.warning(
+                "Input token budget hit before chunk %d/%d (%d >= %d); "
+                "skipping %d remaining chunk(s)",
+                idx,
+                len(diff_chunks),
+                total_metrics.prompt_tokens,
+                cfg.llm_max_input_tokens,
+                remaining,
+            )
+            _emit(
+                "log",
+                f"Input token budget hit ({total_metrics.prompt_tokens} >= "
+                f"{cfg.llm_max_input_tokens}); skipping {remaining} remaining "
+                "chunk(s) and finishing early",
+            )
+            skipped_chunks_for_budget = remaining
+            break
         runner_context = _build_runner_context(
             all_files=files,
             skipped=skipped,
@@ -1040,6 +1106,7 @@ def prepare_review(
             cfg=cfg,
             tool_env=tool_env,
             emit=_emit,
+            prior_prompt_tokens=total_metrics.prompt_tokens,
         )
         _merge_metrics(total_metrics, chunk_metrics)
 
@@ -1154,6 +1221,7 @@ def prepare_review(
         comments=draft_comments,
         rejected_count=rejected_count,
         metrics_line=metrics_line,
+        truncated_chunks=skipped_chunks_for_budget,
     )
 
 
@@ -1199,6 +1267,12 @@ def publish_review(
             f"\n\n_Note: {draft.rejected_count} suggested inline comment(s) "
             "were dropped because they referenced lines not present in the diff._"
         )
+    if draft.truncated_chunks:
+        body += (
+            f"\n\n_Note: review finished early after hitting the input-token "
+            f"budget; {draft.truncated_chunks} remaining diff chunk(s) were "
+            "not reviewed._"
+        )
     if draft.metrics_line:
         body += f"\n\n_{draft.metrics_line}_"
 
@@ -1233,8 +1307,7 @@ def run_review(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
             req.owner,
             req.repo,
             req.number,
-            f"Reviewer LLM returned unparseable output ({exc.metrics_line}, "
-            f"finish_reason={exc.finish_reason}):\n\n```\n{exc.content[:3000]}\n```",
+            f"{exc.user_message()}\n\n```\n{exc.content[:3000]}\n```",
         )
         return
     if draft is None:

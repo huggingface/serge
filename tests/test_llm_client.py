@@ -18,16 +18,19 @@ def _interrupted_iter_lines(prefix_lines: list[str], exc: Exception):
 
 class ChatCompletionClientTests(unittest.TestCase):
     def test_complete_uses_explicit_model_without_discovery(self) -> None:
-        with patch("reviewbot.llm_client.requests.get") as mock_get, patch(
-            "reviewbot.llm_client.requests.post"
-        ) as mock_post:
+        with (
+            patch("reviewbot.llm_client.requests.get") as mock_get,
+            patch("reviewbot.llm_client.requests.post") as mock_post,
+        ):
             mock_post.return_value = Mock(
                 status_code=200,
                 json=Mock(return_value={"choices": [{"message": {"content": "ok"}}]}),
                 raise_for_status=Mock(),
             )
 
-            client = ChatCompletionClient("https://example.com/v1", "token", "fixed-model")
+            client = ChatCompletionClient(
+                "https://example.com/v1", "token", "fixed-model"
+            )
             result = client.complete([{"role": "user", "content": "hi"}])
 
         self.assertEqual(result.content, "ok")
@@ -36,13 +39,16 @@ class ChatCompletionClientTests(unittest.TestCase):
         self.assertEqual(payload["model"], "fixed-model")
 
     def test_complete_discovers_first_model_once(self) -> None:
-        with patch("reviewbot.llm_client.requests.get") as mock_get, patch(
-            "reviewbot.llm_client.requests.post"
-        ) as mock_post:
+        with (
+            patch("reviewbot.llm_client.requests.get") as mock_get,
+            patch("reviewbot.llm_client.requests.post") as mock_post,
+        ):
             mock_get.return_value = Mock(
                 ok=True,
                 status_code=200,
-                json=Mock(return_value={"data": [{"id": "auto-model"}, {"id": "other"}]}),
+                json=Mock(
+                    return_value={"data": [{"id": "auto-model"}, {"id": "other"}]}
+                ),
             )
             mock_post.return_value = Mock(
                 status_code=200,
@@ -70,9 +76,10 @@ class ChatCompletionClientTests(unittest.TestCase):
         self.assertEqual(second_payload["model"], "auto-model")
 
     def test_complete_adds_v1_when_base_is_unversioned(self) -> None:
-        with patch("reviewbot.llm_client.requests.get") as mock_get, patch(
-            "reviewbot.llm_client.requests.post"
-        ) as mock_post:
+        with (
+            patch("reviewbot.llm_client.requests.get") as mock_get,
+            patch("reviewbot.llm_client.requests.post") as mock_post,
+        ):
             mock_get.return_value = Mock(
                 ok=True,
                 status_code=200,
@@ -104,9 +111,10 @@ class ChatCompletionClientTests(unittest.TestCase):
         )
 
     def test_complete_sends_bill_to_header_when_configured(self) -> None:
-        with patch("reviewbot.llm_client.requests.get") as mock_get, patch(
-            "reviewbot.llm_client.requests.post"
-        ) as mock_post:
+        with (
+            patch("reviewbot.llm_client.requests.get") as mock_get,
+            patch("reviewbot.llm_client.requests.post") as mock_post,
+        ):
             mock_post.return_value = Mock(
                 status_code=200,
                 json=Mock(return_value={"choices": [{"message": {"content": "ok"}}]}),
@@ -124,16 +132,19 @@ class ChatCompletionClientTests(unittest.TestCase):
         )
 
     def test_complete_omits_bill_to_header_when_not_configured(self) -> None:
-        with patch("reviewbot.llm_client.requests.get"), patch(
-            "reviewbot.llm_client.requests.post"
-        ) as mock_post:
+        with (
+            patch("reviewbot.llm_client.requests.get"),
+            patch("reviewbot.llm_client.requests.post") as mock_post,
+        ):
             mock_post.return_value = Mock(
                 status_code=200,
                 json=Mock(return_value={"choices": [{"message": {"content": "ok"}}]}),
                 raise_for_status=Mock(),
             )
 
-            client = ChatCompletionClient("https://example.com/v1", "token", "fixed-model")
+            client = ChatCompletionClient(
+                "https://example.com/v1", "token", "fixed-model"
+            )
             client.complete([{"role": "user", "content": "hi"}])
 
         self.assertNotIn("X-HF-Bill-To", mock_post.call_args.kwargs["headers"])
@@ -149,10 +160,15 @@ class ChatCompletionClientTests(unittest.TestCase):
             json=Mock(return_value={"choices": [{"message": {"content": "ok"}}]}),
             raise_for_status=Mock(),
         )
-        with patch("reviewbot.llm_client.time.sleep"), patch(
-            "reviewbot.llm_client.requests.post", side_effect=[flaky, ok]
-        ) as mock_post:
-            client = ChatCompletionClient("https://example.com/v1", "token", "fixed-model")
+        with (
+            patch("reviewbot.llm_client.time.sleep"),
+            patch(
+                "reviewbot.llm_client.requests.post", side_effect=[flaky, ok]
+            ) as mock_post,
+        ):
+            client = ChatCompletionClient(
+                "https://example.com/v1", "token", "fixed-model"
+            )
             result = client.complete([{"role": "user", "content": "hi"}])
 
         self.assertEqual(result.content, "ok")
@@ -171,10 +187,15 @@ class ChatCompletionClientTests(unittest.TestCase):
             json=Mock(return_value={"choices": [{"message": {"content": "ok"}}]}),
             raise_for_status=Mock(),
         )
-        with patch("reviewbot.llm_client.time.sleep") as mock_sleep, patch(
-            "reviewbot.llm_client.requests.post", side_effect=[rate_limited, ok]
-        ) as mock_post:
-            client = ChatCompletionClient("https://example.com/v1", "token", "fixed-model")
+        with (
+            patch("reviewbot.llm_client.time.sleep") as mock_sleep,
+            patch(
+                "reviewbot.llm_client.requests.post", side_effect=[rate_limited, ok]
+            ) as mock_post,
+        ):
+            client = ChatCompletionClient(
+                "https://example.com/v1", "token", "fixed-model"
+            )
             result = client.complete([{"role": "user", "content": "hi"}])
 
         self.assertEqual(result.content, "ok")
@@ -182,7 +203,9 @@ class ChatCompletionClientTests(unittest.TestCase):
         # Honored the Retry-After: 1 header, capped to the per-wait ceiling.
         mock_sleep.assert_called_once_with(1.0)
 
-    def test_complete_raises_llmresponseerror_with_status_and_body_after_4xx(self) -> None:
+    def test_complete_raises_llmresponseerror_with_status_and_body_after_4xx(
+        self,
+    ) -> None:
         bad = Mock(
             status_code=400,
             ok=False,
@@ -191,7 +214,9 @@ class ChatCompletionClientTests(unittest.TestCase):
             headers={},
         )
         with patch("reviewbot.llm_client.requests.post", return_value=bad):
-            client = ChatCompletionClient("https://example.com/v1", "token", "fixed-model")
+            client = ChatCompletionClient(
+                "https://example.com/v1", "token", "fixed-model"
+            )
             with self.assertRaises(LLMResponseError) as ctx:
                 client.complete([{"role": "user", "content": "hi"}])
 
@@ -248,9 +273,12 @@ class ChatCompletionClientTests(unittest.TestCase):
             raise_for_status=Mock(),
             iter_lines=Mock(return_value=iter(sse_full)),
         )
-        with patch("reviewbot.llm_client.time.sleep"), patch(
-            "reviewbot.llm_client.requests.post", side_effect=[flaky, ok]
-        ) as mock_post:
+        with (
+            patch("reviewbot.llm_client.time.sleep"),
+            patch(
+                "reviewbot.llm_client.requests.post", side_effect=[flaky, ok]
+            ) as mock_post,
+        ):
             client = ChatCompletionClient(
                 "https://example.com/v1", "token", "fixed-model", stream=True
             )
@@ -268,10 +296,13 @@ class ChatCompletionClientTests(unittest.TestCase):
                 requests.exceptions.ChunkedEncodingError("Response ended prematurely"),
             ),
         )
-        with patch("reviewbot.llm_client.time.sleep"), patch(
-            "reviewbot.llm_client.requests.post",
-            side_effect=[flaky(), flaky(), flaky()],
-        ) as mock_post:
+        with (
+            patch("reviewbot.llm_client.time.sleep"),
+            patch(
+                "reviewbot.llm_client.requests.post",
+                side_effect=[flaky(), flaky(), flaky()],
+            ) as mock_post,
+        ):
             client = ChatCompletionClient(
                 "https://example.com/v1", "token", "fixed-model", stream=True
             )
@@ -365,9 +396,7 @@ class ChatCompletionClientTests(unittest.TestCase):
         self.assertEqual(result.finish_reason, "tool_calls")
         self.assertEqual(len(result.tool_calls), 1)
         self.assertEqual(result.tool_calls[0].name, "list_dir")
-        self.assertEqual(
-            json.loads(result.tool_calls[0].arguments), {"path": "src"}
-        )
+        self.assertEqual(json.loads(result.tool_calls[0].arguments), {"path": "src"})
 
     def test_complete_falls_back_when_endpoint_rejects_tools(self) -> None:
         # First call (with tools) returns 400; second call (no tools) succeeds.
@@ -383,16 +412,17 @@ class ChatCompletionClientTests(unittest.TestCase):
             ok=True,
             json=Mock(
                 return_value={
-                    "choices": [
-                        {"message": {"content": "ok"}, "finish_reason": "stop"}
-                    ]
+                    "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
                 }
             ),
             raise_for_status=Mock(),
         )
-        with patch("reviewbot.llm_client.time.sleep"), patch(
-            "reviewbot.llm_client.requests.post", side_effect=[rejected, ok]
-        ) as mock_post:
+        with (
+            patch("reviewbot.llm_client.time.sleep"),
+            patch(
+                "reviewbot.llm_client.requests.post", side_effect=[rejected, ok]
+            ) as mock_post,
+        ):
             client = ChatCompletionClient(
                 "https://example.com/v1", "token", "fixed-model"
             )
@@ -418,9 +448,12 @@ class ChatCompletionClientTests(unittest.TestCase):
             text='{"error":"bad messages"}',
             raise_for_status=Mock(side_effect=requests.HTTPError("400")),
         )
-        with patch("reviewbot.llm_client.time.sleep"), patch(
-            "reviewbot.llm_client.requests.post", return_value=rejected
-        ) as mock_post:
+        with (
+            patch("reviewbot.llm_client.time.sleep"),
+            patch(
+                "reviewbot.llm_client.requests.post", return_value=rejected
+            ) as mock_post,
+        ):
             client = ChatCompletionClient(
                 "https://example.com/v1", "token", "fixed-model"
             )
@@ -430,9 +463,10 @@ class ChatCompletionClientTests(unittest.TestCase):
         self.assertEqual(mock_post.call_count, 1)
 
     def test_complete_raises_when_discovery_returns_no_models(self) -> None:
-        with patch("reviewbot.llm_client.requests.get") as mock_get, patch(
-            "reviewbot.llm_client.requests.post"
-        ) as mock_post:
+        with (
+            patch("reviewbot.llm_client.requests.get") as mock_get,
+            patch("reviewbot.llm_client.requests.post") as mock_post,
+        ):
             mock_get.return_value = Mock(
                 ok=True,
                 status_code=200,

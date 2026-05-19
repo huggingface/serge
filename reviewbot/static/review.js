@@ -282,8 +282,17 @@
     ta.value = c.body;
     ta.dataset.id = c.id;
     ta.dataset.role = "body";
-    ta.addEventListener("input", saveEdits);
+    ta.addEventListener("input", () => {
+      updateSuggestionPreview(card, ta.value);
+      saveEdits();
+    });
     card.appendChild(ta);
+
+    const suggestionPreview = document.createElement("div");
+    suggestionPreview.className = "suggestion-preview";
+    suggestionPreview.dataset.role = "suggestion-preview";
+    card.appendChild(suggestionPreview);
+    updateSuggestionPreview(card, ta.value);
 
     const discardRow = document.createElement("div");
     discardRow.className = "discard-row";
@@ -360,8 +369,72 @@
       }
       if (ta && Object.prototype.hasOwnProperty.call(overrides, c.id)) {
         ta.value = overrides[c.id];
+        const card = ta.closest(".comment-card");
+        if (card) updateSuggestionPreview(card, ta.value);
       }
     }
+  }
+
+  function extractSuggestionBlocks(text) {
+    const blocks = [];
+    const re = /```suggestion[^\n]*\n([\s\S]*?)\n```/g;
+    let match;
+    while ((match = re.exec(text)) !== null) {
+      blocks.push(match[1]);
+    }
+    return blocks;
+  }
+
+  function updateSuggestionPreview(card, body) {
+    const preview = card.querySelector('[data-role="suggestion-preview"]');
+    if (!preview) return;
+    const blocks = extractSuggestionBlocks(body);
+    preview.replaceChildren();
+    preview.hidden = blocks.length === 0;
+    if (!blocks.length) return;
+
+    for (let i = 0; i < blocks.length; i++) {
+      const block = document.createElement("div");
+      block.className = "suggestion-block";
+
+      const header = document.createElement("div");
+      header.className = "suggestion-header";
+      header.textContent =
+        blocks.length === 1 ? "Suggested change" : `Suggested change ${i + 1}`;
+      block.appendChild(header);
+      block.appendChild(buildSuggestionDiff(blocks[i]));
+      preview.appendChild(block);
+    }
+  }
+
+  function buildSuggestionDiff(text) {
+    const table = document.createElement("table");
+    table.className = "diff-snippet suggestion-diff";
+    const lines = text.split("\n");
+    for (const line of lines) {
+      const tr = document.createElement("tr");
+      tr.className = "diff-line add";
+
+      const old = document.createElement("td");
+      old.className = "lineno";
+      old.textContent = "";
+      const nw = document.createElement("td");
+      nw.className = "lineno";
+      nw.textContent = "";
+      const op = document.createElement("td");
+      op.className = "op";
+      op.textContent = "+";
+      const code = document.createElement("td");
+      code.className = "text";
+      code.textContent = line;
+
+      tr.appendChild(old);
+      tr.appendChild(nw);
+      tr.appendChild(op);
+      tr.appendChild(code);
+      table.appendChild(tr);
+    }
+    return table;
   }
 
   summaryEl.addEventListener("input", saveEdits);
@@ -430,6 +503,9 @@
         body: JSON.stringify({
           pr: infoCache.target,
           comment: infoCache.trigger_comment,
+          llm_provider: infoCache.llm_provider,
+          llm_model: infoCache.llm_model,
+          llm_base_url: infoCache.llm_base_url,
         }),
       });
       if (!r.ok) {

@@ -1,6 +1,7 @@
 """Tests for the prepare/publish split. We don't go through the LLM —
 we hand-craft a ReviewDraft and exercise publish_review's body-format
 and edit-application rules."""
+
 import unittest
 from unittest.mock import MagicMock
 
@@ -37,6 +38,7 @@ def _make_cfg(**overrides) -> Config:
         context_script_timeout=30,
         repo_checkout_path="",
         tool_max_iterations=8,
+        llm_max_input_tokens=2_000_000,
     )
     base.update(overrides)
     return Config(**base)
@@ -51,8 +53,12 @@ def _make_draft(**overrides) -> ReviewDraft:
         summary="LGTM overall.",
         event="COMMENT",
         comments=[
-            DraftComment(id="c0", path="a.py", side="RIGHT", line=10, body="nit: rename"),
-            DraftComment(id="c1", path="b.py", side="RIGHT", line=20, body="this is wrong"),
+            DraftComment(
+                id="c0", path="a.py", side="RIGHT", line=10, body="nit: rename"
+            ),
+            DraftComment(
+                id="c1", path="b.py", side="RIGHT", line=20, body="this is wrong"
+            ),
         ],
         rejected_count=0,
         metrics_line="2 LLM turns · 0 tool calls · 3.4s",

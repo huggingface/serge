@@ -36,7 +36,9 @@ class _TempRepo(unittest.TestCase):
         # Fixture files
         os.makedirs(os.path.join(self.repo_root, "src", "pkg"))
         with open(os.path.join(self.repo_root, "src", "pkg", "main.py"), "w") as f:
-            f.write("def hello():\n    return 'world'\n\n\ndef goodbye():\n    return 'bye'\n")
+            f.write(
+                "def hello():\n    return 'world'\n\n\ndef goodbye():\n    return 'bye'\n"
+            )
         with open(os.path.join(self.repo_root, "src", "pkg", "util.py"), "w") as f:
             f.write("CONSTANT = 1\n")
         with open(os.path.join(self.repo_root, "README.md"), "w") as f:
@@ -47,7 +49,7 @@ class _TempRepo(unittest.TestCase):
                 "#!/bin/sh\n"
                 "printf 'cwd=%s\\n' \"$(pwd)\"\n"
                 "printf 'argc=%s\\n' \"$#\"\n"
-                "for arg in \"$@\"; do\n"
+                'for arg in "$@"; do\n'
                 "  printf 'arg=%s\\n' \"$arg\"\n"
                 "done\n"
             )
@@ -55,16 +57,24 @@ class _TempRepo(unittest.TestCase):
         # Pretend there's a .git dir so the denylist has something to bite on
         os.makedirs(os.path.join(self.repo_root, ".git", "refs"))
         # Real git init so `git grep` works in the grep tests
-        subprocess.run(
-            ["git", "init", "-q"], cwd=self.repo_root, check=True
-        )
+        subprocess.run(["git", "init", "-q"], cwd=self.repo_root, check=True)
         subprocess.run(
             ["git", "-c", "user.email=a@b", "-c", "user.name=a", "add", "."],
             cwd=self.repo_root,
             check=True,
         )
         subprocess.run(
-            ["git", "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "-m", "init"],
+            [
+                "git",
+                "-c",
+                "user.email=a@b",
+                "-c",
+                "user.name=a",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
             cwd=self.repo_root,
             check=True,
         )
@@ -75,7 +85,9 @@ class _TempRepo(unittest.TestCase):
 class ResolvePathTests(_TempRepo):
     def test_read_file_returns_numbered_lines(self) -> None:
         out = run_tool(
-            self.env, "read_file", {"path": "src/pkg/main.py", "start_line": 1, "end_line": 3}
+            self.env,
+            "read_file",
+            {"path": "src/pkg/main.py", "start_line": 1, "end_line": 3},
         )
         self.assertIn("src/pkg/main.py (lines 1-3)", out)
         self.assertIn("     1\tdef hello():", out)
@@ -126,9 +138,7 @@ class ResolvePathTests(_TempRepo):
         self.assertIn("util.py", out)
 
     def test_grep_finds_match(self) -> None:
-        out = run_tool(
-            self.env, "grep", {"pattern": "def hello", "path": "src"}
-        )
+        out = run_tool(self.env, "grep", {"pattern": "def hello", "path": "src"})
         self.assertIn("src/pkg/main.py:1:def hello", out)
 
     def test_grep_reports_no_matches(self) -> None:
@@ -266,9 +276,7 @@ class RepoHelperConfigTests(unittest.TestCase):
             }
             """
         )
-        self.assertEqual(
-            helpers[0].install, ("pip", "install", "transformers-mlinter")
-        )
+        self.assertEqual(helpers[0].install, ("pip", "install", "transformers-mlinter"))
 
     def test_load_repo_helper_tools_rejects_unknown_installer(self) -> None:
         with self.assertRaises(ValueError) as ctx:
@@ -423,18 +431,14 @@ class FetchUrlTests(unittest.TestCase):
 
     def test_fetch_rejects_non_huggingface_host(self) -> None:
         with patch("reviewbot.tools.requests.get") as mock_get:
-            out = run_tool(
-                self.env, "fetch_url", {"url": "https://example.com/foo"}
-            )
+            out = run_tool(self.env, "fetch_url", {"url": "https://example.com/foo"})
         self.assertTrue(out.startswith("error:"), out)
         self.assertIn("not in the allowlist", out)
         mock_get.assert_not_called()
 
     def test_fetch_rejects_http_scheme(self) -> None:
         with patch("reviewbot.tools.requests.get") as mock_get:
-            out = run_tool(
-                self.env, "fetch_url", {"url": "http://huggingface.co/foo"}
-            )
+            out = run_tool(self.env, "fetch_url", {"url": "http://huggingface.co/foo"})
         self.assertTrue(out.startswith("error:"), out)
         self.assertIn("only https", out)
         mock_get.assert_not_called()
@@ -466,9 +470,7 @@ class FetchUrlTests(unittest.TestCase):
             is_redirect=False,
         )
         with patch("reviewbot.tools.requests.get", return_value=response):
-            out = run_tool(
-                self.env, "fetch_url", {"url": "https://huggingface.co/foo"}
-            )
+            out = run_tool(self.env, "fetch_url", {"url": "https://huggingface.co/foo"})
         self.assertIn("[... truncated", out)
 
     def test_fetch_skips_body_for_non_text(self) -> None:
@@ -481,9 +483,7 @@ class FetchUrlTests(unittest.TestCase):
             is_redirect=False,
         )
         with patch("reviewbot.tools.requests.get", return_value=response):
-            out = run_tool(
-                self.env, "fetch_url", {"url": "https://huggingface.co/foo"}
-            )
+            out = run_tool(self.env, "fetch_url", {"url": "https://huggingface.co/foo"})
         self.assertIn("non-text body", out)
 
     def test_fetch_handles_timeout(self) -> None:
@@ -491,9 +491,7 @@ class FetchUrlTests(unittest.TestCase):
             "reviewbot.tools.requests.get",
             side_effect=requests.Timeout("slow"),
         ):
-            out = run_tool(
-                self.env, "fetch_url", {"url": "https://huggingface.co/foo"}
-            )
+            out = run_tool(self.env, "fetch_url", {"url": "https://huggingface.co/foo"})
         self.assertTrue(out.startswith("error:"), out)
         self.assertIn("timed out", out)
 

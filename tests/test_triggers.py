@@ -14,7 +14,9 @@ class TriggerTests(unittest.TestCase):
                 "user": {"login": "reviewer"},
             },
             "issue": {
-                "pull_request": {"url": "https://api.github.com/repos/acme/project/pulls/7"},
+                "pull_request": {
+                    "url": "https://api.github.com/repos/acme/project/pulls/7"
+                },
                 "state": "open",
                 "number": 7,
             },
@@ -40,7 +42,9 @@ class TriggerTests(unittest.TestCase):
                 "user": {"login": "reviewer"},
             },
             "issue": {
-                "pull_request": {"url": "https://api.github.com/repos/acme/project/pulls/7"},
+                "pull_request": {
+                    "url": "https://api.github.com/repos/acme/project/pulls/7"
+                },
                 "state": "open",
                 "number": 7,
             },

@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     target_repo     TEXT NOT NULL,
     target_number   INTEGER NOT NULL,
     trigger_comment TEXT NOT NULL,
+    llm_provider    TEXT,
+    llm_api_base    TEXT,
+    llm_model       TEXT,
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL,
     status          TEXT NOT NULL,
@@ -72,8 +75,19 @@ class JobStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
+            self._ensure_column("llm_provider", "TEXT")
+            self._ensure_column("llm_api_base", "TEXT")
+            self._ensure_column("llm_model", "TEXT")
             self._conn.commit()
         log.info("Opened job store at %s", path)
+
+    def _ensure_column(self, name: str, sql_type: str) -> None:
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if name not in columns:
+            self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sql_type}")
 
     # ------------------------------------------------------------------
     # writes
@@ -87,6 +101,9 @@ class JobStore:
         target_repo: str,
         target_number: int,
         trigger_comment: str,
+        llm_provider: str,
+        llm_api_base: str,
+        llm_model: Optional[str],
         created_at: float,
         status: str,
     ) -> None:
@@ -96,12 +113,14 @@ class JobStore:
                 """
                 INSERT INTO jobs (
                     id, user, target_owner, target_repo, target_number,
-                    trigger_comment, created_at, updated_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    trigger_comment, llm_provider, llm_api_base, llm_model,
+                    created_at, updated_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     id, user, target_owner, target_repo, target_number,
-                    trigger_comment, created_at, now, status,
+                    trigger_comment, llm_provider, llm_api_base, llm_model,
+                    created_at, now, status,
                 ),
             )
             self._conn.commit()
@@ -207,7 +226,8 @@ class JobStore:
             rows = self._conn.execute(
                 """
                 SELECT id, user, target_owner, target_repo, target_number,
-                       status, created_at, updated_at
+                       status, created_at, updated_at,
+                       llm_provider, llm_api_base, llm_model
                   FROM jobs
                  WHERE user = ?
                  ORDER BY created_at DESC
