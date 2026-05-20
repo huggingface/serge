@@ -106,3 +106,37 @@ class GitHubClient:
             json={"content": content},
             timeout=30,
         )
+
+    def add_reaction_to_review_comment(
+        self, owner: str, repo: str, comment_id: int, content: str = "eyes"
+    ) -> None:
+        self.session.post(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions",
+            json={"content": content},
+            timeout=30,
+        )
+
+    def reply_to_review_comment(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        comment_id: int,
+        body: str,
+    ) -> dict:
+        """Post a threaded reply to an existing PR review comment. The
+        endpoint accepts any comment_id in the thread and re-uses the
+        thread's commit/path/line anchor, so we don't have to look those
+        up ourselves."""
+        r = self.session.post(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies",
+            json={"body": body},
+            timeout=30,
+        )
+        if not r.ok:
+            raise requests.HTTPError(
+                f"{r.status_code} replying to review comment "
+                f"{owner}/{repo}#{number} comment {comment_id}: {r.text}",
+                response=r,
+            )
+        return r.json()

@@ -9,7 +9,7 @@ from flask import Flask, abort, jsonify, request
 from .config import Config
 from .github_auth import installation_token
 from .github_client import GitHubClient
-from .reviewer import ReviewRequest, run_review
+from .reviewer import ReviewRequest, run_followup, run_review
 from .triggers import build_review_request
 
 logging.basicConfig(
@@ -48,7 +48,10 @@ def _review_worker(installation_id: int, req: ReviewRequest) -> None:
             cfg.github_app_id, cfg.github_private_key, installation_id
         )
         gh = GitHubClient(token)
-        run_review(cfg, gh, req)
+        if req.inline is not None:
+            run_followup(cfg, gh, req)
+        else:
+            run_review(cfg, gh, req)
     except Exception:
         log.exception("review worker crashed for %s/%s#%d", req.owner, req.repo, req.number)
 

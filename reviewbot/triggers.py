@@ -1,6 +1,6 @@
 from typing import Optional
 
-from .reviewer import ReviewRequest
+from .reviewer import InlineCommentContext, ReviewRequest
 
 
 def build_review_request(
@@ -14,6 +14,11 @@ def build_review_request(
     The same logic backs both the Flask webhook (app.py) and the GitHub
     Action entry point (action_runner.py), so behaviour is identical in
     both deployment modes.
+
+    For ``pull_request_review_comment`` events the returned request carries
+    an ``inline`` context object — the caller dispatches to the follow-up
+    flow (a focused reply on the comment thread) instead of a full PR
+    review.
     """
     if event_name not in ("issue_comment", "pull_request_review_comment"):
         return None
@@ -32,6 +37,7 @@ def build_review_request(
         return None
     owner, name = full.split("/", 1)
 
+    inline: Optional[InlineCommentContext] = None
     if event_name == "issue_comment":
         issue = payload.get("issue") or {}
         if not issue.get("pull_request"):
@@ -40,7 +46,30 @@ def build_review_request(
             return None
         pr_number = issue.get("number")
     else:
-        pr_number = (payload.get("pull_request") or {}).get("number")
+        pr = payload.get("pull_request") or {}
+        pr_number = pr.get("number")
+        if pr.get("state") and pr.get("state") != "open":
+            return None
+        path = comment.get("path")
+        # GitHub nulls out line/side when the comment is "outdated" against
+        # the latest commit; the original_* fields keep the anchor that the
+        # commenter actually looked at, which is the right thing to reason
+        # about for a follow-up question.
+        line = comment.get("line") or comment.get("original_line")
+        side = comment.get("side") or comment.get("original_side") or "RIGHT"
+        if not isinstance(path, str) or not isinstance(line, int):
+            return None
+        comment_id = comment.get("id")
+        if not isinstance(comment_id, int):
+            return None
+        inline = InlineCommentContext(
+            comment_id=comment_id,
+            path=path,
+            side=side if side in ("RIGHT", "LEFT") else "RIGHT",
+            line=line,
+            diff_hunk=comment.get("diff_hunk") or "",
+            in_reply_to_id=comment.get("in_reply_to_id"),
+        )
 
     if not isinstance(pr_number, int):
         return None
@@ -52,4 +81,5 @@ def build_review_request(
         trigger_comment_id=comment.get("id") or 0,
         trigger_comment_body=comment.get("body") or "",
         commenter=(comment.get("user") or {}).get("login") or "unknown",
+        inline=inline,
     )
