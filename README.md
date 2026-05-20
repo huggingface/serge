@@ -203,6 +203,24 @@ On any open PR, post a comment as a collaborator/member/owner:
 Within a few seconds a full PR review lands with inline comments
 anchored to the diff.
 
+### Follow-up questions on inline comments
+
+To ask a focused question about a specific line, leave an **inline
+review comment** on that line containing the trigger phrase:
+
+```
+@serge could you help me understand this line of code?
+```
+
+The reviewer replies in the same comment thread (instead of posting a
+new full-PR review). The reply is anchored to the line you commented
+on and has access to the same browse tools as a full review, so it can
+read surrounding code when needed.
+
+Use this for "what does this do?", "why this approach?", or "is this
+covered by tests?" — anything where a thread reply makes more sense
+than another top-level review.
+
 ### Repo-supplied extra context
 
 Drop an executable script at `.ai/context-script` (path configurable

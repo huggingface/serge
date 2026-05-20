@@ -9,7 +9,12 @@ from .context_script import run_context_script
 from .github_client import GitHubClient
 from .llm_client import ChatCompletionClient, ChatResult, ToolCall
 from .patch import DiffSnippetLine, ParsedFile, extract_hunk_snippet, parse_patch
-from .prompts import build_system_prompt, build_user_prompt
+from .prompts import (
+    build_followup_system_prompt,
+    build_followup_user_prompt,
+    build_system_prompt,
+    build_user_prompt,
+)
 from .tools import (
     RepoHelperTool,
     ToolEnv,
@@ -23,6 +28,24 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
+class InlineCommentContext:
+    """Metadata captured from a ``pull_request_review_comment`` event so
+    the follow-up flow can answer the question in-thread on the exact
+    line the commenter was looking at.
+
+    ``in_reply_to_id`` is set when the trigger comment was itself a reply
+    inside an existing thread; the reply endpoint accepts any comment_id
+    in the thread so we always use ``comment_id`` to post the reply.
+    """
+    comment_id: int
+    path: str
+    side: str
+    line: int
+    diff_hunk: str
+    in_reply_to_id: Optional[int] = None
+
+
+@dataclass
 class ReviewRequest:
     owner: str
     repo: str
@@ -30,6 +53,9 @@ class ReviewRequest:
     trigger_comment_id: int
     trigger_comment_body: str
     commenter: str
+    # Populated only for pull_request_review_comment events. When set,
+    # the runner dispatches to run_followup instead of run_review.
+    inline: Optional[InlineCommentContext] = None
 
 
 @dataclass
@@ -578,6 +604,13 @@ def _merge_chunk_event(events: list[str], comments_count: int) -> str:
     return "COMMENT"
 
 
+_DEFAULT_FORCE_FINAL_MESSAGE = (
+    "You have used all available tool calls. Based on what you have "
+    "already gathered, produce the final JSON review now. Do not "
+    "request any more tools."
+)
+
+
 def _run_agentic_loop(
     llm: ChatCompletionClient,
     initial_messages: list[dict[str, Any]],
@@ -586,6 +619,7 @@ def _run_agentic_loop(
     tool_env: Optional[ToolEnv],
     emit: Optional[Callable[[str, str], None]] = None,
     prior_prompt_tokens: int = 0,
+    final_force_message: Optional[str] = None,
 ) -> tuple[ChatResult, _AggregateMetrics]:
     """Run a tool-augmented chat loop until the model emits a final
     (non-tool) response, falling back to a final non-tool turn if the
@@ -763,11 +797,7 @@ def _run_agentic_loop(
         emit("log", "Agent budget exhausted; asking for a final review without tools")
     messages.append({
         "role": "user",
-        "content": (
-            "You have used all available tool calls. Based on what you have "
-            "already gathered, produce the final JSON review now. Do not "
-            "request any more tools."
-        ),
+        "content": final_force_message or _DEFAULT_FORCE_FINAL_MESSAGE,
     })
     chat = llm.complete(
         messages,
@@ -1313,3 +1343,108 @@ def run_review(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
     if draft is None:
         return
     publish_review(cfg, gh, draft)
+
+
+_FOLLOWUP_FORCE_FINAL_MESSAGE = (
+    "You have used all available tool calls. Based on what you have "
+    "already gathered, write the final reply now as plain markdown "
+    "(no JSON, no tool calls)."
+)
+
+
+def _noop_emit(kind: str, text: str) -> None:
+    del kind, text
+
+
+def run_followup(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
+    """Answer a single inline follow-up question and post the reply in
+    the same comment thread. Triggered from pull_request_review_comment
+    events; ``req.inline`` carries the anchor (path/line/side/diff_hunk).
+    """
+    assert req.inline is not None, "run_followup requires req.inline"
+    inline = req.inline
+
+    log.info(
+        "Starting follow-up on %s/%s#%d %s:%d (triggered by @%s)",
+        req.owner,
+        req.repo,
+        req.number,
+        inline.path,
+        inline.line,
+        req.commenter,
+    )
+
+    try:
+        gh.add_reaction_to_review_comment(
+            req.owner, req.repo, inline.comment_id, "eyes"
+        )
+    except Exception:
+        log.debug("reaction failed (non-fatal)", exc_info=True)
+
+    pr = gh.get_pr(req.owner, req.repo, req.number)
+    review_rules = _load_review_rules(gh, req.owner, req.repo, pr, cfg)
+    helper_tools = _load_helper_tools(gh, req.owner, req.repo, pr, cfg)
+    _install_helper_tools_with_emit(helper_tools, _noop_emit)
+    tool_env = _make_tool_env(cfg, helper_tools)
+
+    llm = ChatCompletionClient(
+        cfg.llm_api_base,
+        cfg.llm_api_key,
+        cfg.llm_model,
+        bill_to=cfg.llm_bill_to,
+        stream=cfg.llm_stream,
+    )
+
+    system_prompt = build_followup_system_prompt(
+        review_rules, tools_enabled=tool_env is not None
+    )
+    user_prompt = build_followup_user_prompt(
+        repo_full_name=f"{req.owner}/{req.repo}",
+        number=req.number,
+        title=pr.get("title") or "",
+        body=pr.get("body") or "",
+        author=(pr.get("user") or {}).get("login") or "unknown",
+        commenter=req.commenter,
+        trigger_comment=req.trigger_comment_body,
+        path=inline.path,
+        side=inline.side,
+        line=inline.line,
+        diff_hunk=inline.diff_hunk,
+    )
+
+    chat, metrics = _run_agentic_loop(
+        llm,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        cfg=cfg,
+        tool_env=tool_env,
+        final_force_message=_FOLLOWUP_FORCE_FINAL_MESSAGE,
+    )
+
+    reply = (chat.content or "").strip()
+    if not reply:
+        reply = (
+            "_Could not produce a reply (the model returned an empty "
+            f"response after {metrics.turns} turn(s))._"
+        )
+
+    body = reply
+    if cfg.persona_header:
+        body = f"{cfg.persona_header}\n\n{body}"
+    metrics_line = _format_aggregated_metrics(metrics)
+    if metrics_line:
+        body += f"\n\n_{metrics_line}_"
+
+    gh.reply_to_review_comment(
+        req.owner, req.repo, req.number, inline.comment_id, body
+    )
+    log.info(
+        "Posted follow-up reply on %s/%s#%d comment %d (%s)",
+        req.owner,
+        req.repo,
+        req.number,
+        inline.comment_id,
+        metrics_line,
+    )
