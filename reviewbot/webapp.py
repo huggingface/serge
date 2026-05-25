@@ -40,6 +40,7 @@ from .github_auth import (
     AppNotInstalledError,
     installation_id_for_repo,
     installation_token,
+    user_is_org_member,
 )
 from .github_client import GitHubClient
 from .llm_client import LLMResponseError
@@ -139,9 +140,10 @@ def _save_session(response: Response, data: dict[str, Any]) -> None:
         _serializer.dumps(data),
         httponly=True,
         samesite="lax",
-        # Cookie must travel only over HTTPS in production. In dev mode
-        # (DEV_NO_AUTH) we relax this so localhost http:// flows work.
-        secure=not cfg.web_dev_no_auth,
+        # Cookie must travel only over HTTPS in production. Set
+        # WEB_INSECURE_COOKIES=1 to relax this for VPN-private HTTP
+        # deployments where TLS isn't terminated locally.
+        secure=not cfg.web_insecure_cookies,
         max_age=60 * 60 * 24 * 7,
     )
 
@@ -699,6 +701,13 @@ def index(request: Request) -> Response:
     return _serve_static("index.html")
 
 
+@app.get("/journal")
+def journal_page(request: Request) -> Response:
+    if not _current_user(request):
+        return RedirectResponse("/login", status_code=302)
+    return _serve_static("journal.html")
+
+
 @app.get("/login")
 def login_page(request: Request) -> Response:
     if _current_user(request):
@@ -788,8 +797,31 @@ async def auth_callback(request: Request) -> Response:
                 ]
 
     if not _user_is_allowed(login, orgs):
-        log.warning("denied login attempt by %s (orgs=%s)", login, orgs)
-        raise HTTPException(status_code=403, detail="user_not_allowed")
+        # /user/orgs honors SAML SSO — if the OAuth token wasn't
+        # SSO-authorized for the org, the org won't appear here even when
+        # the user is a real member. Fall back to the GitHub App's own
+        # view of org membership (public_members first, then the App
+        # installation route) which isn't subject to user-side SSO.
+        verified_via_app: list[str] = []
+        if (
+            cfg.web_allowed_orgs
+            and cfg.github_app_id
+            and cfg.github_private_key
+        ):
+            for org in cfg.web_allowed_orgs:
+                if user_is_org_member(
+                    cfg.github_app_id, cfg.github_private_key, org, login
+                ):
+                    verified_via_app.append(org)
+                    break
+        if not verified_via_app:
+            log.warning("denied login attempt by %s (orgs=%s)", login, orgs)
+            raise HTTPException(status_code=403, detail="user_not_allowed")
+        log.info(
+            "user %s authorized via App membership lookup (orgs=%s)",
+            login,
+            verified_via_app,
+        )
 
     sess["user"] = login
     response = RedirectResponse("/", status_code=302)
@@ -837,40 +869,81 @@ def list_reviews(request: Request) -> JSONResponse:
     )
 
 
+@app.get("/journal/data")
+def journal_data(request: Request) -> JSONResponse:
+    """Cross-user activity log — every persisted review job with its
+    token usage, provider/model, and status. Any authenticated user can
+    read this; the allowlist already gates who has an account."""
+    _require_user(request)
+    rows = _store.list_all_calls(limit=cfg.web_job_retention)
+    return JSONResponse(
+        {
+            "entries": [
+                {
+                    "id": r["id"],
+                    "user": r["user"],
+                    "owner": r["target_owner"],
+                    "repo": r["target_repo"],
+                    "number": r["target_number"],
+                    "status": r["status"],
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                    "provider": r["llm_provider"],
+                    "model": r["llm_model"],
+                    "prompt_tokens": r["prompt_tokens"],
+                    "completion_tokens": r["completion_tokens"],
+                    "url": (
+                        f"/reviews/{r['target_owner']}/{r['target_repo']}/"
+                        f"{r['target_number']}/{r['id']}"
+                    ),
+                }
+                for r in rows
+            ]
+        }
+    )
+
+
 @app.get("/llm-options")
 def llm_options(request: Request) -> JSONResponse:
     _require_user(request)
     provider = _infer_llm_provider(cfg.llm_api_base)
     custom_base = cfg.llm_api_base if provider == _LLM_PROVIDER_CUSTOM else ""
+
+    def _provider_entry(pid: str, label: str, base_url: str) -> dict:
+        entry: dict[str, Any] = {"id": pid, "label": label, "base_url": base_url}
+        # The server-configured cfg.llm_model is the default for whichever
+        # provider matches cfg.llm_api_base; other providers fall back to
+        # the static per-provider defaults so switching in the UI lands on
+        # something sensible instead of an empty box.
+        default_model = (
+            cfg.llm_model
+            if pid == provider and cfg.llm_model
+            else _LLM_PROVIDER_DEFAULT_MODELS.get(pid, "")
+        )
+        if default_model:
+            entry["default_model"] = default_model
+        return entry
+
     return JSONResponse(
         {
             "default_provider": provider,
             "default_model": cfg.llm_model or "",
             "custom_base_url": custom_base,
             "providers": [
-                {
-                    "id": _LLM_PROVIDER_HF,
-                    "label": "HF",
-                    "base_url": _LLM_PROVIDER_BASES[_LLM_PROVIDER_HF],
-                },
-                {
-                    "id": _LLM_PROVIDER_OPENAI,
-                    "label": "OpenAI",
-                    "base_url": _LLM_PROVIDER_BASES[_LLM_PROVIDER_OPENAI],
-                },
-                {
-                    "id": _LLM_PROVIDER_ANTHROPIC,
-                    "label": "Anthropic",
-                    "base_url": _LLM_PROVIDER_BASES[_LLM_PROVIDER_ANTHROPIC],
-                    "default_model": _LLM_PROVIDER_DEFAULT_MODELS[
-                        _LLM_PROVIDER_ANTHROPIC
-                    ],
-                },
-                {
-                    "id": _LLM_PROVIDER_CUSTOM,
-                    "label": "Custom",
-                    "base_url": custom_base,
-                },
+                _provider_entry(
+                    _LLM_PROVIDER_HF, "HF", _LLM_PROVIDER_BASES[_LLM_PROVIDER_HF]
+                ),
+                _provider_entry(
+                    _LLM_PROVIDER_OPENAI,
+                    "OpenAI",
+                    _LLM_PROVIDER_BASES[_LLM_PROVIDER_OPENAI],
+                ),
+                _provider_entry(
+                    _LLM_PROVIDER_ANTHROPIC,
+                    "Anthropic",
+                    _LLM_PROVIDER_BASES[_LLM_PROVIDER_ANTHROPIC],
+                ),
+                _provider_entry(_LLM_PROVIDER_CUSTOM, "Custom", custom_base),
             ],
         }
     )

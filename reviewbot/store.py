@@ -44,7 +44,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     error           TEXT,
     raw_llm_output  TEXT,
     draft_json      TEXT,
-    history_json    TEXT
+    history_json    TEXT,
+    prompt_tokens   INTEGER,
+    completion_tokens INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
@@ -78,6 +80,8 @@ class JobStore:
             self._ensure_column("llm_provider", "TEXT")
             self._ensure_column("llm_api_base", "TEXT")
             self._ensure_column("llm_model", "TEXT")
+            self._ensure_column("prompt_tokens", "INTEGER")
+            self._ensure_column("completion_tokens", "INTEGER")
             self._conn.commit()
         log.info("Opened job store at %s", path)
 
@@ -136,14 +140,25 @@ class JobStore:
         history: list[dict[str, Any]],
     ) -> None:
         """Persist the final state of a job (done/error/published/discarded)
-        along with its filtered event history and the resulting draft, if any."""
+        along with its filtered event history and the resulting draft, if any.
+
+        Token counts come from the draft when available; otherwise (error
+        path with no draft) we fall back to the latest ``metrics`` event in
+        the history so the journal still reports what was consumed before
+        the failure."""
         filtered = [e for e in history if e.get("kind") in PERSIST_EVENT_KINDS]
+        if draft is not None:
+            prompt_tokens: Optional[int] = draft.prompt_tokens or None
+            completion_tokens: Optional[int] = draft.completion_tokens or None
+        else:
+            prompt_tokens, completion_tokens = _latest_token_counts(history)
         with self._lock:
             self._conn.execute(
                 """
                 UPDATE jobs
                    SET status = ?, error = ?, raw_llm_output = ?,
-                       draft_json = ?, history_json = ?, updated_at = ?
+                       draft_json = ?, history_json = ?, updated_at = ?,
+                       prompt_tokens = ?, completion_tokens = ?
                  WHERE id = ?
                 """,
                 (
@@ -153,6 +168,8 @@ class JobStore:
                     _encode_draft(draft),
                     json.dumps(filtered, ensure_ascii=False),
                     time.time(),
+                    prompt_tokens,
+                    completion_tokens,
                     job_id,
                 ),
             )
@@ -237,10 +254,57 @@ class JobStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_all_calls(self, limit: int = 500) -> list[dict[str, Any]]:
+        """Cross-user journal: every review job ever recorded, newest
+        first. Used by the /journal page so any authenticated viewer can
+        audit who called what model with how many tokens."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, user, target_owner, target_repo, target_number,
+                       status, created_at, updated_at,
+                       llm_provider, llm_api_base, llm_model,
+                       prompt_tokens, completion_tokens
+                  FROM jobs
+                 ORDER BY created_at DESC
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
 
 # ---------------------------------------------------------------------------
 # (de)serialization helpers
 # ---------------------------------------------------------------------------
+def _latest_token_counts(
+    history: list[dict[str, Any]],
+) -> tuple[Optional[int], Optional[int]]:
+    """Scan the event history backwards for the most recent ``metrics``
+    payload and return its ``in`` / ``out`` totals. Used when a job
+    errors out before a ReviewDraft is built but we still want the
+    journal to show what was consumed."""
+    for event in reversed(history):
+        if event.get("kind") != "metrics":
+            continue
+        text = event.get("text")
+        if not isinstance(text, str):
+            continue
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        p_in = payload.get("in")
+        p_out = payload.get("out")
+        return (
+            p_in if isinstance(p_in, int) and p_in > 0 else None,
+            p_out if isinstance(p_out, int) and p_out > 0 else None,
+        )
+    return None, None
+
+
 def _encode_draft(draft: Optional[ReviewDraft]) -> Optional[str]:
     if draft is None:
         return None

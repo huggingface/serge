@@ -11,7 +11,11 @@
   const jobsTbody = document.getElementById("jobs-tbody");
   const jobsCount = document.getElementById("jobs-count");
   const LLM_PREF_COOKIE = "serge_llm_prefs";
-  const PROVIDER_DEFAULT_MODELS = {
+  // Per-provider default model. Seeded with a hardcoded fallback for
+  // Anthropic so the form still works if /llm-options can't be reached;
+  // loadLlmOptions() overwrites entries with whatever the server reports
+  // (which folds in cfg.llm_model for the system-default provider).
+  const providerDefaultModels = {
     anthropic: "claude-opus-4-6",
   };
 
@@ -105,9 +109,31 @@
   }
 
   function applyProviderModelDefault() {
-    const defaultModel = PROVIDER_DEFAULT_MODELS[providerEl.value];
+    const defaultModel = providerDefaultModels[providerEl.value];
     if (defaultModel && !modelEl.value.trim()) {
       modelEl.value = defaultModel;
+    }
+  }
+
+  function resetModelToProviderDefault() {
+    // Used when the user changes the provider dropdown: always overwrite
+    // the model field, since the previous model name almost certainly
+    // doesn't exist on the new provider. Clears the field when the new
+    // provider has no registered default.
+    modelEl.value = providerDefaultModels[providerEl.value] || "";
+  }
+
+  function ingestProviderDefaults(providers) {
+    if (!Array.isArray(providers)) return;
+    for (const p of providers) {
+      if (
+        p &&
+        typeof p.id === "string" &&
+        typeof p.default_model === "string" &&
+        p.default_model
+      ) {
+        providerDefaultModels[p.id] = p.default_model;
+      }
     }
   }
 
@@ -119,6 +145,7 @@
       providerEl.value = data.default_provider || "hf";
       modelEl.value = data.default_model || "";
       baseUrlEl.value = data.custom_base_url || "";
+      ingestProviderDefaults(data.providers);
       applySavedLlmPrefs();
       applyProviderModelDefault();
       updateProviderFields();
@@ -221,7 +248,7 @@
 
   providerEl.addEventListener("change", () => {
     updateProviderFields();
-    applyProviderModelDefault();
+    resetModelToProviderDefault();
     saveLlmPrefs();
   });
   modelEl.addEventListener("change", saveLlmPrefs);

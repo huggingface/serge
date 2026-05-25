@@ -132,6 +132,22 @@ button.danger:hover { background: var(--danger-hover); }
 button.secondary { background: transparent; border-color: var(--border); color: var(--fg); }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* Anchor styled as a secondary button — used for header nav links so
+   they line up visually with the Sign-out / New-review buttons. */
+a.nav-link {
+  display: inline-block;
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  font-weight: 600;
+  font-size: 0.95rem;
+  text-decoration: none;
+  line-height: 1;
+}
+a.nav-link:hover { opacity: 0.85; }
+
 .actions { display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap; }
 
 .presets {

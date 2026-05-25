@@ -89,6 +89,12 @@ class ReviewDraft:
     # token budget (llm_max_input_tokens) was hit mid-review. Zero in the
     # normal case; non-zero means the review didn't cover every hunk.
     truncated_chunks: int = 0
+    # Cumulative input/output token counts across every LLM call this
+    # review made (all chunks + tool turns + synthesis). Stored as
+    # separate fields so the journal can query them without parsing the
+    # metrics_line string.
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 @dataclass
@@ -1252,6 +1258,8 @@ def prepare_review(
         rejected_count=rejected_count,
         metrics_line=metrics_line,
         truncated_chunks=skipped_chunks_for_budget,
+        prompt_tokens=total_metrics.prompt_tokens,
+        completion_tokens=total_metrics.completion_tokens,
     )
 
 

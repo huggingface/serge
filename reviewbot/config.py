@@ -99,6 +99,11 @@ class Config:
     # running jobs are never pruned.
     web_job_retention: int = 25
     web_dev_no_auth: bool = False
+    # Drop the Secure flag from the session cookie so plain-HTTP works
+    # (typical for VPN-private deployments without TLS termination).
+    # Independent of DEV_NO_AUTH: you can have mandatory auth without
+    # HTTPS as long as the network path is trusted. Default off.
+    web_insecure_cookies: bool = False
     # Optional ``reasoning_effort`` passed through on /v1/chat/completions.
     # Supported by some endpoints (OpenAI o-series, HF Router for the
     # Kimi-K2 thinking variants, etc.). Common values: "low", "medium",
@@ -228,4 +233,5 @@ class Config:
             or "jobs.db",
             web_job_retention=_int_env("WEB_JOB_RETENTION", 25),
             web_dev_no_auth=dev_no_auth,
+            web_insecure_cookies=_bool_env("WEB_INSECURE_COOKIES", False),
         )
