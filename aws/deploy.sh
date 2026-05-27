@@ -8,7 +8,7 @@ STACK_NAME="${STACK_NAME:-ai-reviewer-reviewboard}"
 AWS_REGION="${AWS_REGION:-eu-north-1}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.medium}"
 VOLUME_SIZE_GB="${VOLUME_SIZE_GB:-20}"
-REPO_URL="${REPO_URL:-https://github.com/tarekziade/ai-reviewer.git}"
+REPO_URL="${REPO_URL:-https://github.com/huggingface/ai-reviewer.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 # SUBNET_ID is required — pick a private subnet in your target VPC.
 SUBNET_ID="${SUBNET_ID:-}"

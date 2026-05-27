@@ -10,7 +10,7 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {"LLM_API_KEY": "token"}, clear=True):
             cfg = Config.from_env(require_app=False)
 
-        self.assertEqual(cfg.mention_trigger, "@serge")
+        self.assertEqual(cfg.mention_trigger, "@askserge")
 
     def test_respects_explicit_trigger_override(self) -> None:
         with patch.dict(

@@ -8,7 +8,7 @@ class TriggerTests(unittest.TestCase):
         payload = {
             "action": "created",
             "comment": {
-                "body": "@serge please review",
+                "body": "@askserge please review",
                 "author_association": "MEMBER",
                 "id": 123,
                 "user": {"login": "reviewer"},
@@ -23,7 +23,7 @@ class TriggerTests(unittest.TestCase):
             "repository": {"full_name": "acme/project"},
         }
 
-        req = build_review_request("issue_comment", payload, "@serge")
+        req = build_review_request("issue_comment", payload, "@askserge")
 
         self.assertIsNotNone(req)
         assert req is not None
@@ -37,7 +37,7 @@ class TriggerTests(unittest.TestCase):
             "action": "created",
             "comment": {
                 "id": 4242,
-                "body": "@serge could you help me understand this line?",
+                "body": "@askserge could you help me understand this line?",
                 "author_association": "COLLABORATOR",
                 "user": {"login": "alice"},
                 "path": "src/foo.py",
@@ -50,7 +50,7 @@ class TriggerTests(unittest.TestCase):
             "repository": {"full_name": "acme/project"},
         }
 
-        req = build_review_request("pull_request_review_comment", payload, "@serge")
+        req = build_review_request("pull_request_review_comment", payload, "@askserge")
 
         self.assertIsNotNone(req)
         assert req is not None
@@ -71,7 +71,7 @@ class TriggerTests(unittest.TestCase):
             "action": "created",
             "comment": {
                 "id": 1,
-                "body": "@serge what is this for?",
+                "body": "@askserge what is this for?",
                 "author_association": "MEMBER",
                 "user": {"login": "bob"},
                 "path": "x.py",
@@ -85,7 +85,7 @@ class TriggerTests(unittest.TestCase):
             "repository": {"full_name": "acme/project"},
         }
 
-        req = build_review_request("pull_request_review_comment", payload, "@serge")
+        req = build_review_request("pull_request_review_comment", payload, "@askserge")
 
         assert req is not None and req.inline is not None
         self.assertEqual(req.inline.line, 17)
@@ -96,7 +96,7 @@ class TriggerTests(unittest.TestCase):
             "action": "created",
             "comment": {
                 "id": 1,
-                "body": "@serge",
+                "body": "@askserge",
                 "author_association": "MEMBER",
                 "user": {"login": "bob"},
                 "path": "x.py",
@@ -109,14 +109,14 @@ class TriggerTests(unittest.TestCase):
         }
 
         self.assertIsNone(
-            build_review_request("pull_request_review_comment", payload, "@serge")
+            build_review_request("pull_request_review_comment", payload, "@askserge")
         )
 
     def test_issue_comment_event_has_no_inline_context(self) -> None:
         payload = {
             "action": "created",
             "comment": {
-                "body": "@serge please review",
+                "body": "@askserge please review",
                 "author_association": "MEMBER",
                 "id": 1,
                 "user": {"login": "alice"},
@@ -129,7 +129,7 @@ class TriggerTests(unittest.TestCase):
             "repository": {"full_name": "acme/project"},
         }
 
-        req = build_review_request("issue_comment", payload, "@serge")
+        req = build_review_request("issue_comment", payload, "@askserge")
 
         assert req is not None
         self.assertIsNone(req.inline)
@@ -153,7 +153,7 @@ class TriggerTests(unittest.TestCase):
             "repository": {"full_name": "acme/project"},
         }
 
-        req = build_review_request("issue_comment", payload, "@serge")
+        req = build_review_request("issue_comment", payload, "@askserge")
 
         self.assertIsNone(req)
 

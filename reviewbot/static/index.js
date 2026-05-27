@@ -23,22 +23,22 @@
 
   const PRESETS = {
     "first-pass":
-      "@serge first-pass review. Flag clear correctness, security, and " +
+      "@askserge first-pass review. Flag clear correctness, security, and " +
       "API-shape problems; skip style nits and speculative concerns. " +
       "Use the browse tools to verify any claim before flagging it.",
     "new-model":
-      "@serge this PR adds a new model. Verify the modular file structure, " +
+      "@askserge this PR adds a new model. Verify the modular file structure, " +
       "tokenizer/config/processor wiring, that tests exist and cover the " +
       "model meaningfully, and that the docs entry is in place. Be strict " +
       "about consistency with sibling model implementations — use the " +
       "browse tools to compare.",
     "bugfix":
-      "@serge this is a bug fix. Verify the change actually addresses the " +
+      "@askserge this is a bug fix. Verify the change actually addresses the " +
       "root cause (not just the symptom), confirm a regression test was " +
       "added (or call out clearly that one is missing), and flag any " +
       "unrelated changes that slipped in.",
     "docs":
-      "@serge this is a documentation change. Focus on accuracy, clarity, " +
+      "@askserge this is a documentation change. Focus on accuracy, clarity, " +
       "and whether code samples are runnable. Ignore changes outside of " +
       "docs and docstrings; do not nit on prose style unless it's actively " +
       "misleading.",

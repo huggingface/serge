@@ -1,6 +1,6 @@
 # ai-reviewer
 
-**Source:** [github.com/tarekziade/ai-reviewer](https://github.com/tarekziade/ai-reviewer)
+**Source:** [github.com/huggingface/ai-reviewer](https://github.com/huggingface/ai-reviewer)
 
 Reviews pull requests with any **OpenAI-compatible chat-completion
 service** and posts **inline comments** on the diff via GitHub's
@@ -16,7 +16,7 @@ llama.cpp, or anything else that speaks `/v1/chat/completions`.
 Runs in **two modes** off the same codebase:
 
 1. **GitHub Action** (no server) — drop-in replacement for the original
-   workflow. Triggers on `@serge` comments via `on: issue_comment`.
+   workflow. Triggers on `@askserge` comments via `on: issue_comment`.
 2. **GitHub App** (self-hosted) — long-lived webhook service. Install
    once, review PRs across many repos.
 
@@ -39,7 +39,7 @@ Runs in **two modes** off the same codebase:
 ## How it works
 
 ```
- PR comment containing "@serge"
+ PR comment containing "@askserge"
         │
         ▼
 ┌───────────────────────┐
@@ -60,7 +60,7 @@ Runs in **two modes** off the same codebase:
              └────────────────────────────────────────────┘
 ```
 
-1. A PR comment containing the trigger phrase (default `@serge`) from a
+1. A PR comment containing the trigger phrase (default `@askserge`) from a
    `MEMBER`, `OWNER`, or `COLLABORATOR` arrives — either via webhook
    (App mode) or as an Actions event (Action mode).
 2. The reviewer fetches PR metadata and every changed file with its
@@ -113,7 +113,7 @@ with the job's `GITHUB_TOKEN`. No public server, no App registration.
 
 Drop this workflow into the repository you want reviewed as
 `.github/workflows/ai-review.yml`. The action is referenced directly
-from `tarekziade/ai-reviewer` — no vendoring, no submodules.
+from `huggingface/ai-reviewer` — no vendoring, no submodules.
 
 ```yaml
 name: AI PR Review
@@ -131,29 +131,29 @@ permissions:
 
 jobs:
   review:
-    # Only run for @serge mentions from trusted authors, on open PRs.
+    # Only run for @askserge mentions from trusted authors, on open PRs.
     if: |
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
        github.event.issue.state == 'open' &&
-       contains(github.event.comment.body, '@serge') &&
+       contains(github.event.comment.body, '@askserge') &&
        (github.event.comment.author_association == 'MEMBER' ||
         github.event.comment.author_association == 'OWNER' ||
         github.event.comment.author_association == 'COLLABORATOR')) ||
       (github.event_name == 'pull_request_review_comment' &&
-       contains(github.event.comment.body, '@serge') &&
+       contains(github.event.comment.body, '@askserge') &&
        (github.event.comment.author_association == 'MEMBER' ||
         github.event.comment.author_association == 'OWNER' ||
         github.event.comment.author_association == 'COLLABORATOR'))
     runs-on: ubuntu-latest
     steps:
-      - uses: tarekziade/ai-reviewer@main
+      - uses: huggingface/ai-reviewer@main
         with:
           llm_api_key: ${{ secrets.LLM_API_KEY }}
           llm_api_base: ${{ secrets.LLM_API_BASE || 'https://api.openai.com/v1' }}
 ```
 
-Pin to a commit SHA (`tarekziade/ai-reviewer@<sha>`) or a tag once
+Pin to a commit SHA (`huggingface/ai-reviewer@<sha>`) or a tag once
 you're happy with a version, rather than tracking `main`.
 
 The workflow-level `if:` is redundant with the in-process trigger
@@ -181,7 +181,7 @@ the workflow YAML, store that as a secret too:
 | `llm_api_key`           | —                                             | ✅       |
 | `llm_api_base`          | `https://api.openai.com/v1`                   |          |
 | `llm_model`             | first `id` from `{llm_api_base}/models`       |          |
-| `mention_trigger`       | `@serge`                                      |          |
+| `mention_trigger`       | `@askserge`                                      |          |
 | `review_event`          | `COMMENT`                                     |          |
 | `max_diff_chars`        | `200000`                                      |          |
 | `review_rules_path`     | `.ai/review-rules.md`                         |          |
@@ -197,7 +197,7 @@ the workflow YAML, store that as a secret too:
 On any open PR, post a comment as a collaborator/member/owner:
 
 ```
-@serge please review
+@askserge please review
 ```
 
 Within a few seconds a full PR review lands with inline comments
@@ -209,7 +209,7 @@ To ask a focused question about a specific line, leave an **inline
 review comment** on that line containing the trigger phrase:
 
 ```
-@serge could you help me understand this line of code?
+@askserge could you help me understand this line of code?
 ```
 
 The reviewer replies in the same comment thread (instead of posting a
@@ -339,7 +339,7 @@ install the App on the repositories you want reviewed.
 ### 2. Configure
 
 ```bash
-git clone https://github.com/tarekziade/ai-reviewer.git
+git clone https://github.com/huggingface/ai-reviewer.git
 cd ai-reviewer
 python -m venv .venv && source .venv/bin/activate
 pip install .
@@ -593,7 +593,7 @@ tests/                           unittest-based test suite
 
 - **No queue** in App mode: reviews run in a thread per webhook. Fine
   for small teams; swap for RQ/Celery/SQS if you need durability.
-- **No rate limiting**: spamming `@serge` triggers one review per
+- **No rate limiting**: spamming `@askserge` triggers one review per
   comment. Add a cooldown keyed on `(repo, pr, commenter)` if needed.
 - **Single-shot LLM call**: no multi-turn repo exploration like
   `claude-code-action` would do. Add tool use if you want the model to

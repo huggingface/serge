@@ -26,7 +26,7 @@ def _make_cfg(**overrides) -> Config:
         llm_bill_to=None,
         llm_max_tokens=4096,
         llm_stream=False,
-        mention_trigger="@serge",
+        mention_trigger="@askserge",
         review_event="COMMENT",
         max_diff_chars=200000,
         review_rules_path=".ai/review-rules.md",

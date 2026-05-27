@@ -30,7 +30,7 @@ inputs:
   mention_trigger:
     description: 'Phrase that must appear in a comment to trigger a review.'
     required: false
-    default: '@serge'
+    default: '@askserge'
   review_event:
     description: 'One of COMMENT, REQUEST_CHANGES, APPROVE (fallback if the LLM omits one).'
     required: false

@@ -204,7 +204,7 @@ class Config:
             llm_stream=_bool_env("LLM_STREAM", True),
             llm_reasoning_effort=(os.environ.get("LLM_REASONING_EFFORT") or "").strip()
             or None,
-            mention_trigger=os.environ.get("MENTION_TRIGGER", "@serge"),
+            mention_trigger=os.environ.get("MENTION_TRIGGER", "@askserge"),
             review_event=os.environ.get("REVIEW_EVENT", "COMMENT"),
             max_diff_chars=_int_env("MAX_DIFF_CHARS", 200000),
             review_rules_path=os.environ.get(

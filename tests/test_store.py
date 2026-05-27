@@ -18,7 +18,7 @@ class JobStoreTests(unittest.TestCase):
                 target_owner="owner",
                 target_repo="repo",
                 target_number=123,
-                trigger_comment="@serge please review",
+                trigger_comment="@askserge please review",
                 llm_provider="openai",
                 llm_api_base="https://api.openai.com/v1",
                 llm_model="gpt-4.1",
