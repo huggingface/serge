@@ -627,8 +627,13 @@ def _merge_chunk_event(events: list[str], comments_count: int) -> str:
 
 _DEFAULT_FORCE_FINAL_MESSAGE = (
     "You have used all available tool calls. Based on what you have "
-    "already gathered, produce the final JSON review now. Do not "
-    "request any more tools."
+    "already gathered, produce the final review now as a single JSON "
+    "object with EXACTLY these keys:\n"
+    '  - "summary": a non-empty markdown string with your overall review\n'
+    '  - "event": one of "COMMENT", "REQUEST_CHANGES", or "APPROVE"\n'
+    '  - "comments": an array of inline comments (may be empty)\n'
+    "Reply with the JSON object only — no surrounding prose, no code "
+    "fences, no extra commentary. Do not request any more tools."
 )
 
 
@@ -1204,6 +1209,24 @@ def prepare_review(
 
         summary = (result.get("summary") or "").strip()
         event = result.get("event") or cfg.review_event
+        # Fallback: forced-final turns sometimes return a stub JSON
+        # object alongside the actual review written as prose. Since
+        # `_extract_json` accepts the first decodable `{...}`, we can
+        # end up with an empty `summary` while the model's real
+        # write-up sits in `chat.content`. Use the raw content rather
+        # than publishing an empty "(no overall summary provided)".
+        if (
+            not summary
+            and not (result.get("comments") or [])
+            and chat.content
+            and chat.content.strip()
+        ):
+            summary = chat.content.strip()
+            log.warning(
+                "Parsed JSON yielded empty summary/comments; using "
+                "raw content (%d chars) as summary",
+                len(summary),
+            )
         if event not in ("COMMENT", "REQUEST_CHANGES", "APPROVE"):
             event = cfg.review_event
         if event == "APPROVE" and not cfg.allow_approve:
