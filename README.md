@@ -10,7 +10,7 @@ It runs in three modes off the same codebase. Pick one:
 
 | Mode | Best for | Infra |
 | ---- | -------- | ----- |
-| **GitHub Action** | Trying it out, per-repo control | None (runs on Actions) |
+| **GitHub Action** | Trying it out, per-repo control on same-repo PRs | None (runs on Actions) |
 | **GitHub App** | Many repos, auto-review on every mention | A hosted webhook server |
 | **Web app** | Human-in-the-loop: edit a review before posting | A hosted server + OAuth |
 
@@ -55,7 +55,16 @@ jobs:
 Then comment `@askserge please review` on any open PR. `issues: write` is
 needed so the bot can react to your comment and post error messages.
 
+**Forked PRs:** GitHub does not pass repository secrets to workflows triggered
+from forks, and the `GITHUB_TOKEN` is usually read-only. That means the Action
+cannot safely receive `LLM_API_KEY` or post review comments on forked PRs. For
+fork-heavy repositories, use the GitHub App or Web app modes instead.
+
 ### Mode 2 — GitHub App (hosted)
+
+GitHub App mode requires you to run a small HTTPS webhook server. GitHub sends
+comment events to that server; the server verifies the webhook, calls the LLM,
+and posts back to GitHub with the App installation token.
 
 1. **Create the App** (Settings → Developer settings → GitHub Apps → New):
    - Permissions: Pull requests **R/W**, Contents **R**, Issues **R**, Metadata **R**

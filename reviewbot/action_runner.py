@@ -18,6 +18,12 @@ from .reviewer import run_followup, run_review
 from .triggers import build_review_request
 
 
+FORKED_PR_ACTION_MESSAGE = (
+    "I can't comment on forked PRs from this GitHub Actions workflow. "
+    "You should use me through the review app or GitHub App."
+)
+
+
 def _format_llm_response_error(exc: LLMResponseError) -> str:
     excerpt = exc.body_preview.strip()
     if len(excerpt) > 600:
@@ -26,6 +32,48 @@ def _format_llm_response_error(exc: LLMResponseError) -> str:
     if excerpt:
         return f"LLM endpoint returned {exc.status_code}{reason_part}: {excerpt}"
     return f"LLM endpoint returned {exc.status_code}{reason_part}"
+
+
+def _write_step_summary(message: str) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write(f"{message}\n")
+    except OSError:
+        logging.getLogger("ai-reviewer.action").debug(
+            "failed to write GitHub step summary", exc_info=True
+        )
+
+
+def _event_payload_is_from_fork(payload: dict) -> bool:
+    pr = payload.get("pull_request")
+    if not isinstance(pr, dict):
+        return False
+    head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
+    base_repo = ((pr.get("base") or {}).get("repo") or {}).get("full_name")
+    return bool(head_repo and base_repo and head_repo != base_repo)
+
+
+def _post_failure_comment(
+    gh: GitHubClient, req, body: str, *, fork_message: str | None = None
+) -> None:
+    log = logging.getLogger("ai-reviewer.action")
+    try:
+        # On inline-comment failures, post the failure as a reply on the
+        # same thread so the commenter sees it in-context.
+        if req.inline is not None:
+            gh.reply_to_review_comment(
+                req.owner, req.repo, req.number, req.inline.comment_id, body
+            )
+        else:
+            gh.post_issue_comment(req.owner, req.repo, req.number, body)
+    except Exception as post_exc:
+        log.warning("failed to post failure comment to PR: %s", post_exc)
+        if fork_message:
+            log.warning(fork_message)
+            _write_step_summary(fork_message)
 
 
 def main() -> int:
@@ -55,11 +103,6 @@ def main() -> int:
 
     cfg = Config.from_env(require_app=False)
     cfg.llm_api_key = cfg.llm_api_key.strip()
-    if not cfg.llm_api_key:
-        log.error(
-            "LLM_API_KEY missing (forgot to pass it via env or inputs.llm_api_key?)"
-        )
-        return 1
 
     req = build_review_request(event_name, payload, cfg.mention_trigger)
     if req is None:
@@ -71,6 +114,21 @@ def main() -> int:
         return 0
 
     gh = GitHubClient(token)
+    forked_pr = _event_payload_is_from_fork(payload)
+    if not cfg.llm_api_key:
+        message = (
+            FORKED_PR_ACTION_MESSAGE
+            if forked_pr
+            else "LLM_API_KEY missing (forgot to pass it via env or inputs.llm_api_key?)"
+        )
+        log.error(message)
+        if forked_pr:
+            body = message
+            if cfg.persona_header:
+                body = f"{cfg.persona_header}\n\n{body}"
+            _post_failure_comment(gh, req, body, fork_message=message)
+        return 1
+
     try:
         if req.inline is not None:
             run_followup(cfg, gh, req)
@@ -82,34 +140,24 @@ def main() -> int:
         body = f"⚠️ Review failed: `{message}`"
         if cfg.persona_header:
             body = f"{cfg.persona_header}\n\n{body}"
-        try:
-            # On inline-comment failures, post the failure as a reply
-            # on the same thread so the commenter sees it in-context.
-            if req.inline is not None:
-                gh.reply_to_review_comment(
-                    req.owner, req.repo, req.number, req.inline.comment_id, body
-                )
-            else:
-                gh.post_issue_comment(req.owner, req.repo, req.number, body)
-        except Exception as post_exc:
-            log.warning("failed to post failure comment to PR: %s", post_exc)
+        _post_failure_comment(
+            gh,
+            req,
+            body,
+            fork_message=FORKED_PR_ACTION_MESSAGE if forked_pr else None,
+        )
         return 1
     except Exception as exc:
         log.exception("review failed")
         body = f"⚠️ Review failed: `{type(exc).__name__}: {exc}`"
         if cfg.persona_header:
             body = f"{cfg.persona_header}\n\n{body}"
-        try:
-            # On inline-comment failures, post the failure as a reply
-            # on the same thread so the commenter sees it in-context.
-            if req.inline is not None:
-                gh.reply_to_review_comment(
-                    req.owner, req.repo, req.number, req.inline.comment_id, body
-                )
-            else:
-                gh.post_issue_comment(req.owner, req.repo, req.number, body)
-        except Exception as post_exc:
-            log.warning("failed to post failure comment to PR: %s", post_exc)
+        _post_failure_comment(
+            gh,
+            req,
+            body,
+            fork_message=FORKED_PR_ACTION_MESSAGE if forked_pr else None,
+        )
         return 1
     return 0
 

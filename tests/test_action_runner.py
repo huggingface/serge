@@ -17,8 +17,8 @@ def _write_event(payload: dict) -> str:
     return path
 
 
-def _inline_comment_payload() -> dict:
-    return {
+def _inline_comment_payload(*, fork: bool = False) -> dict:
+    payload = {
         "action": "created",
         "comment": {
             "id": 3322017554,
@@ -33,6 +33,14 @@ def _inline_comment_payload() -> dict:
         "pull_request": {"number": 13827, "state": "open"},
         "repository": {"full_name": "huggingface/diffusers"},
     }
+    if fork:
+        payload["pull_request"]["head"] = {
+            "repo": {"full_name": "akshan-main/diffusers"}
+        }
+        payload["pull_request"]["base"] = {
+            "repo": {"full_name": "huggingface/diffusers"}
+        }
+    return payload
 
 
 class ActionRunnerTests(unittest.TestCase):
@@ -56,6 +64,41 @@ class ActionRunnerTests(unittest.TestCase):
         self.assertEqual(code, 1)
         run_followup.assert_not_called()
         self.assertIn("LLM_API_KEY missing", "\n".join(logs.output))
+
+    def test_forked_pr_with_missing_llm_api_key_uses_action_message(self) -> None:
+        event_path = _write_event(_inline_comment_payload(fork=True))
+        self.addCleanup(os.remove, event_path)
+        fd, summary_path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(os.remove, summary_path)
+        env = {
+            "GITHUB_EVENT_NAME": "pull_request_review_comment",
+            "GITHUB_EVENT_PATH": event_path,
+            "GITHUB_STEP_SUMMARY": summary_path,
+            "GITHUB_TOKEN": "github-token",
+            "LLM_API_KEY": "",
+        }
+
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("reviewbot.action_runner.run_followup") as run_followup,
+            patch("reviewbot.action_runner.GitHubClient") as github_client,
+            self.assertLogs("ai-reviewer.action", level="WARNING") as logs,
+        ):
+            github_client.return_value.reply_to_review_comment.side_effect = (
+                requests.HTTPError("403 Resource not accessible by integration")
+            )
+            code = action_runner.main()
+
+        self.assertEqual(code, 1)
+        run_followup.assert_not_called()
+        github_client.return_value.reply_to_review_comment.assert_called_once()
+        body = github_client.return_value.reply_to_review_comment.call_args.args[-1]
+        self.assertIn(action_runner.FORKED_PR_ACTION_MESSAGE, body)
+        output = "\n".join(logs.output)
+        self.assertIn(action_runner.FORKED_PR_ACTION_MESSAGE, output)
+        with open(summary_path) as f:
+            self.assertIn(action_runner.FORKED_PR_ACTION_MESSAGE, f.read())
 
     def test_llm_api_key_is_stripped_before_review(self) -> None:
         event_path = _write_event(_inline_comment_payload())
