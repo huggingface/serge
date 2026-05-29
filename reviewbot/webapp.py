@@ -7,7 +7,9 @@ GitHub App identity — OAuth is only used for access control.
 
 import asyncio
 import dataclasses
+import hashlib
 import html as _html
+import hmac
 import json as _json
 import logging
 import os
@@ -17,6 +19,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -50,8 +53,11 @@ from .reviewer import (
     _UnparseableLLMOutput,
     prepare_review,
     publish_review,
+    run_followup,
+    run_review,
 )
 from .store import JobStore, decode_draft
+from .triggers import build_review_request
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -288,6 +294,54 @@ _clone_cache = CloneCache(cfg.web_clone_cache_dir)
 # Jobs left mid-flight by a previous process are marked crashed above;
 # their worktrees are orphaned, so clear them on startup.
 _clone_cache.reset_worktrees()
+
+# Same immediate-review webhook behavior as the legacy Flask app, now
+# hosted by reviewbot-web at /webhook. Keep this separate from the staged
+# review worker pool so a burst of GitHub comments cannot starve UI jobs.
+_WEBHOOK_MAX_WORKERS = int(os.environ.get("WEBHOOK_MAX_WORKERS", "2"))
+_WEBHOOK_REVIEW_POOL = ThreadPoolExecutor(
+    max_workers=_WEBHOOK_MAX_WORKERS,
+    thread_name_prefix="webhook-review-worker",
+)
+
+
+def _verify_webhook_signature(body: bytes, header: str) -> bool:
+    secret = cfg.github_webhook_secret
+    if not secret or not header or not header.startswith("sha256="):
+        return False
+    mac = hmac.new(secret.encode(), body, hashlib.sha256)
+    expected = "sha256=" + mac.hexdigest()
+    return hmac.compare_digest(expected, header)
+
+
+def _run_webhook_review_worker(installation_id: int, req: ReviewRequest) -> None:
+    try:
+        assert cfg.github_app_id and cfg.github_private_key
+        llm_api_key = cfg.llm_api_key.strip()
+        if not llm_api_key:
+            log.error(
+                "webhook review for %s/%s#%d skipped: LLM_API_KEY is not configured",
+                req.owner,
+                req.repo,
+                req.number,
+            )
+            return
+        token = installation_token(
+            cfg.github_app_id, cfg.github_private_key, installation_id
+        )
+        gh = GitHubClient(token)
+        worker_cfg = dataclasses.replace(cfg, llm_api_key=llm_api_key)
+        if req.inline is not None:
+            run_followup(worker_cfg, gh, req)
+        else:
+            run_review(worker_cfg, gh, req)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "webhook review worker crashed for %s/%s#%d",
+            req.owner,
+            req.repo,
+            req.number,
+        )
 
 
 def _infer_llm_provider(api_base: str) -> str:
@@ -715,6 +769,39 @@ async def _no_cache_static(request: Request, call_next):
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
     return response
+
+
+@app.post("/webhook")
+async def github_app_webhook(request: Request) -> Response:
+    body = await request.body()
+    if not cfg.github_webhook_secret:
+        log.error("rejected GitHub webhook: GITHUB_WEBHOOK_SECRET is not configured")
+        raise HTTPException(status_code=503, detail="webhook_not_configured")
+    sig = request.headers.get("X-Hub-Signature-256", "")
+    if not _verify_webhook_signature(body, sig):
+        log.warning("rejected GitHub webhook with bad signature")
+        raise HTTPException(status_code=401, detail="bad_signature")
+
+    event = request.headers.get("X-GitHub-Event", "")
+    try:
+        payload = _json.loads(body.decode("utf-8") or "{}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="bad_json") from exc
+
+    if event == "ping":
+        return JSONResponse({"pong": True})
+
+    req = build_review_request(event, payload, cfg.mention_trigger)
+    if req is None:
+        return Response(status_code=204)
+
+    installation = payload.get("installation") or {}
+    installation_id = installation.get("id")
+    if not isinstance(installation_id, int):
+        return Response(status_code=204)
+
+    _WEBHOOK_REVIEW_POOL.submit(_run_webhook_review_worker, installation_id, req)
+    return JSONResponse({"status": "accepted"}, status_code=202)
 
 
 def _require_user(request: Request) -> str:

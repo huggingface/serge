@@ -60,11 +60,13 @@ from forks, and the `GITHUB_TOKEN` is usually read-only. That means the Action
 cannot safely receive `LLM_API_KEY` or post review comments on forked PRs. For
 fork-heavy repositories, use the GitHub App or Web app modes instead.
 
-### Mode 2 — GitHub App (hosted)
+### Mode 2 — GitHub App webhooks
 
-GitHub App mode requires you to run a small HTTPS webhook server. GitHub sends
-comment events to that server; the server verifies the webhook, calls the LLM,
-and posts back to GitHub with the App installation token.
+GitHub App webhooks are served by the same `reviewbot-web` FastAPI app used
+for staged reviews. GitHub sends comment events to `POST /webhook`; the app
+verifies the webhook, calls the LLM, and posts back to GitHub with the App
+installation token. No separate `reviewbot-app` process is needed for the
+hosted deployment.
 
 1. **Create the App** (Settings → Developer settings → GitHub Apps → New):
    - Permissions: Pull requests **R/W**, Contents **R**, Issues **R**, Metadata **R**
@@ -82,23 +84,24 @@ and posts back to GitHub with the App installation token.
    cp .env.example .env && $EDITOR .env   # fill in App + LLM credentials
    set -a; source .env; set +a
 
-   reviewbot-app                                   # dev
-   gunicorn -w 2 -b 0.0.0.0:8080 reviewbot.app:app # production
+   pip install -e '.[web]'
+   reviewbot-web                                  # http://localhost:8080
    ```
 
    Required env: `GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY_PATH` (or
    `GITHUB_PRIVATE_KEY`), `GITHUB_WEBHOOK_SECRET`, `LLM_API_BASE`, `LLM_API_KEY`.
 
-Expose the server over HTTPS and point the App's webhook at it. For local
-testing, tunnel with [smee.io](https://smee.io) or `cloudflared`.
+Expose the server over HTTPS and point the App's webhook at
+`https://<your-host>/webhook`. For local testing, tunnel with
+[smee.io](https://smee.io) or `cloudflared`.
 
 ### Mode 3 — Web app (review before posting)
 
-A FastAPI app (`reviewbot-web`) where a signed-in user starts a review from a
-form, watches the LLM stream live, then edits the summary and per-comment text
-(or drops comments) before publishing. Reviews are still posted under the
-GitHub App identity — OAuth is only for access control. Per-repo LLM provider
-keys are stored in the app's database, managed from an admin page.
+A signed-in user starts a review from a form, watches the LLM stream live,
+then edits the summary and per-comment text (or drops comments) before
+publishing. Reviews are still posted under the GitHub App identity — OAuth is
+only for access control. Per-repo LLM provider keys are stored in the app's
+database, managed from an admin page.
 
 ```bash
 pip install -e '.[web]'
