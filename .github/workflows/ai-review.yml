@@ -24,9 +24,6 @@ on:
 
 permissions:
   contents: read
-  # Required so the Tailscale action can mint a GitHub OIDC JWT and
-  # authenticate to the tailnet via workload-identity federation.
-  id-token: write
 
 jobs:
   forward-to-serge-app:
@@ -63,7 +60,7 @@ jobs:
           # long-lived auth key is stored. The runner joins as an
           # ephemeral, tag:ci-tagged node.
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID_AI_REVIEW }}
-          audience: ${{ secrets.TS_AUDIENCE_AI_REVIEW }}
+          oauth-secret: ${{ secrets.TS_AUDIENCE_AI_REVIEW }}
           tags: tag:ci
 
       - name: Relay event to the Serge GitHub App
