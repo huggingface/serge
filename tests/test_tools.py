@@ -54,6 +54,20 @@ class _TempRepo(unittest.TestCase):
                 "done\n"
             )
         os.chmod(os.path.join(self.repo_root, "tools", "helper.sh"), 0o755)
+        # An identical helper under .ai/ — the only repo location a helper
+        # command is allowed to resolve to (the clone cache forces .ai/ to
+        # the upstream default branch).
+        os.makedirs(os.path.join(self.repo_root, ".ai"))
+        with open(os.path.join(self.repo_root, ".ai", "helper.sh"), "w") as f:
+            f.write(
+                "#!/bin/sh\n"
+                "printf 'cwd=%s\\n' \"$(pwd)\"\n"
+                "printf 'argc=%s\\n' \"$#\"\n"
+                'for arg in "$@"; do\n'
+                "  printf 'arg=%s\\n' \"$arg\"\n"
+                "done\n"
+            )
+        os.chmod(os.path.join(self.repo_root, ".ai", "helper.sh"), 0o755)
         # Pretend there's a .git dir so the denylist has something to bite on
         os.makedirs(os.path.join(self.repo_root, ".git", "refs"))
         # Real git init so `git grep` works in the grep tests
@@ -188,14 +202,14 @@ class ResolvePathTests(_TempRepo):
         )
         self.assertIn("args", helper_spec["function"]["parameters"]["properties"])
 
-    def test_repo_helper_runs_repo_relative_command(self) -> None:
+    def test_repo_helper_runs_dot_ai_command(self) -> None:
         env = ToolEnv(
             repo_root=self.repo_root,
             helper_tools={
                 "fixture_helper": RepoHelperTool(
                     name="fixture_helper",
                     description="Run the fixture helper script.",
-                    command=("./tools/helper.sh",),
+                    command=("./.ai/helper.sh",),
                     allow_args=True,
                     max_args=2,
                 )
@@ -208,6 +222,25 @@ class ResolvePathTests(_TempRepo):
         self.assertIn("argc=2", out)
         self.assertIn("arg=alpha", out)
         self.assertIn("arg=beta", out)
+
+    def test_repo_helper_rejects_command_outside_dot_ai(self) -> None:
+        # A path-form command pointing into the fork tree (outside .ai/)
+        # is refused — only PATH binaries or .ai/ scripts may run.
+        env = ToolEnv(
+            repo_root=self.repo_root,
+            helper_tools={
+                "fixture_helper": RepoHelperTool(
+                    name="fixture_helper",
+                    description="Run the fixture helper script.",
+                    command=("./tools/helper.sh",),
+                )
+            },
+        )
+
+        out = run_tool(env, "fixture_helper", {})
+
+        self.assertTrue(out.startswith("error:"), out)
+        self.assertIn("must be a PATH binary or live under .ai/", out)
 
     def test_repo_helper_rejects_args_when_not_allowed(self) -> None:
         env = ToolEnv(

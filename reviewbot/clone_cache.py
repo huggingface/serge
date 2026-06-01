@@ -45,6 +45,11 @@ log = logging.getLogger(__name__)
 # inject a refspec.
 _SAFE = re.compile(r"[^A-Za-z0-9._-]")
 
+# Config directory whose contents we force to the repo's default branch.
+_AI_DIR = ".ai"
+# Per-bare-repo ref holding the default-branch tip used for the overlay.
+_BASE_REF = "_reviewbot_base"
+
 
 def _slug(value: str) -> str:
     return _SAFE.sub("-", value)
@@ -134,6 +139,62 @@ class CloneCache:
         # Applied to every worktree checkout off this repo.
         self._git(bare, "config", "core.symlinks", "false", timeout=30)
 
+    def _overlay_base_ai(
+        self,
+        bare: str,
+        wt: str,
+        url: str,
+        auth_args: list[str],
+        redact: tuple[str, ...],
+    ) -> None:
+        """Replace the worktree's ``.ai/`` with the repo's default-branch
+        copy. The "clone main, grab .ai/, then check out the fork" flow,
+        expressed against the shared bare repo.
+
+        Fail-closed: if the default branch can't be fetched we drop the
+        PR's ``.ai/`` entirely rather than trust a copy the PR author
+        could have tampered with. The caller holds the per-repo lock."""
+        ai_path = os.path.join(wt, _AI_DIR)
+        try:
+            # Fetch the remote's default branch (HEAD) shallowly into a
+            # stable ref. "+" forces it so a moved default tip overwrites.
+            self._git(
+                bare,
+                *auth_args,
+                "fetch",
+                "--depth",
+                "1",
+                url,
+                f"+HEAD:{_BASE_REF}",
+                timeout=120,
+                redact=redact,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            log.warning(
+                "could not fetch default branch for .ai overlay (%s); "
+                "dropping the PR's .ai/ to stay fail-closed",
+                type(exc).__name__,
+            )
+            shutil.rmtree(ai_path, ignore_errors=True)
+            return
+        # Whatever the PR shipped under .ai/ is discarded unconditionally.
+        shutil.rmtree(ai_path, ignore_errors=True)
+        # Only materialize the upstream .ai/ if the default branch has one.
+        exists = self._git(
+            bare, "cat-file", "-e", f"{_BASE_REF}:{_AI_DIR}", check=False, timeout=30
+        )
+        if exists.returncode != 0:
+            return
+        self._git(
+            wt,
+            "checkout",
+            _BASE_REF,
+            "--",
+            _AI_DIR,
+            timeout=60,
+            redact=redact,
+        )
+
     # -- public API --------------------------------------------------------
 
     def acquire(
@@ -202,6 +263,12 @@ class CloneCache:
                     timeout=60,
                     redact=redact,
                 )
+                # Configuration under .ai/ must come from the repo's own
+                # default branch (upstream), never the PR head — a fork PR
+                # could otherwise ship a malicious .ai/context-script or
+                # helper-tool script that we'd execute. Replace the PR's
+                # .ai/ with the default branch's.
+                self._overlay_base_ai(bare, wt, url, auth_args, redact)
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
                 stderr = ""
                 if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:

@@ -46,6 +46,9 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .sandbox import AUTO, SandboxUnavailable, wrap_command
+from .tools import _helper_subprocess_env
+
 log = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 8000
@@ -136,18 +139,27 @@ def run_context_script(
     files: list[dict],
     timeout_seconds: int,
     cwd: Optional[str] = None,
+    sandbox_mode: str = AUTO,
 ) -> Optional[ContextScriptResult]:
     """Run `script_path` and return its parsed result, or None if nothing useful.
 
     A return of None means "don't change anything" — for any of: not
-    configured, file missing, not executable, timed out, crashed,
-    non-zero exit, or empty output. We never raise to the caller;
-    failures are logged and swallowed because a broken context hook
-    should not break the review.
+    configured, no checkout to run against, file missing, not executable,
+    timed out, crashed, non-zero exit, or empty output. We never raise to
+    the caller; failures are logged and swallowed because a broken context
+    hook should not break the review.
+
+    The script is PR-influenced (it lives under .ai/ in the checkout), so
+    it runs inside the bubblewrap sandbox — no network, no host secrets,
+    only the checkout writable — and with a scrubbed environment.
     """
     if not script_path:
         return None
-    base = cwd or os.getcwd()
+    # The context script only makes sense against a checkout; without one
+    # there is nothing to sandbox or run.
+    if not cwd:
+        return None
+    base = cwd
     full = (
         script_path if os.path.isabs(script_path) else os.path.join(base, script_path)
     )
@@ -167,13 +179,22 @@ def run_context_script(
     )
 
     try:
+        argv = wrap_command(
+            [full], workdir=base, write_root=base, mode=sandbox_mode
+        )
+    except SandboxUnavailable as exc:
+        log.warning("context script not run (sandbox unavailable): %s", exc)
+        return None
+
+    try:
         proc = subprocess.run(
-            [full],
+            argv,
             input=payload,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
             cwd=base,
+            env=_helper_subprocess_env(),
         )
     except subprocess.TimeoutExpired:
         log.warning("context script %s timed out after %ds", full, timeout_seconds)

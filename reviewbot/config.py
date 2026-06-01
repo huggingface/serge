@@ -5,6 +5,9 @@ import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
+from . import sandbox
+from .sandbox import normalize_mode as normalize_sandbox_mode
+
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +89,13 @@ class Config:
     # When true, published reviews carry a note that they came from a
     # non-production (staging) deployment. Set via the STAGING env var.
     is_staging: bool = False
+
+    # Isolation policy for subprocesses that touch the PR tree (helper
+    # tools, the .ai/context-script). One of "require" | "auto" | "off";
+    # see reviewbot/sandbox.py and docs/security-architecture.md.
+    # Production sets "require"; defaults to "auto" so unit tests and
+    # local dev (no bubblewrap) run unsandboxed.
+    helper_sandbox: str = sandbox.AUTO
 
     # Web-mode (reviewbot-web) settings. All optional in webhook/Action
     # modes; required only when require_web=True.
@@ -242,6 +252,7 @@ class Config:
             ),
             context_script_timeout=_int_env("CONTEXT_SCRIPT_TIMEOUT", 30),
             repo_checkout_path=(os.environ.get("REPO_CHECKOUT_PATH") or "").strip(),
+            helper_sandbox=normalize_sandbox_mode(os.environ.get("HELPER_SANDBOX")),
             # Set TOOL_MAX_ITERATIONS=0 to disable the cap entirely;
             # otherwise the agentic loop bails out after this many
             # blind tool-call turns and asks for a final answer with

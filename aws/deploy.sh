@@ -187,7 +187,9 @@ USER_DATA="$(cat <<EOF
 set -euxo pipefail
 
 dnf update -y
-dnf install -y git python3.11 python3.11-pip
+# bubblewrap sandboxes the PR-touching helper/context subprocesses; with
+# HELPER_SANDBOX=require the app refuses to run them if it's missing.
+dnf install -y git python3.11 python3.11-pip bubblewrap
 
 install -d -o ec2-user -g ec2-user /opt/app
 sudo -u ec2-user git clone --branch ${REPO_BRANCH} ${REPO_URL} ${APP_DIR}

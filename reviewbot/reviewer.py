@@ -411,6 +411,7 @@ def _make_tool_env(
         env = ToolEnv(
             repo_root=cfg.repo_checkout_path,
             helper_tools={tool.name: tool for tool in helper_tools or []},
+            sandbox_mode=cfg.helper_sandbox,
         )
     except Exception:
         log.exception("repo checkout path invalid; running without browse tools")
@@ -1066,6 +1067,8 @@ def prepare_review(
         body=pr.get("body") or "",
         files=files,
         timeout_seconds=cfg.context_script_timeout,
+        cwd=cfg.repo_checkout_path or None,
+        sandbox_mode=cfg.helper_sandbox,
     )
     skip_paths: set[str] = set(ctx_result.skip_files) if ctx_result else set()
     extra_context = ctx_result.context if ctx_result else None

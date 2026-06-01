@@ -29,6 +29,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from .sandbox import AUTO, SandboxUnavailable, wrap_command
+
 log = logging.getLogger(__name__)
 
 
@@ -553,6 +555,8 @@ class ToolEnv:
 
     repo_root: str
     helper_tools: dict[str, RepoHelperTool] = field(default_factory=dict)
+    # Isolation policy for helper subprocesses; see reviewbot/sandbox.py.
+    sandbox_mode: str = AUTO
 
     def __post_init__(self) -> None:
         self.repo_root = os.path.realpath(self.repo_root)
@@ -778,9 +782,20 @@ def _fetch_url(args: dict[str, Any]) -> str:
 
 
 def _resolve_helper_command(env: ToolEnv, raw: str) -> str:
+    # A bare name (no slash) is looked up on PATH — a system or
+    # pip-installed binary, never fork-tree content.
     if "/" not in raw:
         return raw
+    # A path-form command may only resolve under .ai/, which the clone
+    # cache forces to the repo's default branch (upstream). This stops a
+    # fork PR from pointing a helper at an executable it shipped elsewhere
+    # in its tree (e.g. ./scripts/lint.sh).
     path = _resolve_path(env, raw, default="")
+    ai_root = os.path.join(env.repo_root, ".ai")
+    if path != ai_root and not path.startswith(ai_root + os.sep):
+        raise _ToolError(
+            f"helper command {raw!r} must be a PATH binary or live under .ai/"
+        )
     if not os.path.isfile(path):
         raise _ToolError(f"helper command path is not a file: {raw}")
     return path
@@ -824,9 +839,17 @@ def _run_repo_helper(env: ToolEnv, helper: RepoHelperTool, args: dict[str, Any])
         *extra_args,
     ]
     rel_cwd = os.path.relpath(cwd, env.repo_root) or "."
+    # Isolate the subprocess: no network, no host secrets, only the
+    # worktree is writable. See reviewbot/sandbox.py.
+    try:
+        argv = wrap_command(
+            command, workdir=cwd, write_root=env.repo_root, mode=env.sandbox_mode
+        )
+    except SandboxUnavailable as exc:
+        raise _ToolError(str(exc)) from exc
     try:
         proc = subprocess.run(
-            command,
+            argv,
             cwd=cwd,
             capture_output=True,
             text=True,

@@ -54,6 +54,14 @@ class CloneCacheTests(unittest.TestCase):
             remote_url=self.src,
         )
 
+    def _commit(self, path, content):
+        full = os.path.join(self.src, path)
+        os.makedirs(os.path.dirname(full) or self.src, exist_ok=True)
+        with open(full, "w") as f:
+            f.write(content)
+        _git(self.src, "add", "-A")
+        _git(self.src, "commit", "--quiet", "-m", f"set {path}")
+
     def test_acquire_checks_out_pr_head(self):
         co = self._acquire()
         self.assertIsNotNone(co)
@@ -114,6 +122,38 @@ class CloneCacheTests(unittest.TestCase):
             remote_url=self.src,
         )
         self.assertIsNone(co)
+
+    def test_ai_overlay_uses_default_branch_not_pr_head(self):
+        # main (the default branch) carries the trusted .ai/ config.
+        self._commit(".ai/rules.md", "UPSTREAM RULES\n")
+        # A PR commit tampers with .ai/ and ships a fork script.
+        _git(self.src, "checkout", "--quiet", "-b", "attacker")
+        self._commit(".ai/rules.md", "MALICIOUS RULES\n")
+        self._commit("evil.sh", "#!/bin/sh\necho pwned\n")
+        _git(self.src, "update-ref", "refs/pull/2/head", "HEAD")
+        # Restore main as the remote's default branch (HEAD).
+        _git(self.src, "checkout", "--quiet", "main")
+
+        co = self._acquire(number=2, job_id="job-overlay")
+        self.assertIsNotNone(co)
+        # .ai/ is the default branch's copy, never the PR's.
+        with open(os.path.join(co.path, ".ai", "rules.md")) as f:
+            self.assertEqual(f.read(), "UPSTREAM RULES\n")
+        # Non-.ai PR content is still the PR head's.
+        self.assertTrue(os.path.isfile(os.path.join(co.path, "evil.sh")))
+
+    def test_ai_overlay_drops_pr_ai_when_default_branch_has_none(self):
+        # Default branch (main) has no .ai/ at all; the PR introduces one.
+        _git(self.src, "checkout", "--quiet", "-b", "attacker2")
+        self._commit(".ai/context-script", "#!/bin/sh\necho pwned\n")
+        _git(self.src, "update-ref", "refs/pull/3/head", "HEAD")
+        _git(self.src, "checkout", "--quiet", "main")
+
+        co = self._acquire(number=3, job_id="job-noai")
+        self.assertIsNotNone(co)
+        # Fail-closed: an .ai/ the upstream default branch doesn't have is
+        # dropped rather than trusted.
+        self.assertFalse(os.path.exists(os.path.join(co.path, ".ai")))
 
 
 if __name__ == "__main__":
