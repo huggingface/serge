@@ -83,6 +83,7 @@ jobs:
 
           HTTP_CODE=$(curl --silent --show-error --fail-with-body \
             --output response.txt --write-out '%{http_code}' \
+            --connect-timeout 10 --max-time 60 \
             --request POST "${WEBHOOK_URL}" \
             --header "Content-Type: application/json" \
             --header "X-GitHub-Event: ${EVENT_NAME}" \
