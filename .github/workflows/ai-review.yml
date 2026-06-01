@@ -68,11 +68,27 @@ jobs:
           # hangs (curl: (28) Resolving timed out). Do NOT add --accept-routes
           # here; the action injects it and a duplicate flag errors.
           args: --accept-dns=false
-          # DEBUG: probe reachability of the serge host over the tailnet after
-          # `up`. tailscale ping goes through the subnet router, independent of
-          # port 443 / ACL grants — so if this succeeds but the relay's :443
-          # connect still times out, it's an ACL/firewall issue, not routing.
-          ping: 10.90.52.50
+
+      # DEBUG: bounded reachability probe for the serge host over the tailnet.
+      # The action's built-in `ping:` input loops for up to 3 minutes, which
+      # looks like a hang — this step caps every check and never blocks the job
+      # (continue-on-error + `|| true`). tailscale ping goes through the subnet
+      # router independent of port 443 / ACL grants: if ping works but the :443
+      # connect below still times out, it's an ACL/firewall issue, not routing.
+      - name: DEBUG tailnet reachability
+        continue-on-error: true
+        run: |
+          echo "=== tailscale status ==="
+          tailscale status || true
+          echo "=== advertised/accepted routes ==="
+          tailscale status --json | jq '.Peer[]? | {host: .HostName, routes: .PrimaryRoutes}' || true
+          echo "=== tailscale ping (3s timeout, no wait-for-direct) ==="
+          tailscale ping --timeout 3s --until-direct=false -c 3 10.90.52.50 || true
+          echo "=== DNS resolution ==="
+          getent hosts serge.huggingface.tech || true
+          echo "=== TCP :443 connect (5s cap) ==="
+          curl -sS -o /dev/null -w 'http=%{http_code} connect=%{time_connect}s\n' \
+            --connect-timeout 5 https://serge.huggingface.tech/ || true
 
       - name: Relay event to the Serge GitHub App
         env:
