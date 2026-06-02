@@ -6,6 +6,8 @@ from typing import Any, Callable, Optional
 
 import requests
 
+from .compression import MessageCompressor
+
 log = logging.getLogger(__name__)
 
 
@@ -82,12 +84,14 @@ class ChatCompletionClient:
         model: Optional[str] = None,
         bill_to: Optional[str] = None,
         stream: bool = False,
+        compressor: Optional["MessageCompressor"] = None,
     ):
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.bill_to = bill_to or None
         self.stream = stream
+        self.compressor = compressor
 
     def _api_base_v1(self) -> str:
         if self.api_base.endswith("/v1"):
@@ -151,8 +155,11 @@ class ChatCompletionClient:
         extra: Optional[dict[str, Any]] = None,
         chunk_callback: Optional[Callable[[str, str], None]] = None,
     ) -> ChatResult:
+        model = self._resolve_model()
+        if self.compressor is not None:
+            messages = self.compressor.compress(messages, model=model)
         payload: dict[str, Any] = {
-            "model": self._resolve_model(),
+            "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,

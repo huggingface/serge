@@ -132,9 +132,36 @@ All modes share the same settings — as **Action inputs** (Mode 1) or
 | `REVIEW_EVENT` | `COMMENT` | Fallback if the LLM omits one |
 | `MAX_DIFF_CHARS` | `200000` | Diffs larger than this are truncated |
 | `REVIEW_RULES_PATH` | `.ai/review-rules.md` | Repo rules, read from default branch |
+| `HEADROOM_COMPRESS` | `false` | Compress context before each LLM call (see below) |
 
 See [`action.yml`](action.yml) and [`.env.example`](.env.example) for the full
 list (billing routing, streaming, reasoning effort, browse-tool limits, etc.).
+
+### Context compression (optional)
+
+Long agentic reviews accumulate token-heavy tool outputs (file reads, grep
+dumps) and assistant turns. Set `HEADROOM_COMPRESS=true` to compress that
+context with [headroom](https://github.com/chopratejas/headroom) before each
+LLM call. It's an opt-in extra — install it with `pip install
+'reviewbot[headroom]'` (the Action installs it automatically when the input is
+on). If the package is missing or a compression call fails, messages are sent
+uncompressed, so a review never breaks on it.
+
+By default the annotated diff (a `user` message, whose line numbers the model
+must cite) and the most recent turns are left intact; only tool outputs and
+older turns shrink. Compression is model-aware — the resolved model id drives
+token counting and the context limit, so it works for both OpenAI- and
+Anthropic-family models over the OpenAI-compatible protocol.
+
+| Env var / input | Default | Notes |
+| --------------- | ------- | ----- |
+| `HEADROOM_COMPRESS` | `false` | Master switch |
+| `HEADROOM_TARGET_RATIO` | — | Keep-ratio for text compression (e.g. `0.5`) |
+| `HEADROOM_COMPRESS_USER_MESSAGES` | `false` | Also compress the diff — off by default to keep cited lines intact |
+| `HEADROOM_PROTECT_RECENT` | `4` | Never compress the last N messages |
+| `HEADROOM_MIN_TOKENS` | `250` | Skip messages shorter than this |
+| `HEADROOM_KOMPRESS_MODEL` | — | Kompress model id, or `disabled` to skip ML compression |
+| `HEADROOM_MODEL_LIMIT` | `200000` | Model context window used for sizing |
 
 **LLM compatibility:** any service exposing
 `POST {base}/chat/completions` with `response_format: json_object` works —

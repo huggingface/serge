@@ -67,6 +67,17 @@ inputs:
     description: 'Maximum number of tool-calling rounds before forcing the model to produce a final review. Each iteration is a separate LLM call.'
     required: false
     default: '8'
+  headroom_compress:
+    description: 'Set to "true" to compress context with headroom-ai before each LLM call (cuts tokens on tool outputs and older turns). Requires the headroom-ai package; install reviewbot with the [headroom] extra. No-op if the package is missing.'
+    required: false
+    default: 'false'
+  headroom_target_ratio:
+    description: 'Optional headroom keep-ratio for text compression (e.g. 0.5 keeps ~50%). Leave empty to let headroom decide.'
+    required: false
+  headroom_compress_user_messages:
+    description: 'Set to "true" to also compress user messages (the annotated diff). Off by default so cited line numbers stay intact.'
+    required: false
+    default: 'false'
   github_token:
     description: 'Token with pull-requests:write. Defaults to the job token.'
     required: false
@@ -86,7 +97,15 @@ runs:
 
     - name: Install reviewbot
       shell: bash
-      run: pip install --disable-pip-version-check "${{ github.action_path }}"
+      env:
+        HEADROOM_COMPRESS: ${{ inputs.headroom_compress }}
+      run: |
+        # Pull in the (heavy) headroom-ai extra only when compression is on.
+        if [ "${HEADROOM_COMPRESS,,}" = "true" ] || [ "$HEADROOM_COMPRESS" = "1" ]; then
+          pip install --disable-pip-version-check "${{ github.action_path }}[headroom]"
+        else
+          pip install --disable-pip-version-check "${{ github.action_path }}"
+        fi
 
     - name: Run AI reviewer
       shell: bash
@@ -108,4 +127,7 @@ runs:
         CONTEXT_SCRIPT_TIMEOUT: ${{ inputs.context_script_timeout }}
         REPO_CHECKOUT_PATH: ${{ inputs.repo_checkout_path }}
         TOOL_MAX_ITERATIONS: ${{ inputs.tool_max_iterations }}
+        HEADROOM_COMPRESS: ${{ inputs.headroom_compress }}
+        HEADROOM_TARGET_RATIO: ${{ inputs.headroom_target_ratio }}
+        HEADROOM_COMPRESS_USER_MESSAGES: ${{ inputs.headroom_compress_user_messages }}
       run: reviewbot-action

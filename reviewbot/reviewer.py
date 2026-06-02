@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from .compression import MessageCompressor
 from .config import Config
 from .context_script import run_context_script
 from .github_client import GitHubClient
@@ -1117,6 +1118,7 @@ def prepare_review(
         cfg.llm_model,
         bill_to=cfg.llm_bill_to,
         stream=cfg.llm_stream,
+        compressor=MessageCompressor.from_env(),
     )
     system_prompt = build_system_prompt(
         review_rules, tools_enabled=tool_env is not None
@@ -1461,6 +1463,7 @@ def run_followup(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
         cfg.llm_model,
         bill_to=cfg.llm_bill_to,
         stream=cfg.llm_stream,
+        compressor=MessageCompressor.from_env(),
     )
 
     system_prompt = build_followup_system_prompt(

@@ -30,6 +30,10 @@ web = [
   "httpx>=0.27",
   "itsdangerous>=2.1",
 ]
+# Optional context compression. Enable at runtime with HEADROOM_COMPRESS=1.
+headroom = [
+  "headroom-ai>=0.22",
+]
 
 [project.scripts]
 reviewbot-action = "reviewbot.action_runner:main"
