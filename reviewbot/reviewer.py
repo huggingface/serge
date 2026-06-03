@@ -1394,7 +1394,13 @@ def publish_review(
     )
 
 
-def run_review(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
+def run_review(
+    cfg: Config,
+    gh: GitHubClient,
+    req: ReviewRequest,
+    *,
+    force_comment_event: bool = False,
+) -> None:
     """Webhook + Action entry point. Unchanged behavior: prepares the
     review, then immediately publishes it. Renders a fallback issue
     comment if the LLM output is unparseable."""
@@ -1410,7 +1416,8 @@ def run_review(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
         return
     if draft is None:
         return
-    publish_review(cfg, gh, draft)
+    edits = ReviewEdits(event="COMMENT") if force_comment_event else None
+    publish_review(cfg, gh, draft, edits=edits)
 
 
 _FOLLOWUP_FORCE_FINAL_MESSAGE = (
