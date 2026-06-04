@@ -78,6 +78,25 @@ inputs:
     description: 'Set to "true" to also compress user messages (the annotated diff). Off by default so cited line numbers stay intact.'
     required: false
     default: 'false'
+  headroom_compress_system_messages:
+    description: 'Set to "false" to leave system messages uncompressed. On by default.'
+    required: false
+    default: 'true'
+  headroom_protect_recent:
+    description: 'Number of most-recent messages never compressed.'
+    required: false
+    default: '4'
+  headroom_min_tokens:
+    description: 'Skip compressing messages shorter than this many tokens.'
+    required: false
+    default: '250'
+  headroom_kompress_model:
+    description: 'Kompress model id for ML compression, or "disabled" to skip it. Leave empty for the headroom default.'
+    required: false
+  headroom_model_limit:
+    description: 'Model context window (tokens) used for sizing.'
+    required: false
+    default: '200000'
   github_token:
     description: 'Token with pull-requests:write. Defaults to the job token.'
     required: false
@@ -130,4 +149,9 @@ runs:
         HEADROOM_COMPRESS: ${{ inputs.headroom_compress }}
         HEADROOM_TARGET_RATIO: ${{ inputs.headroom_target_ratio }}
         HEADROOM_COMPRESS_USER_MESSAGES: ${{ inputs.headroom_compress_user_messages }}
+        HEADROOM_COMPRESS_SYSTEM_MESSAGES: ${{ inputs.headroom_compress_system_messages }}
+        HEADROOM_PROTECT_RECENT: ${{ inputs.headroom_protect_recent }}
+        HEADROOM_MIN_TOKENS: ${{ inputs.headroom_min_tokens }}
+        HEADROOM_KOMPRESS_MODEL: ${{ inputs.headroom_kompress_model }}
+        HEADROOM_MODEL_LIMIT: ${{ inputs.headroom_model_limit }}
       run: reviewbot-action

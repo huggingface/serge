@@ -158,6 +158,7 @@ Anthropic-family models over the OpenAI-compatible protocol.
 | `HEADROOM_COMPRESS` | `false` | Master switch |
 | `HEADROOM_TARGET_RATIO` | — | Keep-ratio for text compression (e.g. `0.5`) |
 | `HEADROOM_COMPRESS_USER_MESSAGES` | `false` | Also compress the diff — off by default to keep cited lines intact |
+| `HEADROOM_COMPRESS_SYSTEM_MESSAGES` | `true` | Compress system messages |
 | `HEADROOM_PROTECT_RECENT` | `4` | Never compress the last N messages |
 | `HEADROOM_MIN_TOKENS` | `250` | Skip messages shorter than this |
 | `HEADROOM_KOMPRESS_MODEL` | — | Kompress model id, or `disabled` to skip ML compression |
