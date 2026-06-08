@@ -43,6 +43,26 @@ def _inline_comment_payload(*, fork: bool = False) -> dict:
     return payload
 
 
+def _issue_comment_payload() -> dict:
+    return {
+        "action": "created",
+        "comment": {
+            "id": 123,
+            "body": "@askserge please review",
+            "author_association": "MEMBER",
+            "user": {"login": "reviewer"},
+        },
+        "issue": {
+            "number": 13827,
+            "state": "open",
+            "pull_request": {
+                "url": "https://api.github.com/repos/huggingface/diffusers/pulls/13827"
+            },
+        },
+        "repository": {"full_name": "huggingface/diffusers"},
+    }
+
+
 class ActionRunnerTests(unittest.TestCase):
     def test_empty_llm_api_key_fails_before_review(self) -> None:
         event_path = _write_event(_inline_comment_payload())
@@ -120,6 +140,26 @@ class ActionRunnerTests(unittest.TestCase):
         self.assertEqual(code, 0)
         cfg = run_followup.call_args.args[0]
         self.assertEqual(cfg.llm_api_key, "token-with-newline")
+
+    def test_direct_pr_review_forces_comment_event(self) -> None:
+        event_path = _write_event(_issue_comment_payload())
+        self.addCleanup(os.remove, event_path)
+        env = {
+            "GITHUB_EVENT_NAME": "issue_comment",
+            "GITHUB_EVENT_PATH": event_path,
+            "GITHUB_TOKEN": "github-token",
+            "LLM_API_KEY": "token",
+        }
+
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("reviewbot.action_runner.run_review") as run_review,
+            patch("reviewbot.action_runner.GitHubClient"),
+        ):
+            code = action_runner.main()
+
+        self.assertEqual(code, 0)
+        self.assertTrue(run_review.call_args.kwargs["force_comment_event"])
 
     def test_llm_response_error_is_logged_without_traceback(self) -> None:
         event_path = _write_event(_inline_comment_payload())

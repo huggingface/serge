@@ -1396,7 +1396,13 @@ def publish_review(
     )
 
 
-def run_review(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
+def run_review(
+    cfg: Config,
+    gh: GitHubClient,
+    req: ReviewRequest,
+    *,
+    force_comment_event: bool = False,
+) -> None:
     """Webhook + Action entry point. Unchanged behavior: prepares the
     review, then immediately publishes it. Renders a fallback issue
     comment if the LLM output is unparseable."""
@@ -1412,7 +1418,8 @@ def run_review(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
         return
     if draft is None:
         return
-    publish_review(cfg, gh, draft)
+    edits = ReviewEdits(event="COMMENT") if force_comment_event else None
+    publish_review(cfg, gh, draft, edits=edits)
 
 
 _FOLLOWUP_FORCE_FINAL_MESSAGE = (
@@ -1422,17 +1429,30 @@ _FOLLOWUP_FORCE_FINAL_MESSAGE = (
 )
 
 
-def _noop_emit(kind: str, text: str) -> None:
-    del kind, text
-
-
-def run_followup(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
+def run_followup(
+    cfg: Config,
+    gh: GitHubClient,
+    req: ReviewRequest,
+    *,
+    chunk_callback: Optional[Callable[[str, str], None]] = None,
+) -> None:
     """Answer a single inline follow-up question and post the reply in
     the same comment thread. Triggered from pull_request_review_comment
     events; ``req.inline`` carries the anchor (path/line/side/diff_hunk).
+
+    ``chunk_callback(kind, text)`` mirrors ``prepare_review``: when given,
+    progress is streamed so the web UI can follow the reply live (the
+    follow-up has no draft, so the page just shows the console + metrics).
     """
     assert req.inline is not None, "run_followup requires req.inline"
     inline = req.inline
+
+    def _emit(kind: str, text: str) -> None:
+        if chunk_callback is not None:
+            try:
+                chunk_callback(kind, text)
+            except Exception:
+                log.debug("chunk_callback raised; suppressing", exc_info=True)
 
     log.info(
         "Starting follow-up on %s/%s#%d %s:%d (triggered by @%s)",
@@ -1443,6 +1463,11 @@ def run_followup(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
         inline.line,
         req.commenter,
     )
+    _emit(
+        "log",
+        f"Answering inline follow-up on {req.owner}/{req.repo}#{req.number} "
+        f"({inline.path}:{inline.line})",
+    )
 
     try:
         gh.add_reaction_to_review_comment(
@@ -1451,10 +1476,11 @@ def run_followup(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
     except Exception:
         log.debug("reaction failed (non-fatal)", exc_info=True)
 
+    _emit("step", "fetch")
     pr = gh.get_pr(req.owner, req.repo, req.number)
     review_rules = _load_review_rules(gh, req.owner, req.repo, pr, cfg)
     helper_tools = _load_helper_tools(gh, req.owner, req.repo, pr, cfg)
-    _install_helper_tools_with_emit(helper_tools, _noop_emit)
+    _install_helper_tools_with_emit(helper_tools, _emit)
     tool_env = _make_tool_env(cfg, helper_tools)
 
     llm = ChatCompletionClient(
@@ -1483,6 +1509,8 @@ def run_followup(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
         diff_hunk=inline.diff_hunk,
     )
 
+    _emit("step", "llm")
+    _emit("log", "Calling LLM…")
     chat, metrics = _run_agentic_loop(
         llm,
         [
@@ -1491,8 +1519,10 @@ def run_followup(cfg: Config, gh: GitHubClient, req: ReviewRequest) -> None:
         ],
         cfg=cfg,
         tool_env=tool_env,
+        emit=_emit,
         final_force_message=_FOLLOWUP_FORCE_FINAL_MESSAGE,
     )
+    _emit("step", "done")
 
     reply = (chat.content or "").strip()
     if not reply:

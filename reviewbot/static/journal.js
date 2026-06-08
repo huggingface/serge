@@ -45,6 +45,14 @@
       });
 
       const tdUser = cell(e.user || "—");
+      // Webhook-triggered reviews have no logged-in submitter; tag them so
+      // the journal makes clear they were kicked off by a GitHub comment.
+      if (e.source === "webhook") {
+        const tag = document.createElement("span");
+        tag.className = "source-tag";
+        tag.textContent = "webhook";
+        tdUser.appendChild(tag);
+      }
 
       const tdPr = document.createElement("td");
       const link = document.createElement("a");
@@ -60,7 +68,15 @@
       const tdStatus = document.createElement("td");
       const badge = document.createElement("span");
       badge.className = `status-badge ${e.status}`;
-      badge.textContent = e.status;
+      // A still-running review gets a small animated spinner so the
+      // journal reads as live at a glance.
+      if (e.status === "running") {
+        const spinner = document.createElement("span");
+        spinner.className = "spinner";
+        spinner.setAttribute("aria-hidden", "true");
+        badge.appendChild(spinner);
+      }
+      badge.appendChild(document.createTextNode(e.status));
       tdStatus.appendChild(badge);
 
       tr.appendChild(tdWhen);

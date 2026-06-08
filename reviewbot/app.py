@@ -51,7 +51,7 @@ def _review_worker(installation_id: int, req: ReviewRequest) -> None:
         if req.inline is not None:
             run_followup(cfg, gh, req)
         else:
-            run_review(cfg, gh, req)
+            run_review(cfg, gh, req, force_comment_event=True)
     except Exception:
         log.exception(
             "review worker crashed for %s/%s#%d", req.owner, req.repo, req.number

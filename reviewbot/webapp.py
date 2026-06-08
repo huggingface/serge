@@ -54,7 +54,6 @@ from .reviewer import (
     prepare_review,
     publish_review,
     run_followup,
-    run_review,
 )
 from .store import JobStore, decode_draft
 from .triggers import build_review_request
@@ -256,6 +255,10 @@ class Job:
     # worker doesn't need to hit the store again. "" for reconstructed
     # finished jobs that won't be re-executed.
     llm_api_key: str = ""
+    # "web" for jobs the logged-in user submitted through the UI; "webhook"
+    # for reviews kicked off by a GitHub comment. Webhook jobs have no
+    # owning UI user, so any authenticated viewer may follow them.
+    source: str = "web"
     status: str = "running"  # running | done | error | discarded | published
     draft: Optional[ReviewDraft] = None
     error: Optional[str] = None
@@ -314,60 +317,115 @@ def _verify_webhook_signature(body: bytes, header: str) -> bool:
     return hmac.compare_digest(expected, header)
 
 
-def _run_webhook_review_worker(installation_id: int, req: ReviewRequest) -> None:
+def _resolve_webhook_worker_cfg(
+    req: ReviewRequest,
+) -> Optional[tuple[Config, str, str, Optional[str]]]:
+    """Resolve the LLM credentials a webhook review should run with.
+
+    Matched on repo only — a webhook has no logged-in user to gate
+    ``allowed_users`` / ``allowed_orgs`` on, so the App being installed on
+    the repo is the authorization. Falls back to the global env config
+    when no ``provider_config`` matches the repo. Returns
+    ``(worker_cfg, provider, api_base, model)`` or ``None`` when no usable
+    API key is available (misconfiguration — the caller skips the review).
+    """
+    matched = _store.find_provider_config_for_repo(owner=req.owner, repo=req.repo)
+    if matched is not None:
+        provider = matched["provider"]
+        llm_api_key = (matched.get("api_key") or "").strip()
+        llm_api_base = _api_base_for_provider(
+            provider, custom_base=matched.get("api_base")
+        )
+        llm_model = (
+            (matched.get("default_model") or "").strip()
+            or _LLM_PROVIDER_DEFAULT_MODELS.get(provider, "")
+            or cfg.llm_model
+        )
+        worker_cfg = dataclasses.replace(
+            cfg,
+            llm_api_key=llm_api_key,
+            llm_api_base=llm_api_base,
+            llm_model=llm_model,
+            llm_bill_to=_llm_bill_to_for_provider(provider),
+        )
+    else:
+        provider = _infer_llm_provider(cfg.llm_api_base)
+        llm_api_key = cfg.llm_api_key.strip()
+        llm_api_base = cfg.llm_api_base
+        llm_model = cfg.llm_model
+        worker_cfg = dataclasses.replace(cfg, llm_api_key=llm_api_key)
+    if not llm_api_key:
+        return None
+    return worker_cfg, provider, llm_api_base, llm_model or None
+
+
+def _run_webhook_review_worker(
+    job: Job, worker_cfg: Config, installation_id: int, req: ReviewRequest
+) -> None:
+    """Run a webhook-triggered review on the dedicated webhook pool.
+
+    Mirrors the UI worker (streaming events into the job so the review
+    page can follow live), but auto-publishes the result to GitHub —
+    there is no human in the loop to edit + publish a draft."""
     try:
         assert cfg.github_app_id and cfg.github_private_key
-        # Resolve LLM credentials from the DB the same way the staged web
-        # app does, but matched on repo only — a webhook has no logged-in
-        # user to gate allowed_users/allowed_orgs on, so the App being
-        # installed on the repo is the authorization. Fall back to the
-        # global env config when no provider_config matches the repo.
-        matched = _store.find_provider_config_for_repo(owner=req.owner, repo=req.repo)
-        if matched is not None:
-            provider = matched["provider"]
-            llm_api_key = (matched.get("api_key") or "").strip()
-            llm_api_base = _api_base_for_provider(
-                provider, custom_base=matched.get("api_base")
-            )
-            llm_model = (
-                (matched.get("default_model") or "").strip()
-                or _LLM_PROVIDER_DEFAULT_MODELS.get(provider, "")
-                or cfg.llm_model
-            )
-            worker_cfg = dataclasses.replace(
-                cfg,
-                llm_api_key=llm_api_key,
-                llm_api_base=llm_api_base,
-                llm_model=llm_model,
-                llm_bill_to=_llm_bill_to_for_provider(provider),
-            )
-        else:
-            llm_api_key = cfg.llm_api_key.strip()
-            worker_cfg = dataclasses.replace(cfg, llm_api_key=llm_api_key)
-        if not llm_api_key:
-            log.error(
-                "webhook review for %s/%s#%d skipped: no LLM API key "
-                "(no matching provider_config and LLM_API_KEY is unset)",
-                req.owner,
-                req.repo,
-                req.number,
-            )
-            return
         token = installation_token(
             cfg.github_app_id, cfg.github_private_key, installation_id
         )
         gh = GitHubClient(token)
+
+        def emit(kind: str, text: str) -> None:
+            _push_event(job, kind, text)
+
         if req.inline is not None:
-            run_followup(worker_cfg, gh, req)
+            # Inline follow-up: a focused reply on the comment thread.
+            # There is no draft, so the page just streams the console.
+            run_followup(worker_cfg, gh, req, chunk_callback=emit)
+            job.status = "done"
+            emit("step", "done")
+            emit("done", "")
         else:
-            run_review(worker_cfg, gh, req)
-    except Exception:  # noqa: BLE001
-        log.exception(
-            "webhook review worker crashed for %s/%s#%d",
-            req.owner,
-            req.repo,
-            req.number,
+            _execute_review(job, worker_cfg, gh, token, req, auto_publish=True)
+    except _UnparseableLLMOutput as exc:
+        # run_followup never raises this (it posts plain markdown); only
+        # reachable on the follow-up path if the agentic loop misbehaves.
+        job.status = "error"
+        job.raw_llm_output = exc.content
+        job.error = exc.user_message()
+        _push_event(job, "step", "error")
+        _push_event(job, "error", job.error)
+        _push_event(job, "done", "")
+    except AppNotInstalledError as exc:
+        log.warning("App not installed for %s/%s (job %s)", exc.owner, exc.repo, job.id)
+        job.status = "error"
+        job.error = str(exc)
+        _push_event(job, "step", "error")
+        _push_event(job, "error", job.error)
+        _push_event(job, "done", "")
+    except LLMResponseError as exc:
+        log.warning(
+            "LLM endpoint returned %d for webhook job %s: %s",
+            exc.status_code,
+            job.id,
+            exc.body_preview[:400],
         )
+        job.status = "error"
+        job.error = _format_llm_error(exc)
+        _push_event(job, "step", "error")
+        _push_event(job, "error", job.error)
+        _push_event(job, "done", "")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("webhook review worker crashed for job %s", job.id)
+        job.status = "error"
+        job.error = f"{type(exc).__name__}: review crashed (see server log)"
+        _push_event(job, "step", "error")
+        _push_event(job, "error", job.error)
+        _push_event(job, "done", "")
+    finally:
+        # Follow-ups stop here; full reviews already persisted inside
+        # _execute_review's own finally. Persisting twice is harmless (the
+        # second call just re-snapshots the terminal state).
+        _persist_terminal(job)
 
 
 def _infer_llm_provider(api_base: str) -> str:
@@ -596,44 +654,44 @@ def _persist_terminal(job: Job) -> None:
         log.exception("failed to persist terminal state for job %s", job.id)
 
 
-def _run_review_worker(job: Job) -> None:
-    """Runs in a background thread. Pulls an installation token for the
-    target repo, shallow-clones the PR head so browse tools work, then
-    calls prepare_review with a chunk_callback that streams events back
-    to the SSE consumer."""
+def _format_llm_error(exc: LLMResponseError) -> str:
+    """Render an LLMResponseError for the SSE client. Surfaces the status
+    code + a body excerpt so the UI shows whether it was a 429 (rate
+    limit), 400 (bad schema), auth, etc. instead of a generic "review
+    crashed". The body comes from the LLM provider's own error response —
+    no auth tokens of ours are echoed there."""
+    excerpt = exc.body_preview.strip()
+    if len(excerpt) > 600:
+        excerpt = excerpt[:600] + "…"
+    reason_part = f" {exc.reason}" if exc.reason else ""
+    if excerpt:
+        return f"LLM endpoint returned {exc.status_code}{reason_part}: {excerpt}"
+    return f"LLM endpoint returned {exc.status_code}{reason_part}"
+
+
+def _execute_review(
+    job: Job,
+    worker_cfg: Config,
+    gh: GitHubClient,
+    token: str,
+    req: ReviewRequest,
+    *,
+    auto_publish: bool,
+) -> None:
+    """Shared review pipeline for both UI and webhook jobs.
+
+    Shallow-clones the PR head so the LLM gets browse tools, runs
+    prepare_review streaming events back to the SSE consumer, then either
+    stops at the draft (``auto_publish=False`` — UI flow, a human edits +
+    publishes) or posts the review immediately (``auto_publish=True`` —
+    webhook flow, no human in the loop). Owns its own checkout cleanup +
+    terminal persistence in a finally block."""
     checkout: Optional[Checkout] = None
     try:
-        assert cfg.github_app_id and cfg.github_private_key
-        installation_id = installation_id_for_repo(
-            cfg.github_app_id,
-            cfg.github_private_key,
-            job.target_owner,
-            job.target_repo,
-        )
-        token = installation_token(
-            cfg.github_app_id, cfg.github_private_key, installation_id
-        )
-        gh = GitHubClient(token)
-        req = ReviewRequest(
-            owner=job.target_owner,
-            repo=job.target_repo,
-            number=job.target_number,
-            trigger_comment_id=0,
-            trigger_comment_body=job.trigger_comment,
-            commenter=job.user,
-        )
-
         # Check out the PR head so the LLM has browse tools (matches Action
         # mode, which gets a checkout via actions/checkout). Backed by the
         # shared clone cache: a worktree off a per-repo bare clone, not a
         # cold clone. If it fails we still run the review — just without tools.
-        worker_cfg = dataclasses.replace(
-            cfg,
-            llm_api_base=job.llm_api_base,
-            llm_api_key=job.llm_api_key,
-            llm_model=job.llm_model,
-            llm_bill_to=_llm_bill_to_for_provider(job.llm_provider),
-        )
         if not _bool_env_safe("WEB_DISABLE_CHECKOUT", False):
             _push_event(job, "step", "clone")
             _push_event(job, "log", "Preparing PR checkout…")
@@ -676,12 +734,25 @@ def _run_review_worker(job: Job) -> None:
             _push_event(job, "done", "")
             return
         job.draft = draft
-        job.status = "done"
-        _push_event(
-            job,
-            "log",
-            f"Draft ready: {len(draft.comments)} inline comment(s), event={draft.event}",
-        )
+        if auto_publish:
+            _push_event(job, "log", "Publishing review to GitHub…")
+            publish_review(worker_cfg, gh, draft)
+            job.status = "published"
+            _push_event(
+                job,
+                "log",
+                f"Published review: {len(draft.comments)} inline comment(s), "
+                f"event={draft.event}",
+            )
+        else:
+            job.status = "done"
+            _push_event(
+                job,
+                "log",
+                f"Draft ready: {len(draft.comments)} inline comment(s), "
+                f"event={draft.event}",
+            )
+        _push_event(job, "step", "done")
         _push_event(job, "done", "")
     except _UnparseableLLMOutput as exc:
         job.status = "error"
@@ -694,26 +765,13 @@ def _run_review_worker(job: Job) -> None:
         # Expected failure mode — the App isn't installed on the target
         # repo. Surface the actionable message verbatim instead of the
         # generic "see server log".
-        log.warning(
-            "App not installed for %s/%s (job %s)",
-            exc.owner,
-            exc.repo,
-            job.id,
-        )
+        log.warning("App not installed for %s/%s (job %s)", exc.owner, exc.repo, job.id)
         job.status = "error"
         job.error = str(exc)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
     except LLMResponseError as exc:
-        # Upstream chat-completions endpoint returned a non-OK status
-        # (and either wasn't retryable, or retries didn't recover).
-        # Surface the status code + a body excerpt directly to the SSE
-        # client — without it the UI just shows "review crashed (see
-        # server log)" and the user has to SSH into the box to figure
-        # out whether it was a 429 (rate limit), a 400 (bad schema),
-        # auth, etc. The body comes from the LLM provider's own error
-        # response — no auth tokens of ours are echoed there.
         log.warning(
             "LLM endpoint returned %d for job %s: %s",
             exc.status_code,
@@ -721,15 +779,7 @@ def _run_review_worker(job: Job) -> None:
             exc.body_preview[:400],
         )
         job.status = "error"
-        excerpt = exc.body_preview.strip()
-        if len(excerpt) > 600:
-            excerpt = excerpt[:600] + "…"
-        reason_part = f" {exc.reason}" if exc.reason else ""
-        job.error = (
-            f"LLM endpoint returned {exc.status_code}{reason_part}: {excerpt}"
-            if excerpt
-            else f"LLM endpoint returned {exc.status_code}{reason_part}"
-        )
+        job.error = _format_llm_error(exc)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -752,6 +802,58 @@ def _run_review_worker(job: Job) -> None:
         # above sets job.status to a non-'running' value, so this also
         # clears the 'running' marker we'd otherwise reap on next restart.
         _persist_terminal(job)
+
+
+def _run_review_worker(job: Job) -> None:
+    """UI entry point. Runs in a background thread: pulls an installation
+    token for the target repo, builds the review request from the job, and
+    delegates to _execute_review (which streams + stops at the draft for a
+    human to edit + publish)."""
+    assert cfg.github_app_id and cfg.github_private_key
+    try:
+        installation_id = installation_id_for_repo(
+            cfg.github_app_id,
+            cfg.github_private_key,
+            job.target_owner,
+            job.target_repo,
+        )
+        token = installation_token(
+            cfg.github_app_id, cfg.github_private_key, installation_id
+        )
+        gh = GitHubClient(token)
+    except Exception as exc:  # noqa: BLE001
+        # Token / installation lookup failed before we could even start.
+        # Mark the job errored + persist so it doesn't hang in 'running'.
+        if isinstance(exc, AppNotInstalledError):
+            log.warning(
+                "App not installed for %s/%s (job %s)", exc.owner, exc.repo, job.id
+            )
+            job.error = str(exc)
+        else:
+            log.exception("review worker setup failed for job %s", job.id)
+            job.error = f"{type(exc).__name__}: review crashed (see server log)"
+        job.status = "error"
+        _push_event(job, "step", "error")
+        _push_event(job, "error", job.error)
+        _push_event(job, "done", "")
+        _persist_terminal(job)
+        return
+    req = ReviewRequest(
+        owner=job.target_owner,
+        repo=job.target_repo,
+        number=job.target_number,
+        trigger_comment_id=0,
+        trigger_comment_body=job.trigger_comment,
+        commenter=job.user,
+    )
+    worker_cfg = dataclasses.replace(
+        cfg,
+        llm_api_base=job.llm_api_base,
+        llm_api_key=job.llm_api_key,
+        llm_model=job.llm_model,
+        llm_bill_to=_llm_bill_to_for_provider(job.llm_provider),
+    )
+    _execute_review(job, worker_cfg, gh, token, req, auto_publish=False)
 
 
 def _bool_env_safe(name: str, default: bool) -> bool:
@@ -826,8 +928,77 @@ async def github_app_webhook(request: Request) -> Response:
     if not isinstance(installation_id, int):
         return Response(status_code=204)
 
-    _WEBHOOK_REVIEW_POOL.submit(_run_webhook_review_worker, installation_id, req)
-    return JSONResponse({"status": "accepted"}, status_code=202)
+    resolved = _resolve_webhook_worker_cfg(req)
+    if resolved is None:
+        log.error(
+            "webhook review for %s/%s#%d skipped: no LLM API key "
+            "(no matching provider_config and LLM_API_KEY is unset)",
+            req.owner,
+            req.repo,
+            req.number,
+        )
+        return JSONResponse({"status": "skipped_no_key"}, status_code=202)
+    worker_cfg, provider, llm_api_base, llm_model = resolved
+
+    # Register a persisted job so the review shows up in the journal and
+    # gets a live review page (same as UI-submitted reviews). The
+    # triggering commenter is recorded as the "user" for the journal; the
+    # "webhook" source lets any authenticated viewer follow it.
+    job = Job(
+        id=uuid.uuid4().hex,
+        user=req.commenter,
+        target_owner=req.owner,
+        target_repo=req.repo,
+        target_number=req.number,
+        trigger_comment=req.trigger_comment_body,
+        llm_provider=provider,
+        llm_api_base=llm_api_base,
+        llm_model=llm_model,
+        created_at=time.time(),
+        llm_api_key=worker_cfg.llm_api_key,
+        source="webhook",
+    )
+    job.loop = asyncio.get_running_loop()
+    with _jobs_lock:
+        _jobs[job.id] = job
+    _store.insert_job(
+        id=job.id,
+        user=job.user,
+        target_owner=job.target_owner,
+        target_repo=job.target_repo,
+        target_number=job.target_number,
+        trigger_comment=job.trigger_comment,
+        llm_provider=job.llm_provider,
+        llm_api_base=job.llm_api_base,
+        llm_model=job.llm_model,
+        created_at=job.created_at,
+        status=job.status,
+        source=job.source,
+    )
+    _prune_store()
+    _WEBHOOK_REVIEW_POOL.submit(
+        _run_webhook_review_worker, job, worker_cfg, installation_id, req
+    )
+    log.info(
+        "queued webhook job %s for %s/%s#%d (triggered by %s) using %s model=%s",
+        job.id,
+        req.owner,
+        req.repo,
+        req.number,
+        req.commenter,
+        provider,
+        llm_model or "<auto>",
+    )
+    return JSONResponse(
+        {
+            "status": "accepted",
+            "id": job.id,
+            "url": (
+                f"/reviews/{req.owner}/{req.repo}/{req.number}/{job.id}"
+            ),
+        },
+        status_code=202,
+    )
 
 
 def _require_user(request: Request) -> str:
@@ -1108,6 +1279,7 @@ def journal_data(request: Request) -> JSONResponse:
                     "repo": r["target_repo"],
                     "number": r["target_number"],
                     "status": r["status"],
+                    "source": r["source"],
                     "created_at": r["created_at"],
                     "updated_at": r["updated_at"],
                     "provider": r["llm_provider"],
@@ -1490,7 +1662,11 @@ def _get_owned_job(
         job = _load_job_from_store(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job_not_found")
-    if job.user != user:
+    # Webhook jobs are kicked off by a GitHub comment, not a logged-in
+    # user, so there is no real owner — any authenticated viewer may
+    # follow them (the journal already exposes them cross-user). UI jobs
+    # stay private to the submitter.
+    if job.source != "webhook" and job.user != user:
         raise HTTPException(status_code=403, detail="not_your_job")
     if (
         job.target_owner != owner
@@ -1520,6 +1696,7 @@ def _load_job_from_store(job_id: str) -> Optional[Job]:
         llm_model=row.get("llm_model") or cfg.llm_model,
         created_at=row["created_at"],
         status=row["status"],
+        source=row.get("source") or "web",
         error=row["error"],
         raw_llm_output=row["raw_llm_output"],
         draft=decode_draft(row["draft_json"]) if row.get("draft_json") else None,

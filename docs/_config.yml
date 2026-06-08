@@ -1,0 +1,18 @@
+title: ai-reviewer
+description: GitHub-native AI pull request reviews with OpenAI-compatible LLMs.
+theme: minima
+repository_url: https://github.com/huggingface/ai-reviewer
+repository_api_url: https://api.github.com/repos/huggingface/ai-reviewer
+
+header_pages:
+  - getting-started.md
+  - github-action.md
+  - github-app.md
+  - web-app.md
+  - configuration.md
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: page

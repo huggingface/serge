@@ -51,6 +51,13 @@ header.bar {
   background: var(--card);
 }
 header.bar h1 { margin: 0; font-size: 1.1rem; }
+.brand-logo {
+  height: 1.4em;
+  width: 1.4em;
+  vertical-align: -0.3em;
+  margin-right: 6px;
+  border-radius: 6px;
+}
 header.bar .right { display: flex; gap: 12px; align-items: center; color: var(--muted); font-size: 0.9rem; }
 header.bar a.brand,
 header.bar a.brand:link,
@@ -229,6 +236,39 @@ pre.console .reasoning {
 .status-badge.error { background: var(--danger); color: white; }
 .status-badge.published { background: #34d399; color: #064e3b; }
 .status-badge.discarded { background: var(--muted); color: white; }
+
+/* Inline spinner for the "running" status badge (and anywhere else a
+   small live indicator is useful). */
+.status-badge.running {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(31, 41, 55, 0.35);
+  border-top-color: #1f2937;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Small "via webhook" tag in the journal user column. */
+.source-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  background: var(--border);
+  color: var(--muted);
+  vertical-align: middle;
+}
 
 .progress {
   list-style: none;

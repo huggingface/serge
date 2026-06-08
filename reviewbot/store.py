@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL,
     status          TEXT NOT NULL,
+    source          TEXT NOT NULL DEFAULT 'web',
     error           TEXT,
     raw_llm_output  TEXT,
     draft_json      TEXT,
@@ -115,6 +116,7 @@ class JobStore:
             self._ensure_column("llm_model", "TEXT")
             self._ensure_column("prompt_tokens", "INTEGER")
             self._ensure_column("completion_tokens", "INTEGER")
+            self._ensure_column("source", "TEXT NOT NULL DEFAULT 'web'")
             self._conn.commit()
         log.info("Opened job store at %s", path)
 
@@ -143,6 +145,7 @@ class JobStore:
         llm_model: Optional[str],
         created_at: float,
         status: str,
+        source: str = "web",
     ) -> None:
         now = time.time()
         with self._lock:
@@ -151,8 +154,8 @@ class JobStore:
                 INSERT INTO jobs (
                     id, user, target_owner, target_repo, target_number,
                     trigger_comment, llm_provider, llm_api_base, llm_model,
-                    created_at, updated_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, status, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     id,
@@ -167,6 +170,7 @@ class JobStore:
                     created_at,
                     now,
                     status,
+                    source,
                 ),
             )
             self._conn.commit()
@@ -285,7 +289,7 @@ class JobStore:
             rows = self._conn.execute(
                 """
                 SELECT id, user, target_owner, target_repo, target_number,
-                       status, created_at, updated_at,
+                       status, source, created_at, updated_at,
                        llm_provider, llm_api_base, llm_model
                   FROM jobs
                  WHERE user = ?
@@ -576,7 +580,7 @@ class JobStore:
             rows = self._conn.execute(
                 """
                 SELECT id, user, target_owner, target_repo, target_number,
-                       status, created_at, updated_at,
+                       status, source, created_at, updated_at,
                        llm_provider, llm_api_base, llm_model,
                        prompt_tokens, completion_tokens
                   FROM jobs

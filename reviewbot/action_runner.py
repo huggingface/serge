@@ -133,7 +133,7 @@ def main() -> int:
         if req.inline is not None:
             run_followup(cfg, gh, req)
         else:
-            run_review(cfg, gh, req)
+            run_review(cfg, gh, req, force_comment_event=True)
     except LLMResponseError as exc:
         message = _format_llm_response_error(exc)
         log.warning("review failed: %s", message)

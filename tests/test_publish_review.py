@@ -3,14 +3,16 @@ we hand-craft a ReviewDraft and exercise publish_review's body-format
 and edit-application rules."""
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from reviewbot.config import Config
 from reviewbot.reviewer import (
     DraftComment,
     ReviewDraft,
     ReviewEdits,
+    ReviewRequest,
     publish_review,
+    run_review,
 )
 
 
@@ -173,6 +175,24 @@ class PublishReviewTests(unittest.TestCase):
         publish_review(cfg, gh, draft)
         body = gh.create_review.call_args.kwargs["body"]
         self.assertIn("(no overall summary provided)", body)
+
+    def test_run_review_can_force_comment_event_for_direct_publish(self) -> None:
+        cfg = _make_cfg()
+        draft = _make_draft(event="REQUEST_CHANGES")
+        gh = MagicMock()
+        req = ReviewRequest(
+            owner="acme",
+            repo="widgets",
+            number=42,
+            trigger_comment_id=123,
+            trigger_comment_body="@askserge please review",
+            commenter="reviewer",
+        )
+
+        with patch("reviewbot.reviewer.prepare_review", return_value=draft):
+            run_review(cfg, gh, req, force_comment_event=True)
+
+        self.assertEqual(gh.create_review.call_args.kwargs["event"], "COMMENT")
 
 
 if __name__ == "__main__":
