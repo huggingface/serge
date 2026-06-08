@@ -236,6 +236,48 @@ class HfModelsTests(unittest.TestCase):
             response.json()["models"], ["Qwen/Qwen3", "meta-llama/Llama-4"]
         )
 
+    def test_empty_fetch_result_is_cached(self) -> None:
+        import asyncio
+
+        webapp = self._import_webapp()
+        # Start from "never fetched" so the first call hits the network.
+        webapp._hf_models_cache["models"] = []
+        webapp._hf_models_cache["fetched_at"] = 0.0
+
+        get_calls: list[str] = []
+
+        class _Resp:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict:
+                # A valid response with no tool-capable models.
+                return {"data": []}
+
+        class _Client:
+            def __init__(self, *a, **k) -> None:
+                pass
+
+            async def __aenter__(self) -> "_Client":
+                return self
+
+            async def __aexit__(self, *a) -> bool:
+                return False
+
+            async def get(self, url: str) -> "_Resp":
+                get_calls.append(url)
+                return _Resp()
+
+        with patch.object(webapp.httpx, "AsyncClient", _Client):
+            first = asyncio.run(webapp._fetch_hf_router_models())
+            second = asyncio.run(webapp._fetch_hf_router_models())
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        # The empty-but-valid result is cached, so the second call is served
+        # from cache rather than re-hitting the router.
+        self.assertEqual(len(get_calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

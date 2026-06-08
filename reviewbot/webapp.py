@@ -1389,9 +1389,13 @@ async def _fetch_hf_router_models() -> list[str]:
     back to a free-text box when the list is empty."""
     now = time.monotonic()
     with _hf_models_lock:
-        cached = _hf_models_cache["models"]
-        if cached and now - _hf_models_cache["fetched_at"] < _HF_MODELS_TTL_SECONDS:
-            return cached
+        # Use fetched_at (0.0 until the first successful fetch) rather than
+        # the list's truthiness to gauge freshness — a valid fetch that
+        # yields no tool-capable models is still a fetch worth caching, and
+        # keying on truthiness would re-hit the router on every call.
+        fetched_at = _hf_models_cache["fetched_at"]
+        if fetched_at > 0 and now - fetched_at < _HF_MODELS_TTL_SECONDS:
+            return _hf_models_cache["models"]
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(_HF_MODELS_URL)
