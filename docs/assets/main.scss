@@ -18,15 +18,6 @@
   flex: 0 0 auto;
 }
 
-// Keep the title + menu on a single row: let the nav take the remaining
-// width and scroll horizontally if it ever overflows, instead of
-// wrapping the menu onto a second line under the title.
-.site-nav {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow-x: auto;
-}
-
 .site-title-with-icon {
   align-items: center;
   display: inline-flex;
@@ -37,6 +28,7 @@
   display: block;
   height: 28px;
   width: 28px;
+  border-radius: 6px;
 }
 
 .site-nav {
