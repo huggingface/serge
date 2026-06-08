@@ -1,0 +1,94 @@
+---
+---
+
+@import "minima";
+
+.site-header-inner {
+  align-items: center;
+  display: flex;
+  gap: 24px;
+  min-height: 55px;
+}
+
+.site-title {
+  flex: 0 0 auto;
+}
+
+.site-title-with-icon {
+  align-items: center;
+  display: inline-flex;
+  gap: 8px;
+}
+
+.site-title-icon {
+  display: block;
+  height: 28px;
+  width: 28px;
+}
+
+.site-nav {
+  border: 0;
+  float: none;
+  line-height: 1;
+  margin-left: auto;
+  position: static;
+}
+
+.site-nav .trigger {
+  align-items: center;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 18px;
+  white-space: nowrap;
+}
+
+.site-nav .page-link {
+  line-height: 1;
+  margin-left: 0;
+}
+
+.repo-link {
+  align-items: center;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  color: #24292f;
+  display: inline-flex;
+  font-size: 14px;
+  gap: 6px;
+  line-height: 1;
+  padding: 6px 9px;
+}
+
+.repo-link:hover {
+  border-color: #8c959f;
+  text-decoration: none;
+}
+
+.repo-link-icon {
+  fill: currentColor;
+  height: 16px;
+  width: 16px;
+}
+
+.repo-stars {
+  color: #57606a;
+}
+
+.repo-stars:not(:empty)::before {
+  content: "· ";
+}
+
+@media screen and (max-width: 760px) {
+  .site-header-inner {
+    gap: 14px;
+  }
+
+  .site-nav {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .site-nav .trigger {
+    gap: 14px;
+  }
+}
