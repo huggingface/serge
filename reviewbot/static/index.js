@@ -6,6 +6,7 @@
   const commentEl = document.getElementById("comment");
   const providerEl = document.getElementById("llm-provider");
   const modelEl = document.getElementById("llm-model");
+  const modelSelectEl = document.getElementById("llm-model-select");
   const baseUrlEl = document.getElementById("llm-base-url");
   const customBaseRow = document.getElementById("custom-base-row");
   const providerHint = document.getElementById("provider-hint");
@@ -125,6 +126,66 @@
     modelEl.value = providerDefaultModels[providerEl.value] || "";
   }
 
+  // HF Router model catalogue, lazily fetched once and cached. null until
+  // loaded; [] when the endpoint is unreachable (we then fall back to the
+  // free-text input rather than an empty dropdown).
+  let hfModels = null;
+
+  async function ensureHfModels() {
+    if (hfModels !== null) return hfModels;
+    try {
+      const r = await fetch("/llm-options/hf-models");
+      const data = r.ok ? await r.json() : {};
+      hfModels = Array.isArray(data.models) ? data.models : [];
+    } catch {
+      hfModels = [];
+    }
+    return hfModels;
+  }
+
+  function populateModelSelect() {
+    // The text input stays the source of truth for the submitted value;
+    // the dropdown mirrors it. Keep the current value selectable even if
+    // the router doesn't list it (e.g. a config default not yet live), so
+    // switching to HF never silently drops a configured model.
+    const current = modelEl.value.trim();
+    const options = [...(hfModels || [])];
+    if (current && !options.includes(current)) options.unshift(current);
+    modelSelectEl.replaceChildren();
+    for (const m of options) {
+      const opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = m;
+      modelSelectEl.appendChild(opt);
+    }
+    if (current && options.includes(current)) {
+      modelSelectEl.value = current;
+    } else if (options.length) {
+      modelSelectEl.value = options[0];
+      modelEl.value = options[0];
+    }
+  }
+
+  // Show a dropdown of HF Router models when the HF provider is selected;
+  // every other provider keeps the free-text input. Falls back to the text
+  // input when the model list can't be fetched.
+  async function updateModelControl() {
+    if (providerEl.value === "hf") {
+      const models = await ensureHfModels();
+      // Guard against the provider changing while the fetch was in flight.
+      if (providerEl.value === "hf" && models.length) {
+        populateModelSelect();
+        modelSelectEl.style.display = "";
+        modelEl.style.display = "none";
+        modelEl.required = false;
+        return;
+      }
+    }
+    modelSelectEl.style.display = "none";
+    modelEl.style.display = "";
+    modelEl.required = true;
+  }
+
   function ingestProviderDefaults(providers) {
     if (!Array.isArray(providers)) return;
     for (const p of providers) {
@@ -151,10 +212,12 @@
       applySavedLlmPrefs();
       applyProviderModelDefault();
       updateProviderFields();
+      await updateModelControl();
     } catch {
       applySavedLlmPrefs();
       applyProviderModelDefault();
       updateProviderFields();
+      await updateModelControl();
     }
   }
 
@@ -276,6 +339,7 @@
       baseUrlEl.value = match.api_base;
     }
     updateProviderFields();
+    updateModelControl();
     const modelPart = match.default_model ? ` · model ${match.default_model}` : "";
     const scope =
       match.repo_pattern && match.repo_pattern !== `${parsed.owner}/${parsed.repo}`
@@ -323,9 +387,14 @@
   providerEl.addEventListener("change", () => {
     updateProviderFields();
     resetModelToProviderDefault();
+    updateModelControl();
     saveLlmPrefs();
   });
   modelEl.addEventListener("change", saveLlmPrefs);
+  modelSelectEl.addEventListener("change", () => {
+    modelEl.value = modelSelectEl.value;
+    saveLlmPrefs();
+  });
   baseUrlEl.addEventListener("change", saveLlmPrefs);
 
   // Auto-fill provider/model from the matching DB config whenever the

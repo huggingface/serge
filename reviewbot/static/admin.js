@@ -9,6 +9,7 @@
   const apiKeyEl = document.getElementById("api_key");
   const apiKeyHint = document.getElementById("api-key-hint");
   const defaultModelEl = document.getElementById("default_model");
+  const defaultModelSelectEl = document.getElementById("default-model-select");
   const repoPatternEl = document.getElementById("repo_pattern");
   const allowedUsersEl = document.getElementById("allowed_users");
   const allowedOrgsEl = document.getElementById("allowed_orgs");
@@ -51,6 +52,61 @@
     if (def) defaultModelEl.value = def;
   }
 
+  // HF Router model catalogue, lazily fetched once and cached. null until
+  // loaded; [] when unreachable (we then keep the free-text input).
+  let hfModels = null;
+
+  async function ensureHfModels() {
+    if (hfModels !== null) return hfModels;
+    try {
+      const r = await fetch("/llm-options/hf-models");
+      const data = r.ok ? await r.json() : {};
+      hfModels = Array.isArray(data.models) ? data.models : [];
+    } catch {
+      hfModels = [];
+    }
+    return hfModels;
+  }
+
+  function populateModelSelect() {
+    // The text input stays the source of truth; the dropdown mirrors it.
+    // A leading blank option keeps "no default" expressible (the submit
+    // form's model then wins). Preserve any current value even if the
+    // router doesn't list it.
+    const current = defaultModelEl.value.trim();
+    const models = [...(hfModels || [])];
+    if (current && !models.includes(current)) models.unshift(current);
+    defaultModelSelectEl.replaceChildren();
+    const blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = "— none (use submit-form model) —";
+    defaultModelSelectEl.appendChild(blank);
+    for (const m of models) {
+      const opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = m;
+      defaultModelSelectEl.appendChild(opt);
+    }
+    defaultModelSelectEl.value = current;
+  }
+
+  // Show a dropdown of HF Router models when the HF provider is selected;
+  // other providers keep the free-text input. Falls back to the text input
+  // when the model list can't be fetched.
+  async function updateModelControl() {
+    if (providerEl.value === "hf") {
+      const models = await ensureHfModels();
+      if (providerEl.value === "hf" && models.length) {
+        populateModelSelect();
+        defaultModelSelectEl.style.display = "";
+        defaultModelEl.style.display = "none";
+        return;
+      }
+    }
+    defaultModelSelectEl.style.display = "none";
+    defaultModelEl.style.display = "";
+  }
+
   function resetForm() {
     editing = null;
     configIdEl.value = "";
@@ -69,6 +125,7 @@
     submitBtn.textContent = "Save";
     cancelBtn.style.display = "none";
     updateProviderRow();
+    updateModelControl();
   }
 
   function startEdit(cfg) {
@@ -88,6 +145,7 @@
     submitBtn.textContent = "Save changes";
     cancelBtn.style.display = "";
     updateProviderRow();
+    updateModelControl();
     window.scrollTo({ top: form.offsetTop - 16, behavior: "smooth" });
   }
 
@@ -264,6 +322,11 @@
     if (!editing) {
       defaultModelEl.value = defaultModels[providerEl.value] || "";
     }
+    updateModelControl();
+  });
+
+  defaultModelSelectEl.addEventListener("change", () => {
+    defaultModelEl.value = defaultModelSelectEl.value;
   });
 
   resetForm();

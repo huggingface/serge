@@ -97,6 +97,16 @@ _LLM_PROVIDER_DEFAULT_MODELS = {
     _LLM_PROVIDER_ANTHROPIC: "claude-opus-4-6",
 }
 
+# HF Inference Providers catalogue. The public router /v1/models endpoint
+# lists every model the HF Router can serve along with per-provider tool
+# support; we surface the tool-capable subset as a dropdown on the submit /
+# admin forms so users don't have to hand-type model ids. Cached in-process
+# (the list is large and changes slowly) and refreshed lazily on expiry.
+_HF_MODELS_URL = f"{_LLM_PROVIDER_BASES[_LLM_PROVIDER_HF]}/models"
+_HF_MODELS_TTL_SECONDS = 15 * 60
+_hf_models_lock = threading.Lock()
+_hf_models_cache: dict[str, Any] = {"fetched_at": 0.0, "models": []}
+
 
 # ---------------------------------------------------------------------------
 # Session handling: signed cookies via itsdangerous (no DB).
@@ -1341,6 +1351,72 @@ def llm_options(request: Request) -> JSONResponse:
             ],
         }
     )
+
+
+def _tool_capable_hf_models(payload: Any) -> list[str]:
+    """Extract the ids of HF Router models that can drive an agentic
+    review — at least one ``live`` provider advertising ``supports_tools``.
+    Serge's review loop relies on browse tools, so models that can't call
+    tools would degrade silently; we keep them out of the dropdown. Sorted
+    case-insensitively and de-duplicated."""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+    ids: set[str] = set()
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        providers = entry.get("providers")
+        if not isinstance(providers, list):
+            continue
+        if any(
+            isinstance(p, dict)
+            and p.get("status") == "live"
+            and p.get("supports_tools") is True
+            for p in providers
+        ):
+            ids.add(model_id)
+    return sorted(ids, key=str.lower)
+
+
+async def _fetch_hf_router_models() -> list[str]:
+    """Tool-capable HF Router model ids, cached for ``_HF_MODELS_TTL_SECONDS``.
+    On a fetch error the last good list (possibly empty) is returned so a
+    transient router blip doesn't blank out the dropdown — the form falls
+    back to a free-text box when the list is empty."""
+    now = time.monotonic()
+    with _hf_models_lock:
+        # Use fetched_at (0.0 until the first successful fetch) rather than
+        # the list's truthiness to gauge freshness — a valid fetch that
+        # yields no tool-capable models is still a fetch worth caching, and
+        # keying on truthiness would re-hit the router on every call.
+        fetched_at = _hf_models_cache["fetched_at"]
+        if fetched_at > 0 and now - fetched_at < _HF_MODELS_TTL_SECONDS:
+            return _hf_models_cache["models"]
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(_HF_MODELS_URL)
+        resp.raise_for_status()
+        models = _tool_capable_hf_models(resp.json())
+    except (httpx.HTTPError, ValueError) as exc:
+        log.warning("Failed to fetch HF router models from %s: %s", _HF_MODELS_URL, exc)
+        with _hf_models_lock:
+            return _hf_models_cache["models"]
+    with _hf_models_lock:
+        _hf_models_cache["models"] = models
+        _hf_models_cache["fetched_at"] = now
+    return models
+
+
+@app.get("/llm-options/hf-models")
+async def hf_models(request: Request) -> JSONResponse:
+    """Tool-capable models served by the HF Router, for the provider
+    dropdown that appears when ``hf`` is the selected provider."""
+    _require_user(request)
+    return JSONResponse({"models": await _fetch_hf_router_models()})
 
 
 @app.get("/reviews/lookup-provider")
