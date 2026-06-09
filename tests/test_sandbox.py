@@ -27,9 +27,13 @@ class NormalizeModeTests(unittest.TestCase):
 
 class BuildArgvTests(unittest.TestCase):
     def test_profile_isolates_network_and_secrets(self):
-        argv = build_bwrap_argv(
-            ["ruff", "check"], workdir="/wt/sub", write_root="/wt"
-        )
+        # Pin the venv root so the assertions don't depend on where the
+        # test happens to run (a venv under /home on CI would otherwise
+        # trip the /home secrets check below).
+        with mock.patch.object(sandbox, "_venv_root", return_value="/opt/venv"):
+            argv = build_bwrap_argv(
+                ["ruff", "check"], workdir="/wt/sub", write_root="/wt"
+            )
         self.assertEqual(argv[0], "bwrap")
         # No network.
         self.assertIn("--unshare-net", argv)
@@ -38,6 +42,8 @@ class BuildArgvTests(unittest.TestCase):
         self.assertIn("--ro-bind", argv)
         joined = " ".join(argv)
         self.assertIn("--ro-bind /usr /usr", joined)
+        # The active venv is bound read-only so installed helpers resolve.
+        self.assertIn("--ro-bind /opt/venv /opt/venv", joined)
         self.assertIn("--bind /wt /wt", joined)
         self.assertIn("--chdir /wt/sub", joined)
         # Host secrets are never bound in.
