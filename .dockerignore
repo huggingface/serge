@@ -1,0 +1,9 @@
+.venv
+.git
+.pytest_cache
+.ruff_cache
+.serena
+*.db
+reviewbot.egg-info
+__pycache__
+aws/*.pem
