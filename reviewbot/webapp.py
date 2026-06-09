@@ -1836,6 +1836,7 @@ def _draft_to_dict(draft: ReviewDraft) -> dict[str, Any]:
         "event": draft.event,
         "rejected_count": draft.rejected_count,
         "metrics_line": draft.metrics_line,
+        "model": draft.model,
         "comments": [dataclasses.asdict(c) for c in draft.comments],
     }
 

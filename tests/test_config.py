@@ -38,6 +38,22 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(cfg.helper_tools_path, ".review/helpers.json")
 
+    def test_staging_defaults_off(self) -> None:
+        with patch.dict(os.environ, {"LLM_API_KEY": "token"}, clear=True):
+            cfg = Config.from_env(require_app=False)
+
+        self.assertFalse(cfg.is_staging)
+
+    def test_staging_enabled_via_env(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"LLM_API_KEY": "token", "STAGING": "true"},
+            clear=True,
+        ):
+            cfg = Config.from_env(require_app=False)
+
+        self.assertTrue(cfg.is_staging)
+
 
 if __name__ == "__main__":
     unittest.main()

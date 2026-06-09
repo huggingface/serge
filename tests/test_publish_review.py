@@ -160,6 +160,42 @@ class PublishReviewTests(unittest.TestCase):
         body = gh.create_review.call_args.kwargs["body"]
         self.assertIn("3 suggested inline comment(s) were dropped", body)
 
+    def test_model_in_footer(self) -> None:
+        cfg = _make_cfg()
+        draft = _make_draft(model="acme/cool-model")
+        gh = MagicMock()
+        publish_review(cfg, gh, draft)
+        body = gh.create_review.call_args.kwargs["body"]
+        self.assertIn("model: `acme/cool-model`", body)
+        # Model and metrics share one footer line.
+        self.assertIn("model: `acme/cool-model` · 2 LLM turns", body)
+
+    def test_no_model_footer_when_unset(self) -> None:
+        cfg = _make_cfg()
+        draft = _make_draft(model=None)
+        gh = MagicMock()
+        publish_review(cfg, gh, draft)
+        body = gh.create_review.call_args.kwargs["body"]
+        self.assertNotIn("model:", body)
+        # Metrics line still renders on its own.
+        self.assertIn("2 LLM turns", body)
+
+    def test_staging_note_in_body(self) -> None:
+        cfg = _make_cfg(is_staging=True)
+        draft = _make_draft()
+        gh = MagicMock()
+        publish_review(cfg, gh, draft)
+        body = gh.create_review.call_args.kwargs["body"]
+        self.assertIn("posted from a staging deployment", body)
+
+    def test_no_staging_note_by_default(self) -> None:
+        cfg = _make_cfg()
+        draft = _make_draft()
+        gh = MagicMock()
+        publish_review(cfg, gh, draft)
+        body = gh.create_review.call_args.kwargs["body"]
+        self.assertNotIn("staging", body)
+
     def test_no_persona_header_when_disabled(self) -> None:
         cfg = _make_cfg(persona_header="")
         draft = _make_draft()

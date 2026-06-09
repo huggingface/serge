@@ -97,6 +97,10 @@ inputs:
     description: 'Model context window (tokens) used for sizing.'
     required: false
     default: '200000'
+  staging:
+    description: 'Set to "true" to mark this as a staging deployment. Published reviews then carry a note saying they were posted from staging.'
+    required: false
+    default: 'false'
   github_token:
     description: 'Token with pull-requests:write. Defaults to the job token.'
     required: false
@@ -146,6 +150,7 @@ runs:
         CONTEXT_SCRIPT_TIMEOUT: ${{ inputs.context_script_timeout }}
         REPO_CHECKOUT_PATH: ${{ inputs.repo_checkout_path }}
         TOOL_MAX_ITERATIONS: ${{ inputs.tool_max_iterations }}
+        STAGING: ${{ inputs.staging }}
         HEADROOM_COMPRESS: ${{ inputs.headroom_compress }}
         HEADROOM_TARGET_RATIO: ${{ inputs.headroom_target_ratio }}
         HEADROOM_COMPRESS_USER_MESSAGES: ${{ inputs.headroom_compress_user_messages }}

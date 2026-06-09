@@ -99,6 +99,10 @@ class ReviewDraft:
     # metrics_line string.
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Resolved LLM model id that produced this review (after endpoint
+    # auto-discovery, if llm_model was unset). Surfaced in the published
+    # review footer; None when no LLM call was made.
+    model: Optional[str] = None
 
 
 @dataclass
@@ -1322,6 +1326,7 @@ def prepare_review(
         truncated_chunks=skipped_chunks_for_budget,
         prompt_tokens=total_metrics.prompt_tokens,
         completion_tokens=total_metrics.completion_tokens,
+        model=llm.model,
     )
 
 
@@ -1373,8 +1378,15 @@ def publish_review(
             f"budget; {draft.truncated_chunks} remaining diff chunk(s) were "
             "not reviewed._"
         )
+    if cfg.is_staging:
+        body += "\n\n_Note: posted from a staging deployment._"
+    footer_parts = []
+    if draft.model:
+        footer_parts.append(f"model: `{draft.model}`")
     if draft.metrics_line:
-        body += f"\n\n_{draft.metrics_line}_"
+        footer_parts.append(draft.metrics_line)
+    if footer_parts:
+        body += f"\n\n_{' · '.join(footer_parts)}_"
 
     gh.create_review(
         draft.owner,

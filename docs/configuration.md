@@ -30,6 +30,7 @@ environment variables in server modes.
 | `DEFAULT_REVIEW_RULES` | `default_review_rules` | general Python correctness and security rules | Fallback when no rules file exists. |
 | `ALLOW_APPROVE` | none | `false` | Allows publishing `APPROVE` events in App/web mode. |
 | `PERSONA_HEADER` | none | `🤗 **Serge** says:` | Prefix for failure comments and bot messages. |
+| `STAGING` | `staging` | `false` | Marks a non-production deployment. Published reviews then carry a note that they were posted from staging. |
 
 ## Context Compression
 
