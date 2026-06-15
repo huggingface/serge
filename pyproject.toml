@@ -29,6 +29,10 @@ web = [
   "uvicorn[standard]>=0.27",
   "httpx>=0.27",
   "itsdangerous>=2.1",
+  # Optional Postgres backend for the job store (DATABASE_URL). SQLite
+  # remains the default; psycopg is only imported when a postgres:// URL
+  # is configured. See reviewbot/store.py.
+  "psycopg[binary]>=3.1",
 ]
 # Optional context compression. Enable at runtime with HEADROOM_COMPRESS=1.
 headroom = [

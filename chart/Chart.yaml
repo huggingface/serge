@@ -1,0 +1,6 @@
+apiVersion: v2
+name: serge
+version: 0.0.0-latest
+type: application
+description: serge — GitHub PR reviewer web app (hub-prod / hub-utils)
+icon: https://huggingface.co/front/assets/huggingface_logo-noborder.svg

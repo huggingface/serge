@@ -1,0 +1,73 @@
+name: Create and publish a Docker image
+
+on:
+  push:
+    branches:
+      - main
+
+# Cancel current run if a newer run starts on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push-image:
+    runs-on:
+      group: cpu-high
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Inject slug/short variables
+        uses: rlespinasse/github-slug-action@v4
+      - name: Login to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.internal.huggingface.tech
+          username: robot$serge
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          flavor: |
+            latest=auto
+          images: registry.internal.huggingface.tech/serge/serge
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=raw,value=sha-${{ env.GITHUB_SHA_SHORT }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: 'linux/amd64'
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-to: type=gha,mode=max
+          cache-from: type=gha
+      - name: tag
+        id: tag
+        run: |
+          echo "tag=sha-${{ env.GITHUB_SHA_SHORT }}" >> "$GITHUB_OUTPUT"
+  deploy:
+    if: ${{ endsWith(github.ref, '/main') }}
+    runs-on:
+      group: cpu-low
+    environment: production
+    concurrency: production
+    needs: [build-and-push-image]
+    steps:
+      - name: Deploy on infra-deployment
+        uses: the-actions-org/workflow-dispatch@v2
+        with:
+          workflow: Update application tag
+          repo: ${{ vars.INFRA_DEPLOYMENT_REPO }}
+          ref: refs/heads/main
+          wait-for-completion: true
+          token: ${{ secrets.GIT_TOKEN_INFRA_DEPLOYMENT }}
+          inputs: '{"path": "hub/serge/*.yaml", "image_tag": "${{ needs.build-and-push-image.outputs.tag }}", "url": "${{ github.event.head_commit.url }}"}'

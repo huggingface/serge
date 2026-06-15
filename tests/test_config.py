@@ -54,6 +54,28 @@ class ConfigTests(unittest.TestCase):
 
         self.assertTrue(cfg.is_staging)
 
+    def test_store_path_defaults_to_sqlite(self) -> None:
+        with patch.dict(os.environ, {"LLM_API_KEY": "token"}, clear=True):
+            cfg = Config.from_env(require_app=False)
+
+        self.assertEqual(cfg.web_store_path, "jobs.db")
+
+    def test_database_url_overrides_store_path(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "LLM_API_KEY": "token",
+                "WEB_STORE_PATH": "/var/lib/reviewbot/jobs.db",
+                "DATABASE_URL": "postgresql://u:p@db.internal:5432/serge",
+            },
+            clear=True,
+        ):
+            cfg = Config.from_env(require_app=False)
+
+        # DATABASE_URL wins over WEB_STORE_PATH so the hosted deployment
+        # keeps state off the ephemeral pod filesystem.
+        self.assertEqual(cfg.web_store_path, "postgresql://u:p@db.internal:5432/serge")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,15 +1,26 @@
-"""SQLite-backed persistence for review jobs. Replaces the original
+"""Persistence for review jobs. Replaces the original
 in-memory-with-4h-TTL registry so reviews survive process restarts and
 can be re-opened / published after the fact.
+
+Two backends are supported, selected by the connection string passed to
+:class:`JobStore`:
+
+* **SQLite** (default) — any plain filesystem path. Single-writer,
+  multi-reader: the FastAPI process runs with workers=1, but the SSE
+  worker threads write from background threads, so we run the connection
+  with WAL + ``check_same_thread=False``.
+* **Postgres** — a ``postgres://`` / ``postgresql://`` URL (e.g. from
+  ``DATABASE_URL``). Used by the hosted hub deployment so job state lives
+  off the (ephemeral) pod filesystem. Requires the ``web`` extra
+  (``psycopg``).
+
+Writes are serialized through a module-level lock for both backends: a
+single connection is shared across the SSE worker threads, and neither a
+sqlite connection nor a psycopg connection is safe for concurrent use.
 
 Only structural events (log/step/tool/error/done/metrics) are persisted
 — the token/reasoning stream is dropped on completion since it can run
 to 10^5 entries per huge PR and is not useful after the fact.
-
-The DB is treated as a single-writer, multi-reader resource: the FastAPI
-process runs with workers=1, but the SSE worker threads write from
-background threads. We serialize writes with a module-level lock and run
-the connection with WAL + check_same_thread=False.
 """
 
 from __future__ import annotations
@@ -21,17 +32,53 @@ import os
 import sqlite3
 import threading
 import time
+import urllib.parse
 from typing import Any, Optional
 
 from .patch import DiffSnippetLine
 from .reviewer import DraftComment, ReviewDraft
 
+try:  # Optional: only needed for the Postgres backend (web extra).
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # pragma: no cover - exercised via the SQLite path
+    psycopg = None  # type: ignore[assignment]
+    dict_row = None  # type: ignore[assignment]
+
 log = logging.getLogger(__name__)
+
+_PG_SCHEMES = ("postgres://", "postgresql://")
+
+
+def _is_postgres_url(path: str) -> bool:
+    return path.startswith(_PG_SCHEMES)
+
+
+class _Conn:
+    """Thin wrapper so the rest of JobStore can keep writing sqlite-style
+    ``?``-placeholder SQL against either backend. For Postgres we rewrite
+    ``?`` to ``%s`` (psycopg's paramstyle) on the way through; everything
+    else (``.execute`` returning a cursor with ``.fetchone``/``.fetchall``/
+    ``.rowcount``, ``.commit``) is already shared between sqlite3 and
+    psycopg3."""
+
+    def __init__(self, raw: Any, is_pg: bool) -> None:
+        self._raw = raw
+        self._is_pg = is_pg
+
+    def execute(self, sql: str, params: Any = ()) -> Any:
+        if self._is_pg:
+            sql = sql.replace("?", "%s")
+        return self._raw.execute(sql, params)
+
+    def commit(self) -> None:
+        self._raw.commit()
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id              TEXT PRIMARY KEY,
-    user            TEXT NOT NULL,
+    "user"          TEXT NOT NULL,
     target_owner    TEXT NOT NULL,
     target_repo     TEXT NOT NULL,
     target_number   INTEGER NOT NULL,
@@ -59,7 +106,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_jobs_user    ON jobs(user);
+CREATE INDEX IF NOT EXISTS idx_jobs_user    ON jobs("user");
 CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
 
 -- Per-repo provider config: which LLM provider + API key to use when a
@@ -110,36 +157,79 @@ PERSIST_EVENT_KINDS = frozenset(
 class JobStore:
     def __init__(self, path: str) -> None:
         self.path = path
-        parent = os.path.dirname(os.path.abspath(path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        # check_same_thread=False: worker threads write from background
-        # threads. We serialize with self._lock to keep that safe.
-        self._conn = sqlite3.connect(path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        self._is_pg = _is_postgres_url(path)
+        if self._is_pg:
+            if psycopg is None:
+                raise RuntimeError(
+                    "DATABASE_URL points at Postgres but psycopg is not "
+                    "installed; install the 'web' extra (pip install -e '.[web]')."
+                )
+            raw: Any = psycopg.connect(path, autocommit=False, row_factory=dict_row)
+        else:
+            parent = os.path.dirname(os.path.abspath(path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            # check_same_thread=False: worker threads write from background
+            # threads. We serialize with self._lock to keep that safe.
+            raw = sqlite3.connect(path, check_same_thread=False)
+            raw.row_factory = sqlite3.Row
+        self._raw = raw
+        self._conn = _Conn(raw, self._is_pg)
         self._lock = threading.Lock()
         with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.executescript(_SCHEMA)
-            self._ensure_column("llm_provider", "TEXT")
-            self._ensure_column("llm_api_base", "TEXT")
-            self._ensure_column("llm_model", "TEXT")
-            self._ensure_column("prompt_tokens", "INTEGER")
-            self._ensure_column("completion_tokens", "INTEGER")
-            self._ensure_column("source", "TEXT NOT NULL DEFAULT 'web'")
-            self._ensure_column("kind", "TEXT NOT NULL DEFAULT 'review'")
-            self._ensure_column("task_spec_json", "TEXT")
-            self._ensure_column("result_json", "TEXT")
-            self._ensure_column(
-                "task_write_enabled",
-                "INTEGER NOT NULL DEFAULT 0",
-                table="provider_configs",
-            )
+            if self._is_pg:
+                # Fresh Postgres DBs get the full schema in one shot; the
+                # sqlite-only column migrations below are a no-op there
+                # since every column is already in _SCHEMA. REAL has too
+                # little precision for epoch-second timestamps in Postgres,
+                # so widen it to DOUBLE PRECISION.
+                schema = _SCHEMA.replace(" REAL", " DOUBLE PRECISION")
+                for stmt in schema.split(";"):
+                    if stmt.strip():
+                        self._raw.execute(stmt)
+            else:
+                self._raw.execute("PRAGMA journal_mode=WAL")
+                self._raw.execute("PRAGMA synchronous=NORMAL")
+                self._raw.executescript(_SCHEMA)
+                self._ensure_column("llm_provider", "TEXT")
+                self._ensure_column("llm_api_base", "TEXT")
+                self._ensure_column("llm_model", "TEXT")
+                self._ensure_column("prompt_tokens", "INTEGER")
+                self._ensure_column("completion_tokens", "INTEGER")
+                self._ensure_column("source", "TEXT NOT NULL DEFAULT 'web'")
+                self._ensure_column("kind", "TEXT NOT NULL DEFAULT 'review'")
+                self._ensure_column("task_spec_json", "TEXT")
+                self._ensure_column("result_json", "TEXT")
+                self._ensure_column(
+                    "task_write_enabled",
+                    "INTEGER NOT NULL DEFAULT 0",
+                    table="provider_configs",
+                )
             self._conn.commit()
-        log.info("Opened job store at %s", path)
+        log.info(
+            "Opened %s job store at %s",
+            "postgres" if self._is_pg else "sqlite",
+            self._redacted_target(),
+        )
+
+    def _redacted_target(self) -> str:
+        """A log-safe description of the store: the bare filesystem path
+        for sqlite, or host/db with the password stripped for a Postgres
+        URL (so credentials never hit the logs)."""
+        if not self._is_pg:
+            return self.path
+        try:
+            parts = urllib.parse.urlsplit(self.path)
+            host = parts.hostname or "?"
+            db = parts.path.lstrip("/") or "?"
+            return f"{host}/{db}"
+        except Exception:  # pragma: no cover - never let logging crash startup
+            return "postgres"
 
     def _ensure_column(self, name: str, sql_type: str, *, table: str = "jobs") -> None:
+        """SQLite-only schema migration: add a column to an existing DB
+        created before that column was introduced. Postgres DBs are always
+        created fresh from the full _SCHEMA."""
         columns = {
             row["name"]
             for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -173,7 +263,7 @@ class JobStore:
             self._conn.execute(
                 """
                 INSERT INTO jobs (
-                    id, user, target_owner, target_repo, target_number,
+                    id, "user", target_owner, target_repo, target_number,
                     trigger_comment, llm_provider, llm_api_base, llm_model,
                     created_at, updated_at, status, source, kind, task_spec_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -322,11 +412,11 @@ class JobStore:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, user, target_owner, target_repo, target_number,
+                SELECT id, "user", target_owner, target_repo, target_number,
                        status, source, created_at, updated_at,
                        llm_provider, llm_api_base, llm_model
                   FROM jobs
-                 WHERE user = ?
+                 WHERE "user" = ?
                  ORDER BY created_at DESC
                  LIMIT ?
                 """,
@@ -620,7 +710,7 @@ class JobStore:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, user, target_owner, target_repo, target_number,
+                SELECT id, "user", target_owner, target_repo, target_number,
                        status, source, kind, created_at, updated_at,
                        llm_provider, llm_api_base, llm_model,
                        prompt_tokens, completion_tokens
@@ -713,7 +803,7 @@ def decode_draft(s: Optional[str]) -> Optional[ReviewDraft]:
     )
 
 
-def _decode_provider_config(row: sqlite3.Row) -> dict[str, Any]:
+def _decode_provider_config(row: Any) -> dict[str, Any]:
     d = dict(row)
     d["task_write_enabled"] = bool(d.get("task_write_enabled"))
     for key in ("allowed_users", "allowed_orgs"):
@@ -729,7 +819,7 @@ def _decode_provider_config(row: sqlite3.Row) -> dict[str, Any]:
     return d
 
 
-def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _row_to_dict(row: Any) -> dict[str, Any]:
     d = dict(row)
     history_raw = d.pop("history_json", None)
     if history_raw:

@@ -1,0 +1,63 @@
+image:
+  repository: registry.internal.huggingface.tech/serge
+  name: serge
+  tag: 0.0.0-latest
+  pullPolicy: IfNotPresent
+
+replicas: 1
+
+# Public hostname; external-dns creates the Route53 record from the
+# ingress, and the AWS LB controller discovers the matching ACM cert by
+# this host.
+domain: serge.huggingface.co
+
+# uvicorn listens here (reviewbot-web defaults to 8080).
+containerPort: 8080
+
+service:
+  type: NodePort
+  annotations: {}
+
+serviceAccount:
+  enabled: false
+  create: false
+  name: ""
+  automountServiceAccountToken: true
+  annotations: {}
+
+ingress:
+  enabled: true
+  path: "/"
+  className: ""
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 1
+    memory: 1Gi
+
+nodeSelector: {}
+tolerations: []
+
+# Non-secret env, rendered into a ConfigMap and injected via envFrom.
+envVars: {}
+
+# Secret env is materialized by the Infisical operator into <name>-secs
+# and injected via envFrom when infisical.enabled. The Postgres
+# DATABASE_URL, GitHub App key, OAuth client secret, session secret and
+# LLM key all live there — see the Infisical /serge folder.
+infisical:
+  enabled: false
+  env: ""
+  project: ""
+  url: ""
+  resyncInterval: 60
+  operatorSecretName: "serge-operator-secrets"
+  operatorSecretNamespace: "hub-utils"
+
+# Escape hatches for extra env without going through Infisical.
+extraEnv: []
+extraEnvFrom: []
