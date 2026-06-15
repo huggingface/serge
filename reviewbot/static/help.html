@@ -86,6 +86,13 @@
               admin config; override per-job if you want.
             </li>
             <li>
+              <strong>Max input tokens</strong> — per-review cap on the
+              cumulative input tokens spent across all diff chunks and tool
+              turns. Blank uses the deployment default; <code>0</code>
+              disables the cap. Raising it lets the reviewer handle very
+              large PRs, but the cost and latency climb fast.
+            </li>
+            <li>
               The <strong>Presets</strong> row (First-pass, New model, Bug
               fix, Documentation) drops a starter prompt into the trigger
               comment.

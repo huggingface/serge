@@ -274,6 +274,10 @@ class Job:
     # worker doesn't need to hit the store again. "" for reconstructed
     # finished jobs that won't be re-executed.
     llm_api_key: str = ""
+    # Per-review override for the cumulative input-token budget. None means
+    # "use the deployment default" (cfg.llm_max_input_tokens); 0 disables
+    # the cap. In-memory only — consumed by the worker, never persisted.
+    llm_max_input_tokens: Optional[int] = None
     # "web" for jobs the logged-in user submitted through the UI; "webhook"
     # for reviews kicked off by a GitHub comment. Webhook jobs have no
     # owning UI user, so any authenticated viewer may follow them.
@@ -522,6 +526,27 @@ def _normalize_llm_base_url(raw: str) -> str:
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise HTTPException(status_code=400, detail="bad_llm_base_url")
     return base
+
+
+def _parse_max_input_tokens(payload: dict[str, Any]) -> Optional[int]:
+    """Per-review override for the cumulative input-token budget. Returns
+    ``None`` when the field is absent/blank (the worker then keeps the
+    deployment default), ``0`` to disable the cap, or a positive int.
+    Rejects negatives and non-integers with a 400."""
+    raw = payload.get("llm_max_input_tokens")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="bad_llm_max_input_tokens")
+    if value < 0:
+        raise HTTPException(status_code=400, detail="bad_llm_max_input_tokens")
+    return value
 
 
 def _parse_provider(payload: dict[str, Any]) -> str:
@@ -945,6 +970,10 @@ def _run_review_worker(job: Job) -> None:
         llm_model=job.llm_model,
         llm_bill_to=_llm_bill_to_for_provider(job.llm_provider),
     )
+    if job.llm_max_input_tokens is not None:
+        worker_cfg = dataclasses.replace(
+            worker_cfg, llm_max_input_tokens=job.llm_max_input_tokens
+        )
     _execute_review(job, worker_cfg, gh, token, req, auto_publish=False)
 
 
@@ -1548,6 +1577,7 @@ def llm_options(request: Request) -> JSONResponse:
             "default_provider": provider,
             "default_model": cfg.llm_model or "",
             "custom_base_url": custom_base,
+            "default_max_input_tokens": cfg.llm_max_input_tokens,
             "providers": [
                 _provider_entry(
                     _LLM_PROVIDER_HF, "HF", _LLM_PROVIDER_BASES[_LLM_PROVIDER_HF]
@@ -1913,6 +1943,7 @@ async def submit_review(request: Request) -> JSONResponse:
         raise HTTPException(status_code=413, detail="comment_too_long")
     owner, repo, number = _parse_pr_ref(pr_ref)
     llm_provider = _parse_provider(payload)
+    llm_max_input_tokens = _parse_max_input_tokens(payload)
     # Stash any newly-discovered orgs on the eventual response so a
     # SAML-protected user doesn't pay the App-membership round-trip on
     # every subsequent submission.
@@ -1964,6 +1995,7 @@ async def submit_review(request: Request) -> JSONResponse:
         llm_model=llm_model,
         created_at=time.time(),
         llm_api_key=matched["api_key"],
+        llm_max_input_tokens=llm_max_input_tokens,
     )
     job.loop = asyncio.get_running_loop()
     with _jobs_lock:

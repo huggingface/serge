@@ -58,6 +58,19 @@
         <input type="text" id="llm-base-url" name="llm_base_url" placeholder="https://example.com/v1">
       </div>
       <div id="provider-hint" class="hint" style="margin-top:10px;"></div>
+      <div style="margin-top: 14px;">
+        <label for="llm-max-input-tokens">Max input tokens</label>
+        <div class="hint">
+          Cumulative input-token budget across the whole review (all diff chunks
+          and tool turns). Leave blank to use the deployment default
+          (<span id="max-input-tokens-default">unset</span>). Use <code>0</code> to
+          disable the cap. <strong>Heads up:</strong> raising this well past the
+          default lets the reviewer chew through very large PRs, but it gets
+          really, really expensive and slow.
+        </div>
+        <input type="number" id="llm-max-input-tokens" name="llm_max_input_tokens"
+               min="0" step="1000" inputmode="numeric" placeholder="deployment default">
+      </div>
       <div class="presets">
         <span class="hint">Presets:</span>
         <button type="button" class="secondary preset" data-preset="first-pass">First-pass</button>

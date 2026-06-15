@@ -10,6 +10,8 @@
   const baseUrlEl = document.getElementById("llm-base-url");
   const customBaseRow = document.getElementById("custom-base-row");
   const providerHint = document.getElementById("provider-hint");
+  const maxInputEl = document.getElementById("llm-max-input-tokens");
+  const maxInputDefaultEl = document.getElementById("max-input-tokens-default");
   const jobsSection = document.getElementById("jobs-section");
   const jobsTbody = document.getElementById("jobs-tbody");
   const jobsCount = document.getElementById("jobs-count");
@@ -91,6 +93,7 @@
       provider: providerEl.value,
       model: modelEl.value.trim(),
       base_url: baseUrlEl.value.trim(),
+      max_input_tokens: maxInputEl.value.trim(),
     };
     document.cookie = `${LLM_PREF_COOKIE}=${encodeURIComponent(JSON.stringify(prefs))}; ${cookieOptions()}`;
   }
@@ -103,6 +106,9 @@
     }
     if (typeof prefs.model === "string") modelEl.value = prefs.model;
     if (typeof prefs.base_url === "string") baseUrlEl.value = prefs.base_url;
+    if (typeof prefs.max_input_tokens === "string") {
+      maxInputEl.value = prefs.max_input_tokens;
+    }
   }
 
   function updateProviderFields() {
@@ -200,6 +206,20 @@
     }
   }
 
+  function applyMaxInputDefault(value) {
+    // Surface the deployment-wide cap in the hint + placeholder so the user
+    // knows what "blank" resolves to. 0/falsy means the cap is disabled.
+    if (!maxInputDefaultEl) return;
+    if (typeof value === "number" && value > 0) {
+      const pretty = value.toLocaleString();
+      maxInputDefaultEl.textContent = `${pretty} tokens`;
+      maxInputEl.placeholder = `default ${pretty}`;
+    } else {
+      maxInputDefaultEl.textContent = "no limit";
+      maxInputEl.placeholder = "default: no limit";
+    }
+  }
+
   async function loadLlmOptions() {
     try {
       const r = await fetch("/llm-options");
@@ -208,6 +228,7 @@
       providerEl.value = data.default_provider || "hf";
       modelEl.value = data.default_model || "";
       baseUrlEl.value = data.custom_base_url || "";
+      applyMaxInputDefault(data.default_max_input_tokens);
       ingestProviderDefaults(data.providers);
       applySavedLlmPrefs();
       applyProviderModelDefault();
@@ -357,12 +378,20 @@
     const llm_provider = providerEl.value;
     const llm_model = modelEl.value.trim();
     const llm_base_url = baseUrlEl.value.trim();
+    const llm_max_input_tokens = maxInputEl.value.trim();
     try {
       saveLlmPrefs();
       const r = await fetch("/reviews", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pr, comment, llm_provider, llm_model, llm_base_url }),
+        body: JSON.stringify({
+          pr,
+          comment,
+          llm_provider,
+          llm_model,
+          llm_base_url,
+          llm_max_input_tokens,
+        }),
       });
       if (!r.ok) {
         throw new Error(await errorMessage(r));
@@ -396,6 +425,7 @@
     saveLlmPrefs();
   });
   baseUrlEl.addEventListener("change", saveLlmPrefs);
+  maxInputEl.addEventListener("change", saveLlmPrefs);
 
   // Auto-fill provider/model from the matching DB config whenever the
   // PR field changes. Debounced so we don't hit the endpoint on every
