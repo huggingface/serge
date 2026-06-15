@@ -43,6 +43,20 @@ PEM_REMOTE_FILE="$(jq -r .pem_remote "$STATE_FILE")"
 APP_DIR="/opt/app/ai-reviewer"
 APP_ENV_REMOTE_FILE="/etc/reviewbot/${SERVICE_NAME}.env"
 
+# Use the AWS profile recorded in the state file (if any) for every aws call,
+# unless the caller already exported one.
+AWS_PROFILE_STATE="$(jq -r '.aws_profile // empty' "$STATE_FILE")"
+if [[ -n "$AWS_PROFILE_STATE" && -z "${AWS_PROFILE:-}" ]]; then
+  export AWS_PROFILE="$AWS_PROFILE_STATE"
+fi
+
+# Fail early with a clear hint if SSO creds are missing/expired.
+if ! aws sts get-caller-identity --region "$REGION" >/dev/null 2>&1; then
+  echo "AWS credentials invalid or expired for profile '${AWS_PROFILE:-default}'." >&2
+  echo "Run: aws sso login --profile ${AWS_PROFILE:-<your-profile>}" >&2
+  exit 1
+fi
+
 if [[ ! -f "$KEY_FILE" ]]; then
   echo "missing SSH key: $KEY_FILE" >&2
   exit 1
