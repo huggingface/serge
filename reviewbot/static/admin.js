@@ -13,6 +13,7 @@
   const repoPatternEl = document.getElementById("repo_pattern");
   const allowedUsersEl = document.getElementById("allowed_users");
   const allowedOrgsEl = document.getElementById("allowed_orgs");
+  const taskWriteEl = document.getElementById("task_write_enabled");
   const submitBtn = document.getElementById("submit-btn");
   const cancelBtn = document.getElementById("cancel-btn");
   const configIdEl = document.getElementById("config-id");
@@ -121,6 +122,7 @@
     repoPatternEl.value = "";
     allowedUsersEl.value = "";
     allowedOrgsEl.value = "";
+    if (taskWriteEl) taskWriteEl.checked = false;
     formTitle.textContent = "Add a provider config";
     submitBtn.textContent = "Save";
     cancelBtn.style.display = "none";
@@ -141,6 +143,7 @@
     repoPatternEl.value = cfg.repo_pattern || "";
     allowedUsersEl.value = (cfg.allowed_users || []).join(", ");
     allowedOrgsEl.value = (cfg.allowed_orgs || []).join(", ");
+    if (taskWriteEl) taskWriteEl.checked = !!cfg.task_write_enabled;
     formTitle.textContent = `Edit config (${cfg.provider} · ${cfg.repo_pattern})`;
     submitBtn.textContent = "Save changes";
     cancelBtn.style.display = "";
@@ -176,11 +179,6 @@
       tdProvider.textContent = cfg.provider;
       tr.appendChild(tdProvider);
 
-      const tdBase = document.createElement("td");
-      tdBase.textContent = cfg.api_base || "—";
-      tdBase.title = cfg.api_base || "";
-      tr.appendChild(tdBase);
-
       const tdModel = document.createElement("td");
       tdModel.textContent = cfg.default_model || "—";
       tr.appendChild(tdModel);
@@ -193,6 +191,13 @@
       if (orgs) access.push(`orgs: ${orgs}`);
       tdAccess.textContent = access.join(" · ") || "—";
       tr.appendChild(tdAccess);
+
+      const tdTasks = document.createElement("td");
+      tdTasks.textContent = cfg.task_write_enabled ? "✓ write" : "—";
+      tdTasks.title = cfg.task_write_enabled
+        ? "Write-capable /tasks flow enabled for this repo."
+        : "Read-only reviews only.";
+      tr.appendChild(tdTasks);
 
       const tdKey = document.createElement("td");
       tdKey.textContent = cfg.api_key_status || "";
@@ -273,6 +278,7 @@
       repo_pattern: repoPatternEl.value.trim(),
       allowed_users: allowedUsersEl.value.trim(),
       allowed_orgs: allowedOrgsEl.value.trim(),
+      task_write_enabled: taskWriteEl ? taskWriteEl.checked : false,
     };
     const apiKey = apiKeyEl.value;
     // On create the key is required. On edit a blank key means "keep

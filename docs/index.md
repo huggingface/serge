@@ -31,6 +31,7 @@ deployment mode that fits your repository.
 - Optional repository context from `.ai/context-script`.
 - Optional helper tools from `.ai/review-tools.json`.
 - Human-in-the-loop staged reviews through the web app.
+- Optional write-capable [tasks flow](tasks-flow.md): CI sends a failure report, serge opens a fix PR.
 
 ## Documentation
 
@@ -38,6 +39,7 @@ deployment mode that fits your repository.
 - [GitHub Action](github-action.md)
 - [GitHub App webhook](github-app.md)
 - [Staged web app](web-app.md)
+- [Tasks flow (write-capable)](tasks-flow.md)
 - [Configuration](configuration.md)
 - [Repository customization](repository-customization.md)
 - [LLM providers](llm-providers.md)

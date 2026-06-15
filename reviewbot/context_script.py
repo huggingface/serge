@@ -179,9 +179,7 @@ def run_context_script(
     )
 
     try:
-        argv = wrap_command(
-            [full], workdir=base, write_root=base, mode=sandbox_mode
-        )
+        argv = wrap_command([full], workdir=base, write_root=base, mode=sandbox_mode)
     except SandboxUnavailable as exc:
         log.warning("context script not run (sandbox unavailable): %s", exc)
         return None

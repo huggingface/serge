@@ -21,12 +21,16 @@ Action workflow from the [GitHub Action guide](docs/github-action.md). Comment
 For fork-heavy repositories or hosted deployments, use the
 [GitHub App](docs/github-app.md) or [web app](docs/web-app.md) guides instead.
 
+Beyond reviewing, serge can also open fix PRs from CI failures — see the
+optional, write-capable [tasks flow](docs/tasks-flow.md).
+
 ## Documentation
 
 - [Getting started](docs/getting-started.md)
 - [GitHub Action](docs/github-action.md)
 - [GitHub App webhook](docs/github-app.md)
 - [Staged web app](docs/web-app.md)
+- [Tasks flow (write-capable)](docs/tasks-flow.md)
 - [Configuration](docs/configuration.md)
 - [Repository customization](docs/repository-customization.md)
 - [LLM providers](docs/llm-providers.md)

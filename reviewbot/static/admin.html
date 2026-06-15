@@ -42,9 +42,9 @@
           <tr>
             <th>Repo</th>
             <th>Provider</th>
-            <th>Base URL</th>
             <th>Default model</th>
             <th>Users / orgs</th>
+            <th>Tasks</th>
             <th>Key</th>
             <th>Updated</th>
             <th></th>
@@ -107,6 +107,14 @@
           <div class="hint">Comma-separated GitHub org slugs.</div>
           <input type="text" id="allowed_orgs" name="allowed_orgs" placeholder="huggingface">
         </div>
+      </div>
+
+      <div>
+        <label for="task_write_enabled" style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+          <input type="checkbox" id="task_write_enabled" name="task_write_enabled" style="width:auto;">
+          Enable write-capable tasks (<code>/tasks</code> flow)
+        </label>
+        <div class="hint">Off by default. When on, serge may open PRs / push commits to this repo from GitHub Actions (requires the App to hold Contents:write + Pull Requests:write).</div>
       </div>
 
       <div class="actions">

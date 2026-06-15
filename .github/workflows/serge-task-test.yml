@@ -1,0 +1,118 @@
+name: Serge task (test the /tasks flow)
+
+# Manually-triggered exerciser for serge's write-capable /tasks endpoint.
+#
+# It mints a GitHub Actions OIDC token (audience = serge), joins the VPN via
+# Tailscale so the internal https://serge.huggingface.tech is reachable, and
+# POSTs an instruction + context to /tasks. serge then opens a fix PR (new_pr)
+# or pushes a follow-up commit onto an existing serge fix branch (existing_pr).
+#
+# Prerequisites (one-time):
+#   - The Serge GitHub App on this repo holds Contents:write + Pull Requests:write.
+#   - The repo's provider config in /admin has "Enable write-capable tasks" on.
+#   - The serge deployment has TASK_API_ENABLED=1 and TASK_OIDC_AUDIENCE=serge.
+
+on:
+  workflow_dispatch:
+    inputs:
+      instruction:
+        description: "Trusted instruction for serge"
+        required: true
+        default: "Make a minimal, safe change as described in the context below."
+      context:
+        description: "Untrusted context (e.g. a failing-test report / logs)"
+        required: false
+        default: ""
+      mode:
+        description: "Output mode"
+        required: true
+        type: choice
+        default: new_pr
+        options:
+          - new_pr
+          - existing_pr
+      base_ref:
+        description: "Base branch (new_pr mode)"
+        required: false
+        default: main
+      pr_number:
+        description: "Existing serge fix PR number (existing_pr mode)"
+        required: false
+        default: ""
+
+permissions:
+  id-token: write   # required to mint the OIDC token serge verifies
+  contents: read
+
+jobs:
+  run-task:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID_AI_REVIEW }}
+          oauth-secret: ${{ secrets.TS_AUDIENCE_AI_REVIEW }}
+          tags: tag:ci
+          args: --accept-dns=false
+
+      - name: Mint OIDC token and POST /tasks
+        env:
+          SERGE_URL: https://serge.huggingface.tech
+          OIDC_AUDIENCE: serge
+          INSTRUCTION: ${{ inputs.instruction }}
+          TASK_CONTEXT: ${{ inputs.context }}
+          MODE: ${{ inputs.mode }}
+          BASE_REF: ${{ inputs.base_ref }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # 1. Mint the GitHub Actions OIDC JWT for the audience serge requires.
+          OIDC_TOKEN=$(curl -sS --fail \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}" | jq -r .value)
+          if [ -z "${OIDC_TOKEN}" ] || [ "${OIDC_TOKEN}" = "null" ]; then
+            echo "::error::failed to mint OIDC token" >&2
+            exit 1
+          fi
+
+          # 2. Build the request body from inputs (jq quotes/escapes safely).
+          if [ "${MODE}" = "existing_pr" ]; then
+            if [ -z "${PR_NUMBER}" ]; then
+              echo "::error::pr_number is required for existing_pr mode" >&2
+              exit 1
+            fi
+            OUTPUT=$(jq -n --argjson n "${PR_NUMBER}" \
+              '{mode: "existing_pr", pr_number: $n}')
+          else
+            OUTPUT=$(jq -n --arg b "serge/fix" '{mode: "new_pr", branch_prefix: $b}')
+          fi
+          BODY=$(jq -n \
+            --arg repo "${GITHUB_REPOSITORY}" \
+            --arg base "${BASE_REF}" \
+            --arg instr "${INSTRUCTION}" \
+            --arg ctx "${TASK_CONTEXT}" \
+            --argjson output "${OUTPUT}" \
+            '{repo: $repo, base_ref: $base, instruction: $instr, context: $ctx, output: $output}')
+
+          # 3. POST it. serge authorizes on the OIDC repository claim.
+          HTTP_CODE=$(curl -sS --output response.json --write-out '%{http_code}' \
+            --connect-timeout 10 --max-time 120 \
+            -X POST "${SERGE_URL}/tasks" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary "${BODY}") || true
+
+          echo "serge responded with HTTP ${HTTP_CODE}"
+          cat response.json || true
+          echo
+          if [ "${HTTP_CODE}" != "202" ]; then
+            echo "::error::/tasks did not accept the request (HTTP ${HTTP_CODE})" >&2
+            exit 1
+          fi
+
+          TASK_URL=$(jq -r '.url // empty' response.json)
+          if [ -n "${TASK_URL}" ]; then
+            echo "Follow the task live: ${SERGE_URL}${TASK_URL}"
+          fi

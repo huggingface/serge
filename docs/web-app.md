@@ -10,6 +10,10 @@ then publish the review to GitHub.
 Reviews are published with the GitHub App identity. GitHub OAuth is used for
 access control to the staging UI.
 
+The web app deployment also hosts the optional, write-capable
+[tasks flow](tasks-flow.md) (`POST /tasks`), which opens fix PRs from CI failure
+reports. It is off unless `TASK_API_ENABLED` is set.
+
 ## Install
 
 ```bash

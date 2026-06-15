@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -65,6 +66,20 @@ class Checkout:
     bare: str  # backing bare repo path
     owner: str
     repo: str
+
+
+@dataclass
+class FileChange:
+    """One path changed by applying a task patch to a worktree.
+
+    ``status`` is ``"A"`` (added), ``"M"`` (modified), or ``"D"`` (deleted).
+    ``content`` is the file's new bytes (None for deletions). ``mode`` is the
+    git tree mode string (``"100644"`` / ``"100755"``)."""
+
+    status: str
+    path: str
+    content: Optional[bytes]
+    mode: str
 
 
 class CloneCache:
@@ -290,6 +305,172 @@ class CloneCache:
                 return None
 
         return Checkout(path=wt, branch=branch, bare=bare, owner=owner, repo=repo)
+
+    def acquire_ref(
+        self,
+        token: Optional[str],
+        owner: str,
+        repo: str,
+        ref: str,
+        *,
+        job_id: str,
+        depth: int = 50,
+        remote_url: Optional[str] = None,
+    ) -> Optional[Checkout]:
+        """Fetch an arbitrary branch ``ref`` (e.g. ``main`` or a
+        ``serge/fix-*`` branch) into the shared bare repo and add a worktree
+        for this job. Used by the /tasks flow, where serge starts from a
+        repo-owned branch rather than ``pull/N/head``.
+
+        Unlike :meth:`acquire`, there is no ``.ai/`` overlay: the checked-out
+        ref is the repo's own trusted branch (base or a serge-authored fix
+        branch), not an untrusted fork PR head, so the helper-tool / context
+        script config can be trusted as-is. Returns the checkout or ``None``
+        on failure."""
+        bare = self._bare_path(owner, repo)
+        local_branch = f"task-{_slug(ref)}-{_slug(job_id)}"
+        wt = os.path.join(
+            self._worktrees_dir,
+            f"{_slug(owner)}__{_slug(repo)}__task__{_slug(ref)}__{_slug(job_id)}",
+        )
+        url = remote_url or f"https://github.com/{owner}/{repo}.git"
+
+        auth_args: list[str] = []
+        basic = ""
+        if token:
+            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            auth_args = ["-c", f"http.extraHeader=Authorization: Basic {basic}"]
+        redact = (token or "", basic)
+
+        lock = self._lock_for(bare)
+        with lock:
+            try:
+                self._ensure_bare(bare)
+                self._git(
+                    bare,
+                    *auth_args,
+                    "-c",
+                    "core.symlinks=false",
+                    "fetch",
+                    "--depth",
+                    str(depth),
+                    url,
+                    f"+refs/heads/{ref}:{local_branch}",
+                    timeout=180,
+                    redact=redact,
+                )
+                os.utime(bare, None)
+                self._git(
+                    bare,
+                    "-c",
+                    "core.symlinks=false",
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    wt,
+                    local_branch,
+                    timeout=60,
+                    redact=redact,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                stderr = ""
+                if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+                    stderr = exc.stderr.decode("utf-8", errors="replace")
+                log.warning(
+                    "clone cache acquire_ref failed for %s/%s@%s (%s): %s",
+                    owner,
+                    repo,
+                    ref,
+                    type(exc).__name__,
+                    stderr or exc,
+                )
+                self._git(
+                    bare, "worktree", "remove", "--force", wt, check=False, timeout=30
+                )
+                self._git(bare, "branch", "-D", local_branch, check=False, timeout=30)
+                shutil.rmtree(wt, ignore_errors=True)
+                return None
+
+        return Checkout(path=wt, branch=local_branch, bare=bare, owner=owner, repo=repo)
+
+    def apply_patch(self, checkout: Checkout, diff_text: str) -> None:
+        """Apply a unified diff to the worktree (and the index). Raises
+        ``subprocess.CalledProcessError`` if the patch does not apply
+        cleanly. ``--index`` keeps the index in sync so newly added files
+        show up in :meth:`collect_changes`. The patch is written to a temp
+        file (not passed on the command line) so its size is unbounded."""
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".patch", delete=False, encoding="utf-8"
+        ) as fh:
+            patch_path = fh.name
+            # git apply requires the diff to end with a newline.
+            fh.write(diff_text if diff_text.endswith("\n") else diff_text + "\n")
+        try:
+            self._git(
+                checkout.path,
+                "apply",
+                "--index",
+                "--whitespace=nowarn",
+                patch_path,
+                timeout=120,
+            )
+        finally:
+            os.unlink(patch_path)
+
+    def collect_changes(self, checkout: Checkout) -> list[FileChange]:
+        """Return the set of files changed in the index relative to its HEAD
+        commit (i.e. what :meth:`apply_patch` just staged). New/modified
+        files carry their bytes; deletions carry ``content=None``. Renames
+        are reported as a delete of the old path plus an add of the new
+        one."""
+        proc = self._git(
+            checkout.path,
+            "diff",
+            "--cached",
+            "--name-status",
+            "-z",
+            "HEAD",
+            timeout=60,
+        )
+        tokens = proc.stdout.decode("utf-8", errors="replace").split("\0")
+        changes: list[FileChange] = []
+        i = 0
+        while i < len(tokens):
+            status = tokens[i]
+            if not status:
+                i += 1
+                continue
+            code = status[0]
+            if code in ("R", "C"):
+                old_path = tokens[i + 1]
+                new_path = tokens[i + 2]
+                i += 3
+                changes.append(
+                    FileChange(status="D", path=old_path, content=None, mode="100644")
+                )
+                changes.append(self._read_change("A", new_path, checkout.path))
+            else:
+                path = tokens[i + 1]
+                i += 2
+                if code == "D":
+                    changes.append(
+                        FileChange(status="D", path=path, content=None, mode="100644")
+                    )
+                else:
+                    changes.append(
+                        self._read_change(
+                            "A" if code == "A" else "M", path, checkout.path
+                        )
+                    )
+        return changes
+
+    @staticmethod
+    def _read_change(status: str, path: str, root: str) -> FileChange:
+        full = os.path.join(root, path)
+        with open(full, "rb") as fh:
+            content = fh.read()
+        mode = "100755" if os.access(full, os.X_OK) else "100644"
+        return FileChange(status=status, path=path, content=content, mode=mode)
 
     def release(self, checkout: Optional[Checkout]) -> None:
         """Drop a job's worktree and its branch. Best-effort; the bare repo
