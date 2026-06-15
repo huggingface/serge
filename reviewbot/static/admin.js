@@ -179,11 +179,6 @@
       tdProvider.textContent = cfg.provider;
       tr.appendChild(tdProvider);
 
-      const tdBase = document.createElement("td");
-      tdBase.textContent = cfg.api_base || "—";
-      tdBase.title = cfg.api_base || "";
-      tr.appendChild(tdBase);
-
       const tdModel = document.createElement("td");
       tdModel.textContent = cfg.default_model || "—";
       tr.appendChild(tdModel);
@@ -196,6 +191,13 @@
       if (orgs) access.push(`orgs: ${orgs}`);
       tdAccess.textContent = access.join(" · ") || "—";
       tr.appendChild(tdAccess);
+
+      const tdTasks = document.createElement("td");
+      tdTasks.textContent = cfg.task_write_enabled ? "✓ write" : "—";
+      tdTasks.title = cfg.task_write_enabled
+        ? "Write-capable /tasks flow enabled for this repo."
+        : "Read-only reviews only.";
+      tr.appendChild(tdTasks);
 
       const tdKey = document.createElement("td");
       tdKey.textContent = cfg.api_key_status || "";

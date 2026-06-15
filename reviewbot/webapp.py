@@ -647,11 +647,10 @@ def _provider_config_summary(row: dict[str, Any]) -> dict[str, Any]:
     belongs to without exposing the secret."""
     raw_key = row.get("api_key") or ""
     if raw_key:
-        # Length and last-4 chars give just enough fingerprint to spot a
-        # stale row without leaking the secret. Short keys (<8 chars)
-        # show no tail.
-        tail = raw_key[-4:] if len(raw_key) >= 8 else ""
-        key_hint = f"set (len={len(raw_key)}, ends={tail})" if tail else "set"
+        # Show only the last 3 chars as a fingerprint so an admin can spot a
+        # stale row without leaking the secret. Short keys (<6 chars) show
+        # no tail.
+        key_hint = f"...{raw_key[-3:]}" if len(raw_key) >= 6 else "set"
     else:
         key_hint = ""
     return {
