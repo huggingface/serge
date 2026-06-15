@@ -51,6 +51,17 @@ Do not rely on the Action for forked PRs. GitHub withholds secrets from forked
 workflow runs, and the token is often read-only. Use GitHub App or web app mode
 for fork-heavy repositories.
 
+## Write-Capable Tasks
+
+The [tasks flow](tasks-flow.md) (`POST /tasks`) can open PRs and push commits,
+so it is off by default and gated on `TASK_API_ENABLED`, a per-repo opt-in flag,
+and GitHub Actions OIDC (authorized on the token's `repository` claim — no shared
+secret). The LLM only ever proposes a patch; serge applies and commits it through
+the GitHub Git Data API, so push credentials never enter the sandbox. serge
+writes only inside its own `serge/*` branch namespace, and a follow-up loop cap
+bounds the number of commits per fix branch. Task `context`/logs are untrusted
+input, handled like a PR body.
+
 ## Web App Sessions
 
 Production web app deployments should use OAuth, a strong

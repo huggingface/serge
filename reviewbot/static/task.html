@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Serge · task</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" type="image/png" href="/static/serge-logo.png">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="brand-row">
+      <a href="/" class="brand"><h1><img class="brand-logo" src="/static/serge-logo.png" alt=""> Serge</h1></a>
+    </div>
+    <div class="right">
+      <span id="target"></span>
+      <span class="status-badge" id="status">running</span>
+      <a href="/journal" class="secondary nav-link">Journal</a>
+      <form method="post" action="/auth/logout" style="margin:0">
+        <button type="submit" class="secondary">Sign out</button>
+      </form>
+    </div>
+  </header>
+  <main>
+    <div id="error-banner"></div>
+
+    <section class="card">
+      <h2 style="margin-top:0;">Task</h2>
+      <p class="hint" id="instruction"></p>
+      <div id="result" style="display:none;"></div>
+    </section>
+
+    <section class="card">
+      <details id="stream-details" open>
+        <summary><h2 style="display: inline-block; margin: 0;">Live stream</h2></summary>
+        <pre class="console" id="console"></pre>
+      </details>
+    </section>
+  </main>
+  <script>
+  (function () {
+    const m = window.location.pathname.match(/^\/tasks\/([^/]+)\/([^/]+)\/([^/]+)/);
+    if (!m) return;
+    const [, owner, repo, jobId] = m;
+    const apiBase = `/tasks/${owner}/${repo}/${jobId}`;
+    const consoleEl = document.getElementById("console");
+    const statusEl = document.getElementById("status");
+    const targetEl = document.getElementById("target");
+    targetEl.textContent = `${owner}/${repo}`;
+
+    function append(line) {
+      consoleEl.textContent += line + "\n";
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
+
+    async function loadInfo() {
+      try {
+        const r = await fetch(`${apiBase}/info`);
+        if (!r.ok) return;
+        const info = await r.json();
+        statusEl.textContent = info.status;
+        document.getElementById("instruction").textContent = info.instruction || "";
+        if (info.error) {
+          const b = document.getElementById("error-banner");
+          b.textContent = info.error;
+          b.className = "error";
+        }
+        if (info.result) {
+          const res = info.result;
+          const el = document.getElementById("result");
+          el.style.display = "block";
+          let html = `<p>${res.message || ""}</p>`;
+          if (res.url) html += `<p><a href="${res.url}" target="_blank" rel="noopener">${res.url}</a></p>`;
+          if (res.changed_files && res.changed_files.length) {
+            html += "<p><strong>Changed files</strong></p><ul>" +
+              res.changed_files.map(f => `<li><code>${f}</code></li>`).join("") + "</ul>";
+          }
+          el.innerHTML = html;
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    const es = new EventSource(`${apiBase}/stream`);
+    es.onmessage = (e) => { try { append(JSON.parse(e.data)); } catch { append(e.data); } };
+    ["step", "tool", "error", "log"].forEach(kind => {
+      es.addEventListener(kind, (e) => {
+        let txt;
+        try { txt = JSON.parse(e.data); } catch { txt = e.data; }
+        append(kind === "log" ? txt : `[${kind}] ${txt}`);
+      });
+    });
+    es.addEventListener("done", () => { es.close(); loadInfo(); });
+    es.onerror = () => { /* reconnect handled by browser; refresh info */ loadInfo(); };
+
+    loadInfo();
+  })();
+  </script>
+</body>
+</html>

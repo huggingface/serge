@@ -138,6 +138,21 @@ class Config:
     # via WEB_GITHUB_APP_URL.
     web_github_app_url: Optional[str] = "https://github.com/apps/sergereview"
 
+    # --- Tasks flow (POST /tasks) -------------------------------------
+    # serge's write-capable endpoint: a GitHub Actions job posts an
+    # instruction + context (e.g. a failing-test report) and serge opens a
+    # PR with a fix. Off by default — it requires the App to hold
+    # Contents:write + Pull Requests:write and is a privilege escalation
+    # over the read-only reviewer. Auth is GitHub Actions OIDC verified
+    # against ``task_oidc_issuer``'s JWKS, authorized on the token's
+    # ``repository`` claim; ``task_oidc_audience`` is the ``aud`` serge
+    # requires the caller to mint the token with.
+    task_api_enabled: bool = False
+    task_oidc_issuer: str = "https://token.actions.githubusercontent.com"
+    task_oidc_audience: str = "serge"
+    # Cap on serge-authored commits per fix branch (follow-up loop guard).
+    task_max_followups: int = 5
+
     @classmethod
     def from_env(
         cls,
@@ -281,4 +296,10 @@ class Config:
             web_clone_depth=_int_env("WEB_CLONE_DEPTH", 50),
             web_github_app_url=(os.environ.get("WEB_GITHUB_APP_URL") or "").strip()
             or "https://github.com/apps/sergereview",
+            task_api_enabled=_bool_env("TASK_API_ENABLED", False),
+            task_oidc_issuer=(os.environ.get("TASK_OIDC_ISSUER") or "").strip()
+            or "https://token.actions.githubusercontent.com",
+            task_oidc_audience=(os.environ.get("TASK_OIDC_AUDIENCE") or "").strip()
+            or "serge",
+            task_max_followups=_int_env("TASK_MAX_FOLLOWUPS", 5),
         )

@@ -43,10 +43,17 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at      REAL NOT NULL,
     status          TEXT NOT NULL,
     source          TEXT NOT NULL DEFAULT 'web',
+    -- 'review' (the read-only PR reviewer) or 'task' (the write-capable
+    -- /tasks flow that opens PRs). Drives which worker + view renders it.
+    kind            TEXT NOT NULL DEFAULT 'review',
     error           TEXT,
     raw_llm_output  TEXT,
     draft_json      TEXT,
     history_json    TEXT,
+    -- For tasks: the inbound TaskRequest spec (instruction/context/output).
+    task_spec_json  TEXT,
+    -- For tasks: the outcome ({pr_number, branch, url}) once published.
+    result_json     TEXT,
     prompt_tokens   INTEGER,
     completion_tokens INTEGER
 );
@@ -72,6 +79,10 @@ CREATE TABLE IF NOT EXISTS provider_configs (
     repo_pattern   TEXT NOT NULL,
     allowed_users  TEXT NOT NULL DEFAULT '[]',
     allowed_orgs   TEXT NOT NULL DEFAULT '[]',
+    -- Per-repo opt-in for the write-capable /tasks flow. Off by default:
+    -- a matching config authorizes read-only reviews, but serge will only
+    -- open PRs / push commits for repos whose config has this set.
+    task_write_enabled INTEGER NOT NULL DEFAULT 0,
     created_by     TEXT NOT NULL,
     created_at     REAL NOT NULL,
     updated_at     REAL NOT NULL
@@ -117,16 +128,24 @@ class JobStore:
             self._ensure_column("prompt_tokens", "INTEGER")
             self._ensure_column("completion_tokens", "INTEGER")
             self._ensure_column("source", "TEXT NOT NULL DEFAULT 'web'")
+            self._ensure_column("kind", "TEXT NOT NULL DEFAULT 'review'")
+            self._ensure_column("task_spec_json", "TEXT")
+            self._ensure_column("result_json", "TEXT")
+            self._ensure_column(
+                "task_write_enabled",
+                "INTEGER NOT NULL DEFAULT 0",
+                table="provider_configs",
+            )
             self._conn.commit()
         log.info("Opened job store at %s", path)
 
-    def _ensure_column(self, name: str, sql_type: str) -> None:
+    def _ensure_column(self, name: str, sql_type: str, *, table: str = "jobs") -> None:
         columns = {
             row["name"]
-            for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
         }
         if name not in columns:
-            self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sql_type}")
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
     # ------------------------------------------------------------------
     # writes
@@ -146,6 +165,8 @@ class JobStore:
         created_at: float,
         status: str,
         source: str = "web",
+        kind: str = "review",
+        task_spec_json: Optional[str] = None,
     ) -> None:
         now = time.time()
         with self._lock:
@@ -154,8 +175,8 @@ class JobStore:
                 INSERT INTO jobs (
                     id, user, target_owner, target_repo, target_number,
                     trigger_comment, llm_provider, llm_api_base, llm_model,
-                    created_at, updated_at, status, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, status, source, kind, task_spec_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     id,
@@ -171,7 +192,20 @@ class JobStore:
                     now,
                     status,
                     source,
+                    kind,
+                    task_spec_json,
                 ),
+            )
+            self._conn.commit()
+
+    def save_task_result(self, job_id: str, result_json: Optional[str]) -> None:
+        """Persist a task's outcome ({pr_number, branch, url}) on the job
+        row. Separate from save_terminal so the result survives even when
+        the task produced no ReviewDraft."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE jobs SET result_json = ?, updated_at = ? WHERE id = ?",
+                (result_json, time.time(), job_id),
             )
             self._conn.commit()
 
@@ -315,6 +349,7 @@ class JobStore:
         allowed_users: list[str],
         allowed_orgs: list[str],
         created_by: str,
+        task_write_enabled: bool = False,
     ) -> None:
         now = time.time()
         with self._lock:
@@ -323,8 +358,8 @@ class JobStore:
                 INSERT INTO provider_configs (
                     id, provider, api_key, api_base, default_model,
                     repo_pattern, allowed_users, allowed_orgs,
-                    created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    task_write_enabled, created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     id,
@@ -335,6 +370,7 @@ class JobStore:
                     repo_pattern,
                     json.dumps([u.lower() for u in allowed_users]),
                     json.dumps([o.lower() for o in allowed_orgs]),
+                    1 if task_write_enabled else 0,
                     created_by,
                     now,
                     now,
@@ -353,12 +389,14 @@ class JobStore:
         allowed_users: list[str],
         allowed_orgs: list[str],
         new_api_key: Optional[str] = None,
+        task_write_enabled: bool = False,
     ) -> bool:
         """Update everything except the api_key by default. When
         ``new_api_key`` is provided, the stored secret is replaced too —
         otherwise the existing one is preserved (write-only model).
         Returns True if a row was updated."""
         now = time.time()
+        twe = 1 if task_write_enabled else 0
         with self._lock:
             if new_api_key is not None:
                 cur = self._conn.execute(
@@ -367,7 +405,7 @@ class JobStore:
                        SET provider = ?, api_key = ?, api_base = ?,
                            default_model = ?, repo_pattern = ?,
                            allowed_users = ?, allowed_orgs = ?,
-                           updated_at = ?
+                           task_write_enabled = ?, updated_at = ?
                      WHERE id = ?
                     """,
                     (
@@ -378,6 +416,7 @@ class JobStore:
                         repo_pattern,
                         json.dumps([u.lower() for u in allowed_users]),
                         json.dumps([o.lower() for o in allowed_orgs]),
+                        twe,
                         now,
                         config_id,
                     ),
@@ -388,7 +427,8 @@ class JobStore:
                     UPDATE provider_configs
                        SET provider = ?, api_base = ?, default_model = ?,
                            repo_pattern = ?, allowed_users = ?,
-                           allowed_orgs = ?, updated_at = ?
+                           allowed_orgs = ?, task_write_enabled = ?,
+                           updated_at = ?
                      WHERE id = ?
                     """,
                     (
@@ -398,6 +438,7 @@ class JobStore:
                         repo_pattern,
                         json.dumps([u.lower() for u in allowed_users]),
                         json.dumps([o.lower() for o in allowed_orgs]),
+                        twe,
                         now,
                         config_id,
                     ),
@@ -421,7 +462,7 @@ class JobStore:
                 """
                 SELECT id, provider, api_key, api_base, default_model,
                        repo_pattern, allowed_users, allowed_orgs,
-                       created_by, created_at, updated_at
+                       task_write_enabled, created_by, created_at, updated_at
                   FROM provider_configs
                  ORDER BY updated_at DESC
                 """
@@ -580,7 +621,7 @@ class JobStore:
             rows = self._conn.execute(
                 """
                 SELECT id, user, target_owner, target_repo, target_number,
-                       status, source, created_at, updated_at,
+                       status, source, kind, created_at, updated_at,
                        llm_provider, llm_api_base, llm_model,
                        prompt_tokens, completion_tokens
                   FROM jobs
@@ -674,6 +715,7 @@ def decode_draft(s: Optional[str]) -> Optional[ReviewDraft]:
 
 def _decode_provider_config(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
+    d["task_write_enabled"] = bool(d.get("task_write_enabled"))
     for key in ("allowed_users", "allowed_orgs"):
         raw = d.get(key)
         if isinstance(raw, str):

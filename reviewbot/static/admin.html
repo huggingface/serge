@@ -109,6 +109,14 @@
         </div>
       </div>
 
+      <div>
+        <label for="task_write_enabled" style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+          <input type="checkbox" id="task_write_enabled" name="task_write_enabled" style="width:auto;">
+          Enable write-capable tasks (<code>/tasks</code> flow)
+        </label>
+        <div class="hint">Off by default. When on, serge may open PRs / push commits to this repo from GitHub Actions (requires the App to hold Contents:write + Pull Requests:write).</div>
+      </div>
+
       <div class="actions">
         <button class="primary" type="submit" id="submit-btn">Save</button>
         <button class="secondary" type="button" id="cancel-btn" style="display:none;">Cancel</button>

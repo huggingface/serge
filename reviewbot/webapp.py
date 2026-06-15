@@ -45,6 +45,7 @@ from .github_auth import (
 )
 from .github_client import GitHubClient
 from .llm_client import LLMResponseError
+from .oidc import OIDCError, verify_token
 from .reviewer import (
     DraftComment,
     ReviewDraft,
@@ -56,6 +57,14 @@ from .reviewer import (
     run_followup,
 )
 from .store import JobStore, decode_draft
+from .tasks import (
+    TaskError,
+    TaskRequest,
+    build_task_request,
+    prepare_task,
+    publish_task,
+    resolve_existing_pr,
+)
 from .triggers import build_review_request
 
 logging.basicConfig(
@@ -269,6 +278,11 @@ class Job:
     # for reviews kicked off by a GitHub comment. Webhook jobs have no
     # owning UI user, so any authenticated viewer may follow them.
     source: str = "web"
+    # "review" (read-only PR reviewer) or "task" (write-capable /tasks flow).
+    kind: str = "review"
+    # For task jobs: the inbound spec and the published outcome.
+    task_spec: Optional[dict[str, Any]] = None
+    task_result: Optional[dict[str, Any]] = None
     status: str = "running"  # running | done | error | discarded | published
     draft: Optional[ReviewDraft] = None
     error: Optional[str] = None
@@ -315,6 +329,15 @@ _WEBHOOK_MAX_WORKERS = int(os.environ.get("WEBHOOK_MAX_WORKERS", "2"))
 _WEBHOOK_REVIEW_POOL = ThreadPoolExecutor(
     max_workers=_WEBHOOK_MAX_WORKERS,
     thread_name_prefix="webhook-review-worker",
+)
+
+# Dedicated pool for the write-capable /tasks flow, kept separate from the
+# webhook + UI review pools so a burst of task requests can't starve
+# reviews (and vice-versa).
+_TASK_MAX_WORKERS = int(os.environ.get("TASK_MAX_WORKERS", "2"))
+_TASK_POOL = ThreadPoolExecutor(
+    max_workers=_TASK_MAX_WORKERS,
+    thread_name_prefix="task-worker",
 )
 
 
@@ -366,6 +389,53 @@ def _resolve_webhook_worker_cfg(
         worker_cfg = dataclasses.replace(cfg, llm_api_key=llm_api_key)
     if not llm_api_key:
         return None
+    return worker_cfg, provider, llm_api_base, llm_model or None
+
+
+def _bearer_token(request: Request) -> str:
+    """Extract the bearer token from the Authorization header, or raise 401."""
+    header = request.headers.get("authorization") or ""
+    if not header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="missing_bearer_token")
+    return header[7:].strip()
+
+
+def _resolve_task_worker_cfg(
+    owner: str, repo: str
+) -> tuple[Config, str, str, Optional[str]]:
+    """Resolve the LLM credentials a task should run with, requiring a
+    provider_config that has opted this repo into the write-capable flow
+    (``task_write_enabled``). Raises HTTPException(403) when no such config
+    exists. Returns ``(worker_cfg, provider, api_base, model)``."""
+    matched = _store.find_provider_config_for_repo(owner=owner, repo=repo)
+    if matched is None or not matched.get("task_write_enabled"):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"The /tasks flow is not enabled for '{owner}/{repo}'. An admin "
+                "must add a provider config for this repo with write access "
+                "enabled at /admin."
+            ),
+        )
+    provider = matched["provider"]
+    llm_api_key = (matched.get("api_key") or "").strip()
+    if not llm_api_key:
+        raise HTTPException(
+            status_code=403, detail="provider config for this repo has no API key"
+        )
+    llm_api_base = _api_base_for_provider(provider, custom_base=matched.get("api_base"))
+    llm_model = (
+        (matched.get("default_model") or "").strip()
+        or _LLM_PROVIDER_DEFAULT_MODELS.get(provider, "")
+        or cfg.llm_model
+    )
+    worker_cfg = dataclasses.replace(
+        cfg,
+        llm_api_key=llm_api_key,
+        llm_api_base=llm_api_base,
+        llm_model=llm_model,
+        llm_bill_to=_llm_bill_to_for_provider(provider),
+    )
     return worker_cfg, provider, llm_api_base, llm_model or None
 
 
@@ -511,6 +581,7 @@ def _parse_provider_config_payload(
             status_code=400,
             detail="allowed_users_or_orgs_required",
         )
+    task_write_enabled = _coerce_bool(payload.get("task_write_enabled"))
     return {
         "provider": provider,
         "api_key": api_key,
@@ -519,7 +590,18 @@ def _parse_provider_config_payload(
         "default_model": default_model,
         "allowed_users": allowed_users,
         "allowed_orgs": allowed_orgs,
+        "task_write_enabled": task_write_enabled,
     }
+
+
+def _coerce_bool(raw: Any) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return False
 
 
 def _parse_login_list(raw: Any, field_name: str) -> list[str]:
@@ -580,6 +662,7 @@ def _provider_config_summary(row: dict[str, Any]) -> dict[str, Any]:
         "repo_pattern": row["repo_pattern"],
         "allowed_users": row.get("allowed_users") or [],
         "allowed_orgs": row.get("allowed_orgs") or [],
+        "task_write_enabled": bool(row.get("task_write_enabled")),
         "created_by": row.get("created_by") or "",
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
@@ -864,6 +947,141 @@ def _run_review_worker(job: Job) -> None:
         llm_bill_to=_llm_bill_to_for_provider(job.llm_provider),
     )
     _execute_review(job, worker_cfg, gh, token, req, auto_publish=False)
+
+
+def _format_pr_files_diff(files: list[dict[str, Any]], *, limit: int = 30000) -> str:
+    """Concatenate a PR's per-file patches into a single blob used as the
+    "prior attempt" context on an existing_pr follow-up. Best-effort and
+    purely informational — not meant to be re-applied."""
+    parts: list[str] = []
+    total = 0
+    for f in files:
+        patch = f.get("patch") or ""
+        chunk = f"--- {f.get('filename')} ---\n{patch}\n"
+        parts.append(chunk)
+        total += len(chunk)
+        if total >= limit:
+            parts.append("[... prior attempt truncated ...]")
+            break
+    return "\n".join(parts)
+
+
+def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
+    """Run a write-capable task on the dedicated task pool: check out the
+    base (or serge fix branch), run the agentic loop to produce a patch,
+    then commit it and open/update a PR. Streams events into the job so the
+    /tasks page can follow live."""
+    checkout: Optional[Checkout] = None
+
+    def emit(kind: str, text: str) -> None:
+        _push_event(job, kind, text)
+
+    try:
+        assert cfg.github_app_id and cfg.github_private_key
+        installation_id = installation_id_for_repo(
+            cfg.github_app_id, cfg.github_private_key, req.owner, req.repo
+        )
+        token = installation_token(
+            cfg.github_app_id, cfg.github_private_key, installation_id
+        )
+        gh = GitHubClient(token)
+
+        existing_diff: Optional[str] = None
+        if req.mode == "existing_pr":
+            emit("step", "resolve")
+            head_branch = resolve_existing_pr(gh, req, worker_cfg)
+            emit(
+                "log",
+                f"Targeting serge branch {head_branch} (PR #{req.pr_number}), "
+                f"base {req.base_ref}",
+            )
+            ref_to_checkout = head_branch
+            try:
+                pr_files = gh.get_pr_files(req.owner, req.repo, req.pr_number or 0)
+                existing_diff = _format_pr_files_diff(pr_files)
+            except Exception:  # noqa: BLE001
+                log.debug("could not fetch prior-attempt diff", exc_info=True)
+        else:
+            ref_to_checkout = req.base_ref
+
+        emit("step", "clone")
+        emit("log", f"Checking out {req.owner}/{req.repo}@{ref_to_checkout}…")
+        t0 = time.monotonic()
+        checkout = _clone_cache.acquire_ref(
+            token,
+            req.owner,
+            req.repo,
+            ref_to_checkout,
+            job_id=job.id,
+            depth=cfg.web_clone_depth,
+        )
+        if checkout is None:
+            raise TaskError(
+                f"could not check out {req.owner}/{req.repo}@{ref_to_checkout}",
+                status_code=502,
+            )
+        emit("log", f"Checkout ready in {time.monotonic() - t0:.1f}s")
+        worker_cfg = dataclasses.replace(worker_cfg, repo_checkout_path=checkout.path)
+
+        plan = prepare_task(
+            worker_cfg, req, existing_diff=existing_diff, chunk_callback=emit
+        )
+        result = publish_task(
+            worker_cfg,
+            gh,
+            req,
+            plan,
+            checkout=checkout,
+            clone_cache=_clone_cache,
+            job_id=job.id,
+            emit=emit,
+        )
+        job.task_result = result.to_json()
+        _store.save_task_result(job.id, _json.dumps(job.task_result))
+        job.status = "done"
+        emit("log", result.message)
+        emit("step", "done")
+        emit("done", "")
+    except TaskError as exc:
+        log.warning("task %s rejected: %s", job.id, exc)
+        job.status = "error"
+        job.error = str(exc)
+        emit("step", "error")
+        emit("error", job.error)
+        emit("done", "")
+    except _UnparseableLLMOutput as exc:
+        job.status = "error"
+        job.raw_llm_output = exc.content
+        job.error = exc.user_message()
+        emit("step", "error")
+        emit("error", job.error)
+        emit("done", "")
+    except AppNotInstalledError as exc:
+        log.warning(
+            "App not installed for %s/%s (task %s)", exc.owner, exc.repo, job.id
+        )
+        job.status = "error"
+        job.error = str(exc)
+        emit("step", "error")
+        emit("error", job.error)
+        emit("done", "")
+    except LLMResponseError as exc:
+        log.warning("LLM endpoint returned %d for task %s", exc.status_code, job.id)
+        job.status = "error"
+        job.error = _format_llm_error(exc)
+        emit("step", "error")
+        emit("error", job.error)
+        emit("done", "")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("task worker crashed for job %s", job.id)
+        job.status = "error"
+        job.error = f"{type(exc).__name__}: task crashed (see server log)"
+        emit("step", "error")
+        emit("error", job.error)
+        emit("done", "")
+    finally:
+        _clone_cache.release(checkout)
+        _persist_terminal(job)
 
 
 def _bool_env_safe(name: str, default: bool) -> bool:
@@ -1501,6 +1719,7 @@ async def admin_create_provider(request: Request) -> JSONResponse:
         repo_pattern=fields["repo_pattern"],
         allowed_users=fields["allowed_users"],
         allowed_orgs=fields["allowed_orgs"],
+        task_write_enabled=fields["task_write_enabled"],
         created_by=user,
     )
     log.info(
@@ -1535,6 +1754,7 @@ async def admin_update_provider(request: Request, config_id: str) -> JSONRespons
         allowed_users=fields["allowed_users"],
         allowed_orgs=fields["allowed_orgs"],
         new_api_key=fields["api_key"],
+        task_write_enabled=fields["task_write_enabled"],
     )
     if not updated:
         raise HTTPException(status_code=404, detail="config_not_found")
@@ -1560,6 +1780,122 @@ def admin_delete_provider(request: Request, config_id: str) -> JSONResponse:
         raise HTTPException(status_code=404, detail="config_not_found")
     log.info("user %s deleted provider config %s", user, config_id)
     return JSONResponse({"status": "deleted"})
+
+
+@app.post("/tasks")
+async def submit_task(request: Request) -> JSONResponse:
+    """Machine-facing, write-capable endpoint: a GitHub Actions job posts an
+    instruction + context and serge opens a PR (or pushes onto a serge fix
+    branch) with the fix. Authenticated via GitHub Actions OIDC and
+    authorized on the token's ``repository`` claim — serge only ever acts on
+    the repo named in the token."""
+    if not cfg.task_api_enabled:
+        raise HTTPException(status_code=404, detail="tasks_api_disabled")
+
+    token = _bearer_token(request)
+    try:
+        claims = verify_token(
+            token,
+            issuer=cfg.task_oidc_issuer,
+            audience=cfg.task_oidc_audience,
+        )
+    except OIDCError as exc:
+        raise HTTPException(status_code=401, detail=f"oidc_verification_failed: {exc}")
+
+    owner, repo = claims.repository.split("/", 1)
+    if not _GH_NAME_RE.match(owner) or not _GH_NAME_RE.match(repo):
+        raise HTTPException(status_code=400, detail="bad_repository_claim")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_json_body")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid_json_body")
+
+    # If the caller names a repo, it must match the OIDC repository claim —
+    # the claim is authoritative, this just catches misconfiguration.
+    body_repo = (payload.get("repo") or "").strip()
+    if body_repo and body_repo.lower() != claims.repository.lower():
+        raise HTTPException(status_code=403, detail="repo_claim_mismatch")
+
+    try:
+        req = build_task_request(payload, owner=owner, repo=repo)
+    except TaskError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+
+    worker_cfg, provider, llm_api_base, llm_model = _resolve_task_worker_cfg(
+        owner, repo
+    )
+
+    spec_summary = {
+        "mode": req.mode,
+        "base_ref": req.base_ref,
+        "pr_number": req.pr_number,
+        "branch_prefix": req.branch_prefix,
+        "instruction": req.instruction[:1000],
+        "context_chars": len(req.context),
+        "actor": claims.actor,
+        "workflow_ref": claims.workflow_ref,
+    }
+
+    job = Job(
+        id=uuid.uuid4().hex,
+        user=claims.actor or "github-actions",
+        target_owner=owner,
+        target_repo=repo,
+        target_number=req.pr_number or 0,
+        trigger_comment=req.instruction[:_MAX_TRIGGER_COMMENT_CHARS],
+        llm_provider=provider,
+        llm_api_base=llm_api_base,
+        llm_model=llm_model,
+        created_at=time.time(),
+        llm_api_key=worker_cfg.llm_api_key,
+        source="task",
+        kind="task",
+        task_spec=spec_summary,
+    )
+    job.loop = asyncio.get_running_loop()
+    with _jobs_lock:
+        _jobs[job.id] = job
+    _store.insert_job(
+        id=job.id,
+        user=job.user,
+        target_owner=job.target_owner,
+        target_repo=job.target_repo,
+        target_number=job.target_number,
+        trigger_comment=job.trigger_comment,
+        llm_provider=job.llm_provider,
+        llm_api_base=job.llm_api_base,
+        llm_model=job.llm_model,
+        created_at=job.created_at,
+        status=job.status,
+        source="task",
+        kind="task",
+        task_spec_json=_json.dumps(spec_summary),
+    )
+    _prune_store()
+    _TASK_POOL.submit(_run_task_worker, job, worker_cfg, req)
+    log.info(
+        "queued task %s for %s/%s (mode=%s pr=%s) by actor=%s using %s model=%s",
+        job.id,
+        owner,
+        repo,
+        req.mode,
+        req.pr_number,
+        claims.actor,
+        provider,
+        llm_model or "<auto>",
+    )
+    return JSONResponse(
+        status_code=202,
+        content={
+            "id": job.id,
+            "repo": claims.repository,
+            "mode": req.mode,
+            "url": f"/tasks/{owner}/{repo}/{job.id}",
+        },
+    )
 
 
 @app.post("/reviews")
@@ -1771,12 +2107,25 @@ def _load_job_from_store(job_id: str) -> Optional[Job]:
         created_at=row["created_at"],
         status=row["status"],
         source=row.get("source") or "web",
+        kind=row.get("kind") or "review",
         error=row["error"],
         raw_llm_output=row["raw_llm_output"],
         draft=decode_draft(row["draft_json"]) if row.get("draft_json") else None,
     )
+    job.task_spec = _safe_json_obj(row.get("task_spec_json"))
+    job.task_result = _safe_json_obj(row.get("result_json"))
     job.history = list(row.get("history") or [])
     return job
+
+
+def _safe_json_obj(raw: Optional[str]) -> Optional[dict[str, Any]]:
+    if not raw:
+        return None
+    try:
+        obj = _json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 @app.get("/reviews/{owner}/{repo}/{number}/{job_id}")
@@ -1983,6 +2332,88 @@ def discard(
         _jobs.pop(job.id, None)
     _store.delete(job.id)
     return JSONResponse({"status": "discarded"})
+
+
+# ---------------------------------------------------------------------------
+# Tasks views: any authenticated user may follow a task (they are kicked
+# off by a machine via OIDC, not by a UI user, so there is no per-user
+# ownership to enforce — same posture as webhook reviews).
+# ---------------------------------------------------------------------------
+def _get_task_job(request: Request, owner: str, repo: str, job_id: str) -> Job:
+    _require_user(request)
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        job = _load_job_from_store(job_id)
+    if job is None or job.kind != "task":
+        raise HTTPException(status_code=404, detail="task_not_found")
+    if job.target_owner != owner or job.target_repo != repo:
+        raise HTTPException(status_code=404, detail="task_target_mismatch")
+    return job
+
+
+@app.get("/tasks/{owner}/{repo}/{job_id}")
+def task_page(request: Request, owner: str, repo: str, job_id: str) -> Response:
+    _require_user(request)
+    return _serve_static("task.html")
+
+
+@app.get("/tasks/{owner}/{repo}/{job_id}/info")
+def task_info(request: Request, owner: str, repo: str, job_id: str) -> JSONResponse:
+    job = _get_task_job(request, owner, repo, job_id)
+    return JSONResponse(
+        {
+            "id": job.id,
+            "status": job.status,
+            "target": f"{job.target_owner}/{job.target_repo}",
+            "kind": job.kind,
+            "instruction": job.trigger_comment,
+            "spec": job.task_spec,
+            "result": job.task_result,
+            "llm_provider": job.llm_provider,
+            "llm_base_url": job.llm_api_base,
+            "llm_model": job.llm_model or "",
+            "error": job.error,
+        }
+    )
+
+
+@app.get("/tasks/{owner}/{repo}/{job_id}/stream")
+async def task_stream(
+    request: Request, owner: str, repo: str, job_id: str
+) -> StreamingResponse:
+    job = _get_task_job(request, owner, repo, job_id)
+
+    async def generator():
+        finished = job.status in ("done", "error", "discarded", "published")
+        with job.history_lock:
+            if finished:
+                replay = [e for e in job.history if e["kind"] not in _NOISY_KINDS]
+            else:
+                replay = list(job.history)
+        for event in replay:
+            yield _sse_format(event)
+        if finished:
+            if not any(e.get("kind") == "done" for e in replay):
+                yield _sse_format({"kind": "done", "text": ""})
+            return
+        while True:
+            if await request.is_disconnected():
+                return
+            try:
+                event = await asyncio.wait_for(job.queue.get(), timeout=15.0)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            yield _sse_format(event)
+            if event.get("kind") == "done":
+                return
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # Suppress an unused-import warning for DraftComment (re-exported via

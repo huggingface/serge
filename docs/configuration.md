@@ -90,6 +90,20 @@ package is missing or a compression call fails, so a review never breaks on it.
 | `WEB_CLONE_DEPTH` | `50` | Shallow fetch depth. |
 | `WEB_GITHUB_APP_URL` | project default | Install/configure URL shown in the web help page. Set this to your GitHub App URL for public deployments. |
 
+## Tasks (write-capable)
+
+The [tasks flow](tasks-flow.md) is off by default. When enabled, it also needs
+the GitHub App to hold Contents: write + Pull Requests: write and a per-repo
+opt-in flag on the provider config.
+
+| Env var | Default | Description |
+| ------- | ------- | ----------- |
+| `TASK_API_ENABLED` | `false` | Master switch for `POST /tasks`. |
+| `TASK_OIDC_ISSUER` | `https://token.actions.githubusercontent.com` | OIDC issuer (override for GHES / self-hosted). |
+| `TASK_OIDC_AUDIENCE` | `serge` | `aud` value the OIDC token must carry. |
+| `TASK_MAX_FOLLOWUPS` | `5` | Max serge-authored commits per fix branch. `0` disables the cap. |
+| `TASK_MAX_WORKERS` | `2` | Concurrent task workers (separate pool from reviews). |
+
 ## Server
 
 | Env var | Default | Description |

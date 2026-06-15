@@ -74,9 +74,7 @@ class WrapCommandTests(unittest.TestCase):
             )
 
     def test_wraps_when_bwrap_available(self):
-        with mock.patch.object(
-            sandbox.shutil, "which", return_value="/usr/bin/bwrap"
-        ):
+        with mock.patch.object(sandbox.shutil, "which", return_value="/usr/bin/bwrap"):
             argv = wrap_command(
                 ["echo", "hi"], workdir="/wt", write_root="/wt", mode=REQUIRE
             )
