@@ -9,7 +9,7 @@ replicas: 1
 # Public hostname; external-dns creates the Route53 record from the
 # ingress, and the AWS LB controller discovers the matching ACM cert by
 # this host.
-domain: serge.huggingface.co
+domain: serge.hf.co
 
 # uvicorn listens here (reviewbot-web defaults to 8080).
 containerPort: 8080
