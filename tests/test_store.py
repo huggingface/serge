@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from reviewbot.reviewer import ReviewDraft
-from reviewbot.store import JobStore, _is_postgres_url
+from reviewbot.store import JobStore
 
 
 class JobStoreTests(unittest.TestCase):
@@ -146,81 +146,6 @@ class JobStoreTests(unittest.TestCase):
             self.assertIn("llm_provider", columns)
             self.assertIn("llm_api_base", columns)
             self.assertIn("llm_model", columns)
-
-
-class BackendDetectionTests(unittest.TestCase):
-    def test_recognizes_postgres_urls(self) -> None:
-        self.assertTrue(_is_postgres_url("postgres://u:p@h/db"))
-        self.assertTrue(_is_postgres_url("postgresql://u:p@h:5432/db?sslmode=require"))
-
-    def test_treats_paths_as_sqlite(self) -> None:
-        self.assertFalse(_is_postgres_url("jobs.db"))
-        self.assertFalse(_is_postgres_url("/var/lib/reviewbot/jobs.db"))
-
-
-@unittest.skipUnless(
-    os.environ.get("TEST_DATABASE_URL"),
-    "set TEST_DATABASE_URL to a Postgres DSN to run the Postgres backend tests",
-)
-class JobStorePostgresTests(unittest.TestCase):
-    """Exercises the Postgres backend against a real server. Skipped unless
-    TEST_DATABASE_URL is set (e.g. a local docker postgres). The same
-    public API as the SQLite path, so these mirror the SQLite tests and
-    guard the ?->%s rewrite and the quoted "user" column."""
-
-    def setUp(self) -> None:
-        self.store = JobStore(os.environ["TEST_DATABASE_URL"])
-        # Start each test from a clean slate (the schema is created once,
-        # CREATE TABLE IF NOT EXISTS, so we truncate rather than drop).
-        with self.store._lock:
-            self.store._conn.execute("TRUNCATE jobs, provider_configs")
-            self.store._conn.commit()
-
-    def test_insert_load_and_journal(self) -> None:
-        self.store.insert_job(
-            id="pg1",
-            user="octocat",
-            target_owner="owner",
-            target_repo="repo",
-            target_number=123,
-            trigger_comment="@askserge please review",
-            llm_provider="openai",
-            llm_api_base="https://api.openai.com/v1",
-            llm_model="gpt-4.1",
-            created_at=1.0,
-            status="running",
-        )
-
-        row = self.store.load("pg1")
-        assert row is not None
-        self.assertEqual(row["user"], "octocat")
-        self.assertEqual(row["llm_model"], "gpt-4.1")
-
-        listed = self.store.list_for_user("octocat")
-        self.assertEqual(len(listed), 1)
-        self.assertEqual(listed[0]["id"], "pg1")
-
-        draft = ReviewDraft(
-            owner="owner",
-            repo="repo",
-            number=123,
-            head_sha="abc",
-            summary="s",
-            event="COMMENT",
-            prompt_tokens=42,
-            completion_tokens=7,
-        )
-        self.store.save_terminal(
-            "pg1",
-            status="done",
-            error=None,
-            raw_llm_output=None,
-            draft=draft,
-            history=[],
-        )
-        entries = self.store.list_all_calls()
-        self.assertEqual(entries[0]["prompt_tokens"], 42)
-        self.assertEqual(entries[0]["completion_tokens"], 7)
 
 
 if __name__ == "__main__":

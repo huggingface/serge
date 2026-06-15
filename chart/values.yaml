@@ -1,63 +1,86 @@
 image:
   repository: registry.internal.huggingface.tech/serge
   name: serge
-  tag: 0.0.0-latest
+  tag: latest
   pullPolicy: IfNotPresent
 
+# SQLite is a single-writer store and the embedded DB lives on one RWO
+# volume, so keep this at 1 (the Deployment also uses the Recreate strategy).
 replicas: 1
-
-# Public hostname; external-dns creates the Route53 record from the
-# ingress, and the AWS LB controller discovers the matching ACM cert by
-# this host.
-domain: serge.hf.co
 
 # uvicorn listens here (reviewbot-web defaults to 8080).
 containerPort: 8080
 
+# Persistent volume for the embedded SQLite job store (review/task metadata,
+# drafts, provider configs). The DB file lives here so history survives pod
+# restarts. WEB_STORE_PATH is set to <mountPath>/jobs.db by the deployment.
+persistence:
+  enabled: true
+  storageClass: ""        # "" = cluster default StorageClass
+  accessMode: ReadWriteOnce
+  size: 5Gi
+  mountPath: /var/lib/reviewbot
+
 service:
-  type: NodePort
+  type: ClusterIP
+  port: 80
   annotations: {}
 
 serviceAccount:
-  enabled: false
   create: false
   name: ""
-  automountServiceAccountToken: true
   annotations: {}
 
+# Disabled by default — enable and set host/className/annotations for your
+# cluster's ingress controller (nginx, ALB, ...).
 ingress:
-  enabled: true
-  path: "/"
+  enabled: false
   className: ""
+  host: ""
+  path: /
+  pathType: Prefix
   annotations: {}
+  tls: []
+
+# Pod/container hardening. fsGroup lets the non-root app user (uid 1000 in
+# the image) write to the persistent volume. If your cluster forbids the
+# unprivileged user namespaces bubblewrap needs, either relax this or set
+# HELPER_SANDBOX=auto/off in envVars.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
 
 resources:
   requests:
     cpu: 500m
     memory: 512Mi
   limits:
-    cpu: 1
+    cpu: "1"
     memory: 1Gi
 
 nodeSelector: {}
 tolerations: []
+affinity: {}
 
-# Non-secret env, rendered into a ConfigMap and injected via envFrom.
-envVars: {}
+# Non-secret runtime config, rendered into a ConfigMap and injected via
+# envFrom. WEB_STORE_PATH is injected separately from persistence.mountPath.
+envVars:
+  PORT: "8080"
+  LOG_LEVEL: "INFO"
 
-# Secret env is materialized by the Infisical operator into <name>-secs
-# and injected via envFrom when infisical.enabled. The Postgres
-# DATABASE_URL, GitHub App key, OAuth client secret, session secret and
-# LLM key all live there — see the Infisical /serge folder.
-infisical:
-  enabled: false
-  env: ""
-  project: ""
-  url: ""
-  resyncInterval: 60
-  operatorSecretName: "serge-operator-secrets"
-  operatorSecretNamespace: "hub-utils"
+# Name of a pre-created Secret holding the sensitive env (GITHUB_APP_ID,
+# GITHUB_PRIVATE_KEY, GITHUB_WEBHOOK_SECRET, GITHUB_OAUTH_CLIENT_ID,
+# GITHUB_OAUTH_CLIENT_SECRET, WEB_SESSION_SECRET, LLM_API_KEY, ...). Injected
+# via envFrom. Leave empty to manage everything through envVars/extraEnv.
+existingSecret: ""
 
-# Escape hatches for extra env without going through Infisical.
 extraEnv: []
 extraEnvFrom: []

@@ -1,4 +1,4 @@
-{{- if $.Values.ingress.enabled }}
+{{- if .Values.ingress.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -7,11 +7,14 @@ metadata:
   name: {{ include "name" . }}
   namespace: {{ .Release.Namespace }}
 spec:
-  {{- if $.Values.ingress.className }}
+  {{- if .Values.ingress.className }}
   ingressClassName: {{ .Values.ingress.className }}
   {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls: {{ toYaml . | nindent 4 }}
+  {{- end }}
   rules:
-    - host: {{ .Values.domain }}
+    - host: {{ required "ingress.host is required when ingress.enabled" .Values.ingress.host | quote }}
       http:
         paths:
           - backend:
@@ -19,6 +22,6 @@ spec:
                 name: {{ include "name" . }}
                 port:
                   name: http
-            path: {{ $.Values.ingress.path | default "/" }}
-            pathType: Prefix
+            path: {{ .Values.ingress.path | default "/" }}
+            pathType: {{ .Values.ingress.pathType | default "Prefix" }}
 {{- end }}

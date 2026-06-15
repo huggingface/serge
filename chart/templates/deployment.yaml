@@ -4,10 +4,6 @@ metadata:
   labels: {{ include "labels.standard" . | nindent 4 }}
   name: {{ include "name" . }}
   namespace: {{ .Release.Namespace }}
-  {{- if .Values.infisical.enabled }}
-  annotations:
-    secrets.infisical.com/auto-reload: "true"
-  {{- end }}
 spec:
   progressDeadlineSeconds: 600
   replicas: {{ .Values.replicas }}
@@ -15,8 +11,8 @@ spec:
   selector:
     matchLabels: {{ include "labels.standard" . | nindent 6 }}
   strategy:
-    # The job store is a single shared connection (workers=1); avoid two
-    # pods writing the same DB rows during a rollout.
+    # The embedded SQLite store is a single shared writer; never run two
+    # pods against the same RWO volume during a rollout.
     type: Recreate
   template:
     metadata:
@@ -24,13 +20,19 @@ spec:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
     spec:
-      {{- if .Values.serviceAccount.enabled }}
+      {{- if .Values.serviceAccount.create }}
       serviceAccountName: "{{ .Values.serviceAccount.name | default (include "name" .) }}"
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext: {{ toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - name: {{ include "app.name" . }}
           image: "{{ .Values.image.repository }}/{{ .Values.image.name }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext: {{ toYaml . | nindent 12 }}
+          {{- end }}
           readinessProbe:
             httpGet:
               path: /healthz
@@ -48,19 +50,40 @@ spec:
               name: http
               protocol: TCP
           resources: {{ toYaml .Values.resources | nindent 12 }}
-          {{- with $.Values.extraEnv }}
           env:
+            # Persist the SQLite job store on the mounted volume.
+            - name: WEB_STORE_PATH
+              value: "{{ .Values.persistence.mountPath }}/jobs.db"
+            {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ include "name" . }}
-          {{- if $.Values.infisical.enabled }}
+            {{- if .Values.existingSecret }}
             - secretRef:
-                name: {{ include "name" $ }}-secs
-          {{- end }}
-          {{- with $.Values.extraEnvFrom }}
+                name: {{ .Values.existingSecret }}
+            {{- end }}
+            {{- with .Values.extraEnvFrom }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "name" . }}-data
+          {{- else }}
+          emptyDir: {}
           {{- end }}
-      nodeSelector: {{ toYaml .Values.nodeSelector | nindent 8 }}
-      tolerations: {{ toYaml .Values.tolerations | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{ toYaml . | nindent 8 }}
+      {{- end }}
