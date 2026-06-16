@@ -147,5 +147,8 @@ review pages use.
 | `TASK_API_ENABLED` | `false` | Master switch for `POST /tasks`. |
 | `TASK_OIDC_ISSUER` | `https://token.actions.githubusercontent.com` | OIDC issuer (override for GHES). |
 | `TASK_OIDC_AUDIENCE` | `serge` | `aud` value serge requires on the token. |
+| `TASK_LLM_MAX_TOKENS` | unset | Task-only completion-token cap. Unset means tasks use `LLM_MAX_TOKENS`; normal reviews are unchanged. |
+| `TASK_LLM_MAX_INPUT_TOKENS` | unset | Task-only cumulative input-token cap. Unset means tasks use `LLM_MAX_INPUT_TOKENS`; normal reviews are unchanged. |
+| `TASK_TOOL_MAX_ITERATIONS` | unset | Task-only tool-loop cap. Unset means tasks use `TOOL_MAX_ITERATIONS`; normal reviews are unchanged. |
 | `TASK_MAX_FOLLOWUPS` | `5` | Max serge-authored commits per fix branch. Set `0` to disable the cap. |
 | `TASK_MAX_WORKERS` | `2` | Concurrent task workers (separate pool from reviews). |

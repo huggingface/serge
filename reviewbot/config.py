@@ -80,6 +80,9 @@ class Config:
     # tool use entirely.
     repo_checkout_path: str
     tool_max_iterations: int
+    # When true, tool_max_iterations caps total tool calls instead of only
+    # blind tool turns. Used by /tasks to preserve final-answer budget.
+    tool_max_iterations_strict: bool = False
     # Hard cap on cumulative *input* tokens consumed by LLM calls during a
     # single review (across all chunks and tool turns). When exceeded we
     # stop the agentic loop, ask the model for a final review with tools
@@ -150,6 +153,13 @@ class Config:
     task_api_enabled: bool = False
     task_oidc_issuer: str = "https://token.actions.githubusercontent.com"
     task_oidc_audience: str = "serge"
+    # Optional task-only completion-token cap. When unset, tasks use the
+    # normal llm_max_tokens value.
+    task_llm_max_tokens: Optional[int] = None
+    # Optional task-only input-token/tool caps. When unset, tasks use the
+    # normal review values.
+    task_llm_max_input_tokens: Optional[int] = None
+    task_tool_max_iterations: Optional[int] = None
     # Cap on serge-authored commits per fix branch (follow-up loop guard).
     task_max_followups: int = 5
 
@@ -301,5 +311,10 @@ class Config:
             or "https://token.actions.githubusercontent.com",
             task_oidc_audience=(os.environ.get("TASK_OIDC_AUDIENCE") or "").strip()
             or "serge",
+            task_llm_max_tokens=(_int_env("TASK_LLM_MAX_TOKENS", 0) or None),
+            task_llm_max_input_tokens=(
+                _int_env("TASK_LLM_MAX_INPUT_TOKENS", 0) or None
+            ),
+            task_tool_max_iterations=(_int_env("TASK_TOOL_MAX_ITERATIONS", 0) or None),
             task_max_followups=_int_env("TASK_MAX_FOLLOWUPS", 5),
         )

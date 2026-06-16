@@ -43,6 +43,19 @@ log = logging.getLogger(__name__)
 # mode is rejected for any head branch outside it, so the OIDC
 # ``repository`` claim cannot be leveraged to push to an arbitrary PR.
 SERGE_BRANCH_NAMESPACE = "serge/"
+
+_TASK_FORCE_FINAL_MESSAGE = (
+    "You have used the available investigation budget. Based only on the "
+    "evidence already gathered, produce the final task result now as a "
+    "single JSON object with EXACTLY these keys:\n"
+    '  - "title": a concise PR title\n'
+    '  - "body": a markdown PR description explaining the failure, root cause, '
+    "and patch; if no safe fix is possible, explain why\n"
+    '  - "patch": a valid unified diff, or an empty string if no safe fix is '
+    "possible\n"
+    "Reply with the JSON object only — no surrounding prose, no code fences, "
+    "no extra commentary, and do not request more tools."
+)
 _BRANCH_PREFIX_RE = re.compile(r"^serge/[A-Za-z0-9._/-]+$")
 
 VALID_MODES = ("new_pr", "existing_pr")
@@ -260,6 +273,7 @@ def prepare_task(
         cfg=cfg,
         tool_env=tool_env,
         emit=_emit,
+        final_force_message=_TASK_FORCE_FINAL_MESSAGE,
     )
     metrics_line = _format_aggregated_metrics(metrics)
     _emit("log", f"LLM done: {metrics_line}")

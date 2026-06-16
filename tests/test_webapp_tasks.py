@@ -39,10 +39,14 @@ class WebappTasksTests(unittest.TestCase):
             "GITHUB_PRIVATE_KEY": "dummy-private-key",
             "GITHUB_WEBHOOK_SECRET": "webhook-secret",
             "LLM_API_KEY": "llm-token",
+            "LLM_MAX_TOKENS": "4096",
             "WEB_STORE_PATH": os.path.join(self.tmpdir, "jobs.db"),
             "WEB_CLONE_CACHE_DIR": os.path.join(self.tmpdir, "clones"),
             "TASK_API_ENABLED": "1" if task_api_enabled else "0",
             "TASK_OIDC_AUDIENCE": "serge",
+            "TASK_LLM_MAX_TOKENS": "16384",
+            "TASK_LLM_MAX_INPUT_TOKENS": "250000",
+            "TASK_TOOL_MAX_ITERATIONS": "8",
         }
         with patch.dict(os.environ, env, clear=True):
             return importlib.import_module("reviewbot.webapp")
@@ -128,6 +132,7 @@ class WebappTasksTests(unittest.TestCase):
 
         def fake_submit(fn, job, worker_cfg, req):
             submitted["job"] = job
+            submitted["worker_cfg"] = worker_cfg
             submitted["req"] = req
 
         with (
@@ -147,6 +152,11 @@ class WebappTasksTests(unittest.TestCase):
         self.assertTrue(body["url"].startswith("/tasks/acme/widgets/"))
         self.assertEqual(submitted["job"].kind, "task")
         self.assertEqual(submitted["req"].instruction, "fix the failing tests")
+        self.assertEqual(webapp.cfg.llm_max_tokens, 4096)
+        self.assertEqual(submitted["worker_cfg"].llm_max_tokens, 16384)
+        self.assertEqual(submitted["worker_cfg"].llm_max_input_tokens, 250000)
+        self.assertEqual(submitted["worker_cfg"].tool_max_iterations, 8)
+        self.assertTrue(submitted["worker_cfg"].tool_max_iterations_strict)
         # Persisted with task kind.
         row = webapp._store.load(body["id"])
         self.assertEqual(row["kind"], "task")

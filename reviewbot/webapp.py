@@ -440,6 +440,12 @@ def _resolve_task_worker_cfg(
         llm_api_base=llm_api_base,
         llm_model=llm_model,
         llm_bill_to=_llm_bill_to_for_provider(provider),
+        llm_max_tokens=cfg.task_llm_max_tokens or cfg.llm_max_tokens,
+        llm_max_input_tokens=(
+            cfg.task_llm_max_input_tokens or cfg.llm_max_input_tokens
+        ),
+        tool_max_iterations=cfg.task_tool_max_iterations or cfg.tool_max_iterations,
+        tool_max_iterations_strict=cfg.task_tool_max_iterations is not None,
     )
     return worker_cfg, provider, llm_api_base, llm_model or None
 

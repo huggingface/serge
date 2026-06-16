@@ -679,13 +679,13 @@ def _run_agentic_loop(
     # instruction plus _extract_json's forgiving parsing handle the
     # final answer just as well across every provider we target.
 
-    # ``tool_max_iterations <= 0`` means "no cap". When set, the cap
+    # ``tool_max_iterations <= 0`` means "no cap". By default, the cap
     # counts only *blind* tool turns: the model emitted tool calls
     # without any reasoning OR content. Productive turns — where the
     # model either thought (reasoning_chars > 0), said something
     # (content), or returned a final answer (no tool calls) — don't
-    # burn the budget. An absolute ceiling on raw iterations still
-    # bounds runaway tool-only chaining.
+    # burn the budget. /tasks can opt into a stricter mode where the cap
+    # counts total tool calls, preserving budget for the final patch JSON.
     iter_cap: Optional[int] = (
         cfg.tool_max_iterations if cfg.tool_max_iterations > 0 else None
     )
@@ -714,6 +714,17 @@ def _run_agentic_loop(
         if iter_cap is not None and blind_tool_turns >= iter_cap:
             break
         if (
+            iter_cap is not None
+            and getattr(cfg, "tool_max_iterations_strict", False)
+            and metrics.tool_calls >= iter_cap
+        ):
+            log.warning(
+                "Strict tool-call budget hit (%d >= %d); bailing out",
+                metrics.tool_calls,
+                iter_cap,
+            )
+            break
+        if (
             input_tokens_cap is not None
             and prior_prompt_tokens + metrics.prompt_tokens >= input_tokens_cap
         ):
@@ -731,7 +742,10 @@ def _run_agentic_loop(
                 )
             break
         if iter_cap is not None:
-            label = f"{blind_tool_turns}/{iter_cap}"
+            if getattr(cfg, "tool_max_iterations_strict", False):
+                label = f"{metrics.tool_calls}/{iter_cap}"
+            else:
+                label = f"{blind_tool_turns}/{iter_cap}"
         else:
             label = f"{iteration}"
         log.info(
@@ -825,9 +839,10 @@ def _run_agentic_loop(
     # used up its content-turn allowance, or when the absolute ceiling
     # tripped (runaway tool calling).
     log.warning(
-        "Agent budget exhausted (blind_tool_turns=%d, raw_iter=%d, cap=%d); "
+        "Agent budget exhausted (blind_tool_turns=%d, tool_calls=%d, raw_iter=%d, cap=%d); "
         "asking model for a final review without tools",
         blind_tool_turns,
+        metrics.tool_calls,
         iteration,
         cfg.tool_max_iterations,
     )
