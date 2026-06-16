@@ -1,0 +1,72 @@
+# Values for the serge deployment on the open-source EKS cluster
+# (opensource-aws-use1-prod-54), namespace chosen at install time.
+# Deploy: helm install serge ./chart -n <ns> -f chart/env/prod.yaml
+#
+# Image is public on GHCR (ghcr.io/huggingface/serge) so no imagePullSecret
+# is needed. The ACM cert for serge.huggingface.tech already exists in this
+# account (infra 05-eks-utils) and is auto-discovered by the ALB controller
+# via the ingress host; external-dns creates the DNS record from the ingress.
+
+image:
+  # Bump to a newer sha-<commit> (pushed by CI on merge to main) or use latest.
+  tag: sha-33be7c5
+
+replicas: 1
+
+# Sensitive env: create this Secret in the target namespace beforehand
+# (GITHUB_APP_ID, GITHUB_PRIVATE_KEY, GITHUB_WEBHOOK_SECRET,
+# GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET, WEB_SESSION_SECRET,
+# LLM_API_KEY, ...).
+existingSecret: serge-secrets
+
+persistence:
+  enabled: true
+  size: 5Gi
+  # "" = cluster default StorageClass (EBS gp3 on this cluster).
+  storageClass: ""
+
+ingress:
+  enabled: true
+  host: serge.huggingface.tech
+  path: /
+  # Use the legacy ingress-class annotation (AWS LB controller), not
+  # ingressClassName, to match the other HF ALB ingresses.
+  className: ""
+  annotations:
+    kubernetes.io/ingress.class: "alb"
+    # Internal ALB: reachable from the internal network / VPN only, NOT the
+    # public internet. (Note: inbound GitHub App webhooks cannot reach an
+    # internal ALB — fine for the OAuth web flow, which redirects in the
+    # user's browser.)
+    alb.ingress.kubernetes.io/scheme: "internal"
+    alb.ingress.kubernetes.io/target-type: "ip"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/healthcheck-path: "/healthz"
+    alb.ingress.kubernetes.io/tags: "Env=prod,Project=serge"
+
+# Non-secret runtime config.
+envVars:
+  PORT: "8080"
+  LOG_LEVEL: "INFO"
+  LLM_API_BASE: "https://router.huggingface.co/v1"
+  LLM_MODEL: "moonshotai/Kimi-K2.6"
+  LLM_STREAM: "1"
+  MENTION_TRIGGER: "@askserge"
+  REVIEW_EVENT: "COMMENT"
+  # Refuse to run PR-author subprocesses unless bubblewrap is available.
+  # Requires the node to allow unprivileged user namespaces; if pods fail
+  # to run reviews, switch to "auto".
+  HELPER_SANDBOX: "require"
+  DEV_NO_AUTH: "0"
+  WEB_ALLOWED_ORG: "huggingface"
+  GITHUB_OAUTH_CALLBACK_URL: "https://serge.huggingface.tech/auth/callback"
+  WEB_GITHUB_APP_URL: "https://github.com/apps/sergereview"
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
