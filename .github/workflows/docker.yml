@@ -4,39 +4,38 @@ on:
   push:
     branches:
       - main
+  # Allow building/pushing on demand (e.g. before the first deploy).
+  workflow_dispatch:
 
-# Cancel current run if a newer run starts on the same ref.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-and-push-image:
-    runs-on:
-      group: cpu-high
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Inject slug/short variables
-        uses: rlespinasse/github-slug-action@v4
-      - name: Login to Registry
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: registry.internal.huggingface.tech
-          username: robot$serge
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Extract metadata (tags, labels) for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
-          flavor: |
-            latest=auto
-          images: registry.internal.huggingface.tech/serge/serge
+          images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-            type=raw,value=sha-${{ env.GITHUB_SHA_SHORT }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:

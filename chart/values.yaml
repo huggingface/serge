@@ -1,5 +1,5 @@
 image:
-  repository: registry.internal.huggingface.tech/serge
+  repository: ghcr.io/huggingface
   name: serge
   tag: latest
   pullPolicy: IfNotPresent
