@@ -855,13 +855,13 @@ def _run_agentic_loop(
             "content": final_force_message or _DEFAULT_FORCE_FINAL_MESSAGE,
         }
     )
+    final_extra = {"reasoning_effort": cfg.llm_reasoning_effort or "low"}
     chat = llm.complete(
         messages,
+        response_format={"type": "json_object"},
         max_tokens=cfg.llm_max_tokens,
         chunk_callback=chunk_cb,
-        extra={"reasoning_effort": cfg.llm_reasoning_effort}
-        if cfg.llm_reasoning_effort
-        else None,
+        extra=final_extra,
     )
     metrics.turns += 1
     metrics.latency_seconds += chat.latency_seconds

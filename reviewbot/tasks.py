@@ -48,15 +48,16 @@ SERGE_BRANCH_NAMESPACE = "serge/"
 
 _TASK_FORCE_FINAL_MESSAGE = (
     "You have used the available investigation budget. Based only on the "
-    "evidence already gathered, produce the final task result now as a "
-    "single JSON object with EXACTLY these keys:\n"
+    "evidence already gathered, produce the final task result immediately. "
+    "Do not continue investigating or explain your reasoning. Reply with a "
+    "single compact JSON object that starts with `{` and has EXACTLY these keys:\n"
     '  - "title": a concise PR title\n'
-    '  - "body": a markdown PR description explaining the failure, root cause, '
-    "and patch; if no safe fix is possible, explain why\n"
+    '  - "body": a markdown PR description in at most 12 lines explaining the '
+    "failure, root cause, and patch; if no safe fix is possible, explain why\n"
     '  - "patch": a valid unified diff, or an empty string if no safe fix is '
     "possible\n"
-    "Reply with the JSON object only — no surrounding prose, no code fences, "
-    "no extra commentary, and do not request more tools."
+    "Return JSON only: no surrounding prose, no code fences, no extra commentary, "
+    "and no tool requests."
 )
 _BRANCH_PREFIX_RE = re.compile(r"^serge/[A-Za-z0-9._/-]+$")
 _CANDIDATE_HEADING_RE = re.compile(
