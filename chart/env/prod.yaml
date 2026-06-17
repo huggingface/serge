@@ -29,11 +29,8 @@ ingress:
   enabled: true
   host: serge.huggingface.tech
   path: /
-  # Use the legacy ingress-class annotation (AWS LB controller), not
-  # ingressClassName, to match the other HF ALB ingresses.
-  className: ""
+  className: "alb"
   annotations:
-    kubernetes.io/ingress.class: "alb"
     # Internal ALB: reachable from the internal network / VPN only, NOT the
     # public internet. (Note: inbound GitHub App webhooks cannot reach an
     # internal ALB — fine for the OAuth web flow, which redirects in the
