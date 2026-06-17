@@ -1105,10 +1105,7 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
                     emit=emit,
                 )
             except TaskError as exc:
-                if (
-                    exc.status_code == 422
-                    and index < len(candidate_reqs)
-                ):
+                if exc.status_code == 422 and index < len(candidate_reqs):
                     emit(
                         "log",
                         f"Candidate {index}/{len(candidate_reqs)} did not produce "

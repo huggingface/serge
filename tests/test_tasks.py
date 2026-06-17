@@ -14,6 +14,7 @@ from reviewbot.tasks import (
     TaskError,
     TaskPlan,
     TaskRequest,
+    _selected_failure_context,
     build_task_request,
     publish_task,
     resolve_existing_pr,
@@ -250,6 +251,39 @@ class TaskCandidateRequestTests(unittest.TestCase):
         self.assertNotIn("second details", candidates[0].context)
         self.assertIn("shared report preamble", candidates[1].context)
         self.assertIn("second details", candidates[1].context)
+
+
+class TaskFailureContextTests(unittest.TestCase):
+    def test_selects_failure_context_matching_plan(self):
+        req = TaskRequest(
+            owner="a",
+            repo="b",
+            base_ref="main",
+            instruction="fix",
+            context=(
+                "## Serge candidate failure group 1/1: output mismatches\n"
+                "\n"
+                "- `tests/models/foo/test_modeling_foo.py::FooTest::test_a` [single-gpu] "
+                "(output_mismatch, seen 5/7)\n"
+                "  - AssertionError: ordinary mismatch\n"
+                "- `tests/models/gemma3/test_modeling_gemma3.py::Gemma3IntegrationTest::"
+                "test_dynamic_sliding_window_is_default` [single-gpu] "
+                "(output_mismatch, seen 5/7)\n"
+                "  - AssertionError: 'DynamicSlidingWindowLayer' unexpectedly found in "
+                "'DynamicCache(...)'\n"
+            ),
+        )
+        plan = TaskPlan(
+            title="Fix explicit cache_implementation hybrid handling",
+            body="Preserve cache_implementation when it is explicit.",
+            patch="DynamicSlidingWindowLayer",
+        )
+        context = _selected_failure_context(req, plan)
+        self.assertIn("Original CI failure", context)
+        self.assertIn("output mismatches", context)
+        self.assertIn("Gemma3IntegrationTest", context)
+        self.assertIn("DynamicSlidingWindowLayer", context)
+        self.assertNotIn("FooTest", context)
 
 
 class PublishTaskTests(unittest.TestCase):
