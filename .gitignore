@@ -16,3 +16,5 @@ dist/
 *.db
 .serena/
 .jekyll-cache/
+# Filled-in copy of chart/serge-secrets.example.yaml — never commit real secrets.
+chart/serge-secrets.yaml
