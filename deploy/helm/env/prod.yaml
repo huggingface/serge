@@ -50,6 +50,12 @@ envVars:
   LLM_MODEL: "moonshotai/Kimi-K2.6"
   LLM_STREAM: "1"
   LLM_BILL_TO: "huggingface"
+  # Kimi can spend a substantial part of the completion budget on reasoning.
+  # Keep enough room for long tool-heavy reviews and the final JSON review.
+  LLM_MAX_TOKENS: "49152"
+  TOOL_MAX_ITERATIONS: "30"
+  TASK_LLM_MAX_TOKENS: "49152"
+  TASK_TOOL_MAX_ITERATIONS: "30"
   MENTION_TRIGGER: "@askserge"
   REVIEW_EVENT: "COMMENT"
   TASK_API_ENABLED: "1"

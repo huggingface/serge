@@ -14,6 +14,7 @@ deploy it into its own cluster without changing application code.
   Copy it to `helm/serge-secrets.yaml`, fill it locally, and never commit it.
 - `scripts/deploy.sh` checks the current Kubernetes context, creates the namespace
   when needed, optionally applies a local Secret file, and runs Helm.
+- `scripts/logs.sh` finds the current running Serge pod and prints recent logs.
 
 ## Chart Behavior
 
@@ -50,6 +51,16 @@ deploy/scripts/deploy.sh \
   --context infra:opensource-aws-use1-prod-54 \
   -n serge \
   -f deploy/helm/env/prod.yaml
+```
+
+Fetch recent logs:
+
+```bash
+deploy/scripts/logs.sh \
+  --context infra:opensource-aws-use1-prod-54 \
+  -n serge \
+  --since 2h \
+  --grep 'error|traceback|crashed|HTTPError'
 ```
 
 ## Notes
