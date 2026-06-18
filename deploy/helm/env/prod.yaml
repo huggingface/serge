@@ -1,6 +1,6 @@
 # Values for the serge deployment on the open-source EKS cluster
 # (opensource-aws-use1-prod-54), namespace chosen at install time.
-# Deploy: helm install serge ./chart -n <ns> -f chart/env/prod.yaml
+# Deploy: deploy/scripts/deploy.sh -n serge -f deploy/helm/env/prod.yaml
 #
 # Image is public on GHCR (ghcr.io/huggingface/serge) so no imagePullSecret
 # is needed. The ACM cert for serge.huggingface.tech already exists in this
@@ -49,8 +49,10 @@ envVars:
   LLM_API_BASE: "https://router.huggingface.co/v1"
   LLM_MODEL: "moonshotai/Kimi-K2.6"
   LLM_STREAM: "1"
+  LLM_BILL_TO: "huggingface"
   MENTION_TRIGGER: "@askserge"
   REVIEW_EVENT: "COMMENT"
+  TASK_API_ENABLED: "1"
   # Refuse to run PR-author subprocesses unless bubblewrap is available.
   # Requires the node to allow unprivileged user namespaces; if pods fail
   # to run reviews, switch to "auto".

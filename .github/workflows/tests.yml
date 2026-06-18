@@ -32,3 +32,19 @@ jobs:
 
       - name: Run tests
         run: make test
+
+  helm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.3
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint Helm chart
+        run: helm lint deploy/helm
+
+      - name: Render production values
+        run: helm template serge deploy/helm -n serge -f deploy/helm/env/prod.yaml
