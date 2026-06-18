@@ -63,6 +63,16 @@ deploy/scripts/logs.sh \
   --grep 'error|traceback|crashed|HTTPError'
 ```
 
+Print only the latest error block:
+
+```bash
+deploy/scripts/logs.sh \
+  --context infra:opensource-aws-use1-prod-54 \
+  -n serge \
+  --since 2h \
+  --last-error
+```
+
 ## Notes
 
 - The production image is published to GHCR as `ghcr.io/huggingface/serge`.
