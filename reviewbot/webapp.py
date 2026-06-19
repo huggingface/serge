@@ -36,7 +36,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import __version__
+from . import __version__, build_info, git_sha
 from .clone_cache import CloneCache, Checkout
 from .config import Config
 from .github_auth import (
@@ -1202,6 +1202,46 @@ app = FastAPI(title="Serge web reviewer")
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
+@app.middleware("http")
+async def _stamp_build(request: Request, call_next):
+    """Stamp the running build onto every response.
+
+    Two ways, so it is visible no matter how a client consumes the API:
+    - ``X-Serge-Version`` / ``X-Serge-Commit`` headers on *all* responses
+      (HTML pages, redirects, SSE streams included).
+    - a ``serge`` field merged into every JSON object body, so callers that
+      only read the payload (the GitHub Action, curl, the web UI) see which
+      commit answered them. Lists and streams are left untouched.
+    """
+    response = await call_next(request)
+    sha = git_sha()
+    response.headers["X-Serge-Version"] = __version__
+    if sha:
+        response.headers["X-Serge-Commit"] = sha
+    ctype = response.headers.get("content-type", "")
+    # Only rewrite buffered JSON; never drain an SSE/streaming body.
+    if not ctype.startswith("application/json") or isinstance(
+        response, StreamingResponse
+    ):
+        return response
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    try:
+        data = _json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        data = None
+    if isinstance(data, dict) and "serge" not in data:
+        data["serge"] = {"version": __version__, "commit": sha}
+        body = _json.dumps(data).encode("utf-8")
+    headers = dict(response.headers)
+    headers.pop("content-length", None)  # recomputed from the new body
+    return Response(
+        content=body,
+        status_code=response.status_code,
+        headers=headers,
+        media_type="application/json",
+    )
+
+
 @app.on_event("startup")
 async def _start_clone_cache_gc() -> None:
     """Hourly GC of the clone cache: drop bare repos untouched for longer
@@ -1373,13 +1413,27 @@ def _serve_static(name: str) -> HTMLResponse:
 
 
 def _powered_by_html() -> str:
-    """Render the fixed Inference Providers badge next to the Serge brand."""
+    """Render the fixed Inference Providers badge next to the Serge brand,
+    followed by the running build's version/commit so any page reveals
+    which deployment is live."""
     url = "https://huggingface.co/docs/inference-providers/en/index"
     return (
         '<span class="powered-by">powered by '
         f'<a href="{_html.escape(url, quote=True)}" '
         f'target="_blank" rel="noopener noreferrer">'
-        "HF Inference Providers</a></span>"
+        "HF Inference Providers</a></span>" + _build_badge_html()
+    )
+
+
+def _build_badge_html() -> str:
+    """A small ``v0.1.0 · <sha>`` badge identifying the running build."""
+    sha = git_sha()
+    label = f"v{__version__}"
+    if sha:
+        label += f" · {sha}"
+    return (
+        '<span class="build-badge" title="Serge build version and commit">'
+        f"{_html.escape(label)}</span>"
     )
 
 
@@ -1405,7 +1459,14 @@ def _app_install_html() -> str:
 
 @app.get("/healthz")
 def healthz() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok"}  # the `serge` build stamp is added by middleware
+
+
+@app.get("/version")
+def version() -> dict:
+    """The running build's version and commit SHA. Handy for confirming a
+    deployment is actually serving the commit you think it is."""
+    return build_info()
 
 
 @app.get("/")
@@ -1580,9 +1641,12 @@ def list_reviews(request: Request) -> JSONResponse:
                     "repo": r["target_repo"],
                     "number": r["target_number"],
                     "status": r["status"],
+                    "kind": r.get("kind") or "review",
                     "created_at": r["created_at"],
                     "url": (
-                        f"/reviews/{r['target_owner']}/{r['target_repo']}/"
+                        f"/tasks/{r['target_owner']}/{r['target_repo']}/{r['id']}"
+                        if (r.get("kind") or "review") == "task"
+                        else f"/reviews/{r['target_owner']}/{r['target_repo']}/"
                         f"{r['target_number']}/{r['id']}"
                     ),
                 }

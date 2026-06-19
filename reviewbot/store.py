@@ -323,7 +323,7 @@ class JobStore:
             rows = self._conn.execute(
                 """
                 SELECT id, user, target_owner, target_repo, target_number,
-                       status, source, created_at, updated_at,
+                       status, source, kind, created_at, updated_at,
                        llm_provider, llm_api_base, llm_model
                   FROM jobs
                  WHERE user = ?

@@ -23,6 +23,12 @@ RUN python -m venv /opt/app/.venv \
 
 ENV PATH="/opt/app/.venv/bin:${PATH}"
 ENV PORT=8080
+
+# Bake the build commit into the image so /version, the JSON `serge` stamp,
+# and the web UI footer report exactly what is deployed. CI passes this from
+# github.sha; the .git dir isn't shipped, so the app reads it from here.
+ARG GIT_SHA=""
+ENV SERGE_GIT_SHA=${GIT_SHA}
 EXPOSE 8080
 USER app
 CMD ["reviewbot-web"]

@@ -85,6 +85,12 @@ header.bar .brand-row {
   border-bottom: 1px dotted var(--muted);
 }
 .powered-by a:hover { color: var(--fg); }
+.build-badge {
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  opacity: 0.7;
+}
 
 h1, h2 { margin-top: 0; }
 
