@@ -283,6 +283,9 @@ class ChatCompletionClient:
                     chars += len(name)
                 if isinstance(args, str):
                     chars += len(args)
+                sig = _extract_thought_signature(tc)
+                if sig:
+                    chars += len(sig)
         if tools:
             chars += len(json.dumps(tools))
         return chars // 4

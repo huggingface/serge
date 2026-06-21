@@ -517,6 +517,39 @@ class ChatCompletionClientTests(unittest.TestCase):
         self.assertEqual(len(result.tool_calls), 1)
         self.assertEqual(result.tool_calls[0].thought_signature, "sig-stream")
 
+    def test_estimate_input_tokens_counts_thought_signature(self) -> None:
+        # The replayed assistant turn carries Gemini's signature; the live
+        # "in" counter should account for those chars, not silently drop them.
+        base = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_x",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            }
+        ]
+        with_sig = [
+            {
+                **base[0],
+                "tool_calls": [
+                    {
+                        **base[0]["tool_calls"][0],
+                        "extra_content": {"google": {"thought_signature": "x" * 400}},
+                    }
+                ],
+            }
+        ]
+        self.assertEqual(
+            ChatCompletionClient._estimate_input_tokens(with_sig, None)
+            - ChatCompletionClient._estimate_input_tokens(base, None),
+            100,  # 400 signature chars / 4 chars-per-token
+        )
+
     def test_complete_falls_back_when_endpoint_rejects_tools(self) -> None:
         # First call (with tools) returns 400; second call (no tools) succeeds.
         rejected = Mock(
