@@ -5,6 +5,7 @@ from reviewbot.patch import parse_patch
 from reviewbot.tools import ToolEnv
 from reviewbot.reviewer import (
     _UnparseableLLMOutput,
+    _assistant_tool_call_dict,
     _build_annotated_diff_chunks,
     _content_preview,
     _extract_json,
@@ -13,6 +14,31 @@ from reviewbot.reviewer import (
     _run_agentic_loop,
     _summarize_rejected_comments,
 )
+
+
+class AssistantToolCallDictTests(unittest.TestCase):
+    def test_omits_extra_content_without_signature(self) -> None:
+        tc = ToolCall(id="t0", name="read_file", arguments='{"path":"a.py"}')
+        self.assertEqual(
+            _assistant_tool_call_dict(tc),
+            {
+                "id": "t0",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"a.py"}'},
+            },
+        )
+
+    def test_reattaches_thought_signature_at_gemini_path(self) -> None:
+        tc = ToolCall(
+            id="t0",
+            name="read_file",
+            arguments='{"path":"a.py"}',
+            thought_signature="sig-abc",
+        )
+        self.assertEqual(
+            _assistant_tool_call_dict(tc)["extra_content"],
+            {"google": {"thought_signature": "sig-abc"}},
+        )
 
 
 class ExtractJsonTests(unittest.TestCase):

@@ -807,14 +807,7 @@ def _run_agentic_loop(
             {
                 "role": "assistant",
                 "content": chat.content or None,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.name, "arguments": tc.arguments},
-                    }
-                    for tc in chat.tool_calls
-                ],
+                "tool_calls": [_assistant_tool_call_dict(tc) for tc in chat.tool_calls],
             }
         )
         for tc in chat.tool_calls:
@@ -938,6 +931,21 @@ def _emit_metrics(
         }
     )
     emit("metrics", payload)
+
+
+def _assistant_tool_call_dict(tc: ToolCall) -> dict[str, Any]:
+    """Serialize a ToolCall back into the OpenAI-compat assistant message.
+    Re-attaches Gemini 3's thought_signature at the exact path the API
+    expects it, and only when one is present — so OpenAI / HF Router / Gemini
+    2.5 turns stay byte-for-byte what they were before."""
+    call: dict[str, Any] = {
+        "id": tc.id,
+        "type": "function",
+        "function": {"name": tc.name, "arguments": tc.arguments},
+    }
+    if tc.thought_signature:
+        call["extra_content"] = {"google": {"thought_signature": tc.thought_signature}}
+    return call
 
 
 def _execute_tool_call(env: ToolEnv, tc: ToolCall) -> str:

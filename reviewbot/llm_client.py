@@ -37,11 +37,19 @@ class LLMResponseError(requests.HTTPError):
 class ToolCall:
     """One tool/function call emitted by the assistant. ``arguments`` is
     the raw string the model produced — the caller is responsible for
-    JSON-parsing it (and for handling models that emit malformed JSON)."""
+    JSON-parsing it (and for handling models that emit malformed JSON).
+
+    ``thought_signature`` is Gemini 3's encrypted reasoning token, carried
+    over the OpenAI-compat endpoint at ``tool_call.extra_content.google.
+    thought_signature``. It MUST be echoed back unchanged on the next
+    request or Gemini 3 rejects the follow-up turn with a 400. ``None`` for
+    every other provider (OpenAI, HF Router, Gemini 2.5), which don't send
+    it — so it round-trips invisibly for them."""
 
     id: str
     name: str
     arguments: str
+    thought_signature: Optional[str] = None
 
 
 @dataclass
@@ -739,7 +747,9 @@ class ChatCompletionClient:
         idx = chunk.get("index")
         if not isinstance(idx, int):
             idx = len(parts)
-        slot = parts.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+        slot = parts.setdefault(
+            idx, {"id": None, "name": None, "arguments": "", "thought_signature": None}
+        )
         if chunk.get("id"):
             slot["id"] = chunk["id"]
         fn = chunk.get("function") or {}
@@ -748,6 +758,9 @@ class ChatCompletionClient:
         args_piece = fn.get("arguments")
         if isinstance(args_piece, str):
             slot["arguments"] += args_piece
+        sig = _extract_thought_signature(chunk)
+        if sig:
+            slot["thought_signature"] = sig
 
     @staticmethod
     def _finalize_tool_calls(parts: dict[int, dict[str, Any]]) -> list[ToolCall]:
@@ -764,9 +777,23 @@ class ChatCompletionClient:
                     id=slot.get("id") or f"call_{idx}",
                     name=name,
                     arguments=slot.get("arguments") or "",
+                    thought_signature=slot.get("thought_signature"),
                 )
             )
         return out
+
+
+def _extract_thought_signature(tc: dict[str, Any]) -> Optional[str]:
+    """Pull Gemini 3's ``extra_content.google.thought_signature`` off a raw
+    tool-call dict, returning ``None`` for any other provider's shape."""
+    extra = tc.get("extra_content")
+    if not isinstance(extra, dict):
+        return None
+    google = extra.get("google")
+    if not isinstance(google, dict):
+        return None
+    sig = google.get("thought_signature")
+    return sig if isinstance(sig, str) and sig else None
 
 
 def _parse_tool_calls_from_message(raw: Any) -> list[ToolCall]:
@@ -784,5 +811,12 @@ def _parse_tool_calls_from_message(raw: Any) -> list[ToolCall]:
         args = fn.get("arguments")
         if not isinstance(args, str):
             args = json.dumps(args) if args is not None else ""
-        out.append(ToolCall(id=tc.get("id") or f"call_{i}", name=name, arguments=args))
+        out.append(
+            ToolCall(
+                id=tc.get("id") or f"call_{i}",
+                name=name,
+                arguments=args,
+                thought_signature=_extract_thought_signature(tc),
+            )
+        )
     return out
