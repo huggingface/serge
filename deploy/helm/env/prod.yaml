@@ -65,6 +65,9 @@ envVars:
   HELPER_SANDBOX: "require"
   DEV_NO_AUTH: "0"
   WEB_ALLOWED_ORG: "huggingface"
+  # Comma-separated GitHub logins allowed to view any user's review
+  # (not just their own) via a shared link.
+  WEB_ADMIN_USERS: "tarekziade"
   GITHUB_OAUTH_CALLBACK_URL: "https://serge.huggingface.tech/auth/callback"
   WEB_GITHUB_APP_URL: "https://github.com/apps/sergereview"
 

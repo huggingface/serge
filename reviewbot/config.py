@@ -109,6 +109,10 @@ class Config:
     # Comma-separated lists. Either may be empty when DEV_NO_AUTH is on.
     web_allowed_users: tuple[str, ...] = ()
     web_allowed_orgs: tuple[str, ...] = ()
+    # Admins (comma-separated GitHub logins) may view any user's review,
+    # not just their own. Used to follow a shared review link that was
+    # submitted by someone else via the web UI.
+    web_admin_users: tuple[str, ...] = ()
     # SQLite file used by the web app to persist job metadata, drafts,
     # and structural event history. Default is relative to CWD so dev
     # works out of the box; deploy sets an absolute path.
@@ -206,6 +210,11 @@ class Config:
             for o in (os.environ.get("WEB_ALLOWED_ORG") or "").split(",")
             if o.strip()
         )
+        admin_users = tuple(
+            u.strip().lower()
+            for u in (os.environ.get("WEB_ADMIN_USERS") or "").split(",")
+            if u.strip()
+        )
 
         if require_web and not dev_no_auth:
             missing_web = [
@@ -293,6 +302,7 @@ class Config:
             web_session_secret=session_secret,
             web_allowed_users=allowed_users,
             web_allowed_orgs=allowed_orgs,
+            web_admin_users=admin_users,
             web_store_path=(os.environ.get("WEB_STORE_PATH") or "jobs.db").strip()
             or "jobs.db",
             web_job_retention=_int_env("WEB_JOB_RETENTION", 25),

@@ -247,6 +247,13 @@ def _effective_user_orgs_for_repo(
     return merged
 
 
+def _is_admin(user: Optional[str]) -> bool:
+    """Admins (WEB_ADMIN_USERS) may view any user's review, not just their
+    own. Logins are matched case-insensitively, mirroring the login
+    allowlist."""
+    return bool(user) and user.lower() in cfg.web_admin_users
+
+
 def _user_is_allowed(login: str, orgs: list[str]) -> bool:
     if cfg.web_dev_no_auth:
         return True
@@ -2249,8 +2256,9 @@ def _get_owned_job(
     # Webhook jobs are kicked off by a GitHub comment, not a logged-in
     # user, so there is no real owner — any authenticated viewer may
     # follow them (the journal already exposes them cross-user). UI jobs
-    # stay private to the submitter.
-    if job.source != "webhook" and job.user != user:
+    # stay private to the submitter, except admins (WEB_ADMIN_USERS) may
+    # follow any user's review via a shared link.
+    if job.source != "webhook" and job.user != user and not _is_admin(user):
         raise HTTPException(status_code=403, detail="not_your_job")
     if (
         job.target_owner != owner
