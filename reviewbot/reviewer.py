@@ -849,9 +849,13 @@ def _run_agentic_loop(
         }
     )
     final_extra = {"reasoning_effort": cfg.llm_reasoning_effort or "low"}
+    # Do NOT pass `response_format` here — same reason as the main loop
+    # above (Anthropic's OpenAI shim and others reject
+    # `{"type": "json_object"}`, accepting only `"json_schema"`). The
+    # force message already instructs "single JSON object only", and
+    # _extract_json parses the result forgivingly.
     chat = llm.complete(
         messages,
-        response_format={"type": "json_object"},
         max_tokens=cfg.llm_max_tokens,
         chunk_callback=chunk_cb,
         extra=final_extra,
