@@ -119,6 +119,46 @@ class WebappReviewsTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["default_max_input_tokens"], 2000000)
 
+    def test_apply_review_edits_materializes_published_draft(self):
+        draft = self.webapp.ReviewDraft(
+            owner="acme",
+            repo="widgets",
+            number=7,
+            head_sha="abc",
+            summary="generated summary",
+            event="COMMENT",
+            comments=[
+                self.webapp.DraftComment(
+                    id="c1",
+                    path="a.py",
+                    side="RIGHT",
+                    line=10,
+                    body="generated body",
+                ),
+                self.webapp.DraftComment(
+                    id="c2",
+                    path="b.py",
+                    side="RIGHT",
+                    line=20,
+                    body="discard me",
+                ),
+            ],
+        )
+        edits = self.webapp.ReviewEdits(
+            summary="edited summary",
+            event="REQUEST_CHANGES",
+            comment_overrides={"c1": "edited body"},
+            discarded_comment_ids={"c2"},
+        )
+
+        published = self.webapp._apply_review_edits(draft, edits)
+
+        self.assertEqual(published.summary, "edited summary")
+        self.assertEqual(published.event, "REQUEST_CHANGES")
+        self.assertEqual(len(published.comments), 1)
+        self.assertEqual(published.comments[0].id, "c1")
+        self.assertEqual(published.comments[0].body, "edited body")
+
 
 if __name__ == "__main__":
     unittest.main()
