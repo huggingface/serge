@@ -1,174 +1,180 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+import argparse
+import re
+import shutil
+import subprocess
+import sys
 
-namespace="serge"
-release="serge"
-since="2h"
-follow=0
-grep_pattern=""
-expected_context=""
-last_error=0
 
-usage() {
-  cat <<'EOF'
-Usage: deploy/scripts/logs.sh [options]
+class CommandError(Exception):
+    def __init__(self, return_code):
+        self.return_code = return_code
 
-Options:
-  -n, --namespace NAME       Kubernetes namespace (default: serge)
-  -r, --release NAME         Helm release/app label (default: serge)
-      --since DURATION       Log window, e.g. 30m, 2h (default: 2h)
-  -f, --follow               Follow logs
-      --grep PATTERN         Filter logs with grep -Ei
-      --last-error           Print the last ERROR/Traceback block from recent logs
-      --context NAME         Require this kubectl context before reading logs
-  -h, --help                 Show this help
-EOF
-}
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -n|--namespace)
-      namespace="$2"
-      shift 2
-      ;;
-    -r|--release)
-      release="$2"
-      shift 2
-      ;;
-    --since)
-      since="$2"
-      shift 2
-      ;;
-    -f|--follow)
-      follow=1
-      shift
-      ;;
-    --grep)
-      grep_pattern="$2"
-      shift 2
-      ;;
-    --last-error)
-      last_error=1
-      shift
-      ;;
-    --context)
-      expected_context="$2"
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "unknown option: $1" >&2
-      usage >&2
-      exit 2
-      ;;
-  esac
-done
+def run_text(args):
+    try:
+        return subprocess.check_output(args, text=True).strip()
+    except subprocess.CalledProcessError as exc:
+        raise CommandError(exc.returncode) from exc
 
-if ! command -v kubectl >/dev/null 2>&1; then
-  echo "missing required command: kubectl" >&2
-  exit 1
-fi
 
-if [[ -n "${grep_pattern}" ]] && ! command -v grep >/dev/null 2>&1; then
-  echo "missing required command: grep" >&2
-  exit 1
-fi
+def stream_logs(args, grep_pattern):
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, text=True)
+    assert proc.stdout is not None
 
-current_context="$(kubectl config current-context)"
-if [[ -n "${expected_context}" && "${current_context}" != "${expected_context}" ]]; then
-  echo "refusing to read logs from context '${current_context}' (expected '${expected_context}')" >&2
-  exit 1
-fi
+    pattern = re.compile(grep_pattern, re.IGNORECASE) if grep_pattern else None
+    try:
+        for line in proc.stdout:
+            if pattern is None or pattern.search(line):
+                print(line, end="")
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
 
-pod="$(
-  kubectl get pods -n "${namespace}" \
-    -l "app=${release}" \
-    --field-selector=status.phase=Running \
-    --sort-by=.metadata.creationTimestamp \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
-    | tail -n 1
-)"
+    return proc.wait()
 
-if [[ -z "${pod}" ]]; then
-  echo "no running pod found in namespace '${namespace}' with label app=${release}" >&2
-  exit 1
-fi
 
-pod_started="$(kubectl get pod "${pod}" -n "${namespace}" -o jsonpath='{.status.startTime}')"
+def latest_error_block(args, pod, pod_started, since):
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, text=True)
+    assert proc.stdout is not None
 
-echo "Context: ${current_context}" >&2
-echo "Namespace: ${namespace}" >&2
-echo "Pod: ${pod}" >&2
-echo "Pod started: ${pod_started}" >&2
-echo "Since: ${since}" >&2
+    log_line_re = re.compile(r"^[0-9-]+ [0-9:,]+ (INFO|WARNING|ERROR|DEBUG) ")
+    error_re = re.compile(r"^[0-9-]+ [0-9:,]+ ERROR ")
+    last = []
+    block = []
 
-args=(logs -n "${namespace}" "${pod}" --since="${since}")
-if [[ "${follow}" -eq 1 ]]; then
-  args+=(-f)
-fi
+    def flush():
+        nonlocal last, block
+        if block:
+            last = block
+        block = []
 
-if [[ "${last_error}" -eq 1 ]]; then
-  if [[ "${follow}" -eq 1 ]]; then
-    echo "--last-error cannot be combined with --follow" >&2
-    exit 2
-  fi
-  kubectl "${args[@]}" | awk '
-    function flush() {
-      if (in_block && block != "") {
-        last = block
-      }
-      block = ""
-      in_block = 0
-    }
+    for line in proc.stdout:
+        if error_re.match(line):
+            flush()
+            block = [line]
+            continue
 
-    /^[0-9-]+ [0-9:,]+ ERROR / {
-      flush()
-      in_block = 1
-      block = $0 "\n"
-      next
-    }
+        if line.startswith("Traceback (most recent call last):"):
+            block.append(line)
+            continue
 
-    /^Traceback \(most recent call last\):/ {
-      if (!in_block) {
-        in_block = 1
-        block = $0 "\n"
-      } else {
-        block = block $0 "\n"
-      }
-      next
-    }
+        if block and (log_line_re.match(line) or line.startswith("INFO:")):
+            flush()
 
-    in_block {
-      if ($0 ~ /^[0-9-]+ [0-9:,]+ (INFO|WARNING|ERROR|DEBUG) / || $0 ~ /^INFO:/) {
-        flush()
-      }
-    }
+        if block:
+            block.append(line)
 
-    in_block {
-      block = block $0 "\n"
-    }
+    proc.stdout.close()
+    return_code = proc.wait()
+    if return_code != 0:
+        return return_code
 
-    END {
-      flush()
-      if (last != "") {
-        printf "%s", last
-      } else {
-        exit 1
-      }
-    }
-  ' || {
-    echo "no ERROR/Traceback block found for pod ${pod} in the last ${since}" >&2
-    echo "note: this only covers logs retained for the current pod, which started at ${pod_started}" >&2
-    exit 1
-  }
-  exit 0
-fi
+    flush()
+    if last:
+        print("".join(last), end="")
+        return 0
 
-if [[ -n "${grep_pattern}" ]]; then
-  kubectl "${args[@]}" | grep -Ei "${grep_pattern}"
-else
-  kubectl "${args[@]}"
-fi
+    print(f"no ERROR/Traceback block found for pod {pod} in the last {since}", file=sys.stderr)
+    print(
+        f"note: this only covers logs retained for the current pod, which started at {pod_started}",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="deploy/scripts/logs.sh",
+        description="Find the current running Serge pod and print recent logs.",
+    )
+    parser.add_argument("-n", "--namespace", default="serge", help="Kubernetes namespace")
+    parser.add_argument("-r", "--release", default="serge", help="Helm release/app label")
+    parser.add_argument("--since", default="2h", help="Log window, e.g. 30m, 2h")
+    parser.add_argument("-f", "--follow", action="store_true", help="Follow logs")
+    parser.add_argument("--grep", dest="grep_pattern", help="Filter logs with grep -Ei semantics")
+    parser.add_argument("--last-error", action="store_true", help="Print the last ERROR/Traceback block")
+    parser.add_argument("--context", dest="expected_context", help="Required kubectl context")
+    args = parser.parse_args()
+
+    if args.last_error and args.follow:
+        print("--last-error cannot be combined with --follow", file=sys.stderr)
+        return 2
+
+    if shutil.which("kubectl") is None:
+        print("missing required command: kubectl", file=sys.stderr)
+        return 1
+
+    try:
+        current_context = run_text(["kubectl", "config", "current-context"])
+    except CommandError as exc:
+        return exc.return_code
+    if args.expected_context and current_context != args.expected_context:
+        print(
+            f"refusing to read logs from context '{current_context}' "
+            f"(expected '{args.expected_context}')",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        pod_output = run_text(
+            [
+                "kubectl",
+                "get",
+                "pods",
+                "-n",
+                args.namespace,
+                "-l",
+                f"app={args.release}",
+                "--field-selector=status.phase=Running",
+                "--sort-by=.metadata.creationTimestamp",
+                "-o",
+                'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+            ]
+        )
+    except CommandError as exc:
+        return exc.return_code
+    pods = [line for line in pod_output.splitlines() if line]
+    if not pods:
+        print(
+            f"no running pod found in namespace '{args.namespace}' with label app={args.release}",
+            file=sys.stderr,
+        )
+        return 1
+
+    pod = pods[-1]
+    try:
+        pod_started = run_text(
+            [
+                "kubectl",
+                "get",
+                "pod",
+                pod,
+                "-n",
+                args.namespace,
+                "-o",
+                "jsonpath={.status.startTime}",
+            ]
+        )
+    except CommandError as exc:
+        return exc.return_code
+
+    print(f"Context: {current_context}", file=sys.stderr)
+    print(f"Namespace: {args.namespace}", file=sys.stderr)
+    print(f"Pod: {pod}", file=sys.stderr)
+    print(f"Pod started: {pod_started}", file=sys.stderr)
+    print(f"Since: {args.since}", file=sys.stderr)
+
+    log_args = ["kubectl", "logs", "-n", args.namespace, pod, f"--since={args.since}"]
+    if args.follow:
+        log_args.append("-f")
+
+    if args.last_error:
+        return latest_error_block(log_args, pod, pod_started, args.since)
+
+    return stream_logs(log_args, args.grep_pattern)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
