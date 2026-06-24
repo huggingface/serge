@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     error           TEXT,
     raw_llm_output  TEXT,
     draft_json      TEXT,
+    review_edits_json TEXT,
+    published_draft_json TEXT,
     history_json    TEXT,
     -- For tasks: the inbound TaskRequest spec (instruction/context/output).
     task_spec_json  TEXT,
@@ -127,6 +129,8 @@ class JobStore:
             self._ensure_column("llm_model", "TEXT")
             self._ensure_column("prompt_tokens", "INTEGER")
             self._ensure_column("completion_tokens", "INTEGER")
+            self._ensure_column("review_edits_json", "TEXT")
+            self._ensure_column("published_draft_json", "TEXT")
             self._ensure_column("source", "TEXT NOT NULL DEFAULT 'web'")
             self._ensure_column("kind", "TEXT NOT NULL DEFAULT 'review'")
             self._ensure_column("task_spec_json", "TEXT")
@@ -250,6 +254,40 @@ class JobStore:
                     time.time(),
                     prompt_tokens,
                     completion_tokens,
+                    job_id,
+                ),
+            )
+            self._conn.commit()
+
+    def save_published_review(
+        self,
+        job_id: str,
+        *,
+        edits: Optional[dict[str, Any]],
+        published_draft: Optional[ReviewDraft],
+    ) -> None:
+        """Persist the exact review version published from the web UI.
+
+        ``draft_json`` remains the AI-generated draft. These fields capture
+        the human's publish-time choices and the materialized draft after
+        applying those choices, so the review page can audit what changed.
+        """
+        edits_json = (
+            json.dumps(edits, ensure_ascii=False) if edits is not None else None
+        )
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE jobs
+                   SET review_edits_json = ?,
+                       published_draft_json = ?,
+                       updated_at = ?
+                 WHERE id = ?
+                """,
+                (
+                    edits_json,
+                    _encode_draft(published_draft),
+                    time.time(),
                     job_id,
                 ),
             )

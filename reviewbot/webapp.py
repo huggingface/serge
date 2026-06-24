@@ -300,6 +300,8 @@ class Job:
     task_result: Optional[dict[str, Any]] = None
     status: str = "running"  # running | done | error | discarded | published
     draft: Optional[ReviewDraft] = None
+    review_edits: Optional[dict[str, Any]] = None
+    published_draft: Optional[ReviewDraft] = None
     error: Optional[str] = None
     raw_llm_output: Optional[str] = None  # only set on parse-failure errors
     queue: "asyncio.Queue[dict[str, Any]]" = field(default_factory=asyncio.Queue)
@@ -795,6 +797,12 @@ def _persist_terminal(job: Job) -> None:
             draft=job.draft,
             history=history_copy,
         )
+        if job.published_draft is not None:
+            _store.save_published_review(
+                job.id,
+                edits=job.review_edits,
+                published_draft=job.published_draft,
+            )
     except Exception:  # noqa: BLE001
         log.exception("failed to persist terminal state for job %s", job.id)
 
@@ -926,13 +934,16 @@ def _execute_review(
         job.draft = draft
         if auto_publish:
             _push_event(job, "log", "Publishing review to GitHub…")
-            publish_review(worker_cfg, gh, draft)
+            # Store the effective draft publish_review actually posted (e.g.
+            # APPROVE downgraded to COMMENT) so the audit log doesn't claim
+            # an approval GitHub never received.
+            job.published_draft = publish_review(worker_cfg, gh, draft)
             job.status = "published"
             _push_event(
                 job,
                 "log",
-                f"Published review: {len(draft.comments)} inline comment(s), "
-                f"event={draft.event}",
+                f"Published review: {len(job.published_draft.comments)} inline "
+                f"comment(s), event={job.published_draft.event}",
             )
         else:
             job.status = "done"
@@ -2424,6 +2435,12 @@ def _load_job_from_store(job_id: str) -> Optional[Job]:
         error=row["error"],
         raw_llm_output=row["raw_llm_output"],
         draft=decode_draft(row["draft_json"]) if row.get("draft_json") else None,
+        review_edits=_safe_json_obj(row.get("review_edits_json")),
+        published_draft=(
+            decode_draft(row["published_draft_json"])
+            if row.get("published_draft_json")
+            else None
+        ),
     )
     job.task_spec = _safe_json_obj(row.get("task_spec_json"))
     job.task_result = _safe_json_obj(row.get("result_json"))
@@ -2482,6 +2499,7 @@ def review_draft(
             "status": job.status,
             "error": job.error,
             "draft": _draft_to_dict(job.draft),
+            "audit": _review_audit_to_dict(job),
         }
     )
 
@@ -2499,6 +2517,49 @@ def _draft_to_dict(draft: ReviewDraft) -> dict[str, Any]:
         "model": draft.model,
         "version": __version__,
         "comments": [dataclasses.asdict(c) for c in draft.comments],
+    }
+
+
+def _review_audit_to_dict(job: Job) -> dict[str, Any]:
+    published = job.published_draft
+    changed: dict[str, Any] = {
+        "summary": False,
+        "event": False,
+        "edited_comment_ids": [],
+        "discarded_comment_ids": [],
+    }
+    if job.draft is not None and published is not None:
+        changed = _review_changes(job.draft, published)
+    return {
+        "trigger_comment": job.trigger_comment,
+        "generated_draft": _draft_to_dict(job.draft) if job.draft else None,
+        "published_draft": _draft_to_dict(published) if published else None,
+        "review_edits": job.review_edits,
+        "changes": changed,
+        "trace": [
+            {"kind": e.get("kind"), "text": e.get("text"), "ts": e.get("ts")}
+            for e in job.history
+            if e.get("kind") not in _NOISY_KINDS
+        ],
+    }
+
+
+def _review_changes(generated: ReviewDraft, published: ReviewDraft) -> dict[str, Any]:
+    generated_comments = {c.id: c for c in generated.comments}
+    published_comments = {c.id: c for c in published.comments}
+    edited_comment_ids = [
+        c.id
+        for c in published.comments
+        if c.id in generated_comments and c.body != generated_comments[c.id].body
+    ]
+    discarded_comment_ids = [
+        c.id for c in generated.comments if c.id not in published_comments
+    ]
+    return {
+        "summary": published.summary != generated.summary,
+        "event": published.event != generated.event,
+        "edited_comment_ids": edited_comment_ids,
+        "discarded_comment_ids": discarded_comment_ids,
     }
 
 
@@ -2592,9 +2653,18 @@ async def publish(
         cfg.github_app_id, cfg.github_private_key, installation_id
     )
     gh = GitHubClient(token)
-    publish_review(cfg, gh, job.draft, edits=edits)
+    # Persist exactly what publish_review posted — including any APPROVE ->
+    # COMMENT downgrade — instead of re-deriving the draft separately (which
+    # could drift from the publish path).
+    job.published_draft = publish_review(cfg, gh, job.draft, edits=edits)
     job.status = "published"
+    job.review_edits = _review_edits_to_dict(edits)
     _store.update_status(job.id, "published")
+    _store.save_published_review(
+        job.id,
+        edits=job.review_edits,
+        published_draft=job.published_draft,
+    )
     return JSONResponse({"status": "published"})
 
 
@@ -2630,6 +2700,15 @@ def _edits_from_payload(payload: dict[str, Any], draft: ReviewDraft) -> ReviewEd
         comment_overrides=overrides,
         discarded_comment_ids=discarded,
     )
+
+
+def _review_edits_to_dict(edits: ReviewEdits) -> dict[str, Any]:
+    return {
+        "summary": edits.summary,
+        "event": edits.event,
+        "comment_overrides": dict(edits.comment_overrides),
+        "discarded_comment_ids": sorted(edits.discarded_comment_ids),
+    }
 
 
 @app.post("/reviews/{owner}/{repo}/{number}/{job_id}/discard")
