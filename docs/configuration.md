@@ -26,6 +26,7 @@ environment variables in server modes.
 | `MENTION_TRIGGER` | `mention_trigger` | `@askserge` | Phrase that triggers reviews. |
 | `REVIEW_EVENT` | `review_event` | `COMMENT` | Fallback review event when the model omits one. |
 | `MAX_DIFF_CHARS` | `max_diff_chars` | `200000` | Maximum diff characters sent to the LLM. |
+| `MAX_PR_CONVERSATION_CHARS` | `max_pr_conversation_chars` | `16000` | Characters of prior PR conversation (issue comments, review summaries, inline review threads) fed to the model as untrusted context. Newest entries are kept; `0` disables the fetch. |
 | `REVIEW_RULES_PATH` | `review_rules_path` | `.ai/review-rules.md` | Rules file read from the target repo default branch. |
 | `DEFAULT_REVIEW_RULES` | `default_review_rules` | general Python correctness and security rules | Fallback when no rules file exists. |
 | `ALLOW_APPROVE` | none | `false` | Allows publishing `APPROVE` events in App/web mode. |
