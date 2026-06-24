@@ -108,6 +108,31 @@ class WebappVersionTests(unittest.TestCase):
             entries["job-review"]["url"], "/reviews/acme/widgets/7/job-review"
         )
 
+    def test_journal_page_renders_rows_without_javascript(self):
+        self.webapp._store.insert_job(
+            id="job-review",
+            user="octocat",
+            target_owner="acme",
+            target_repo="widgets",
+            target_number=7,
+            trigger_comment="x",
+            llm_provider="hf",
+            llm_api_base=None,
+            llm_model="m",
+            created_at=2.0,
+            status="published",
+            source="webhook",
+            kind="review",
+            task_spec_json=None,
+        )
+        html = self.client.get("/journal").text
+        self.assertIn('id="journal-count">(1)</span>', html)
+        self.assertIn("acme/widgets#7", html)
+        self.assertIn("/reviews/acme/widgets/7/job-review", html)
+        self.assertIn("octocat", html)
+        self.assertIn("webhook", html)
+        self.assertIn("published", html)
+
 
 if __name__ == "__main__":
     unittest.main()

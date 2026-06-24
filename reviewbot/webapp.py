@@ -1409,14 +1409,91 @@ def _require_same_origin(request: Request) -> None:
     raise HTTPException(status_code=403, detail="bad_origin")
 
 
-def _serve_static(name: str) -> HTMLResponse:
+def _static_html(name: str) -> str:
     path = os.path.join(_STATIC_DIR, name)
     with open(path, "r", encoding="utf-8") as f:
         html = f.read()
     if name.endswith(".html"):
         html = html.replace("<!-- POWERED_BY -->", _powered_by_html())
         html = html.replace("<!-- APP_INSTALL_LINK -->", _app_install_html())
+    return html
+
+
+def _serve_static(name: str) -> HTMLResponse:
+    html = _static_html(name)
     return HTMLResponse(html)
+
+
+def _journal_entry_url(row: dict[str, Any]) -> str:
+    kind = row.get("kind") or "review"
+    owner = row["target_owner"]
+    repo = row["target_repo"]
+    if kind == "task":
+        return f"/tasks/{owner}/{repo}/{row['id']}"
+    return f"/reviews/{owner}/{repo}/{row['target_number']}/{row['id']}"
+
+
+def _journal_type(row: dict[str, Any]) -> str:
+    if (row.get("kind") or "review") == "task":
+        return "task"
+    if row.get("source") == "webhook":
+        return "webhook"
+    return "webapp"
+
+
+def _journal_tokens(n: Any) -> str:
+    if not isinstance(n, int) or n <= 0:
+        return "—"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def _journal_rows_html(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<tr><td colspan="9" class="hint">No calls yet.</td></tr>'
+    rendered: list[str] = []
+    for row in rows:
+        created = row.get("created_at")
+        try:
+            created_ts = float(created)
+        except (TypeError, ValueError):
+            created_ts = 0.0
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(created_ts))
+        entry_type = _journal_type(row)
+        status_text = str(row.get("status") or "unknown")
+        status_class = re.sub(r"[^a-zA-Z0-9_-]+", "-", status_text)
+        target = (
+            f"{row['target_owner']}/{row['target_repo']}"
+            if (row.get("kind") or "review") == "task"
+            else f"{row['target_owner']}/{row['target_repo']}#{row['target_number']}"
+        )
+        rendered.append(
+            "<tr>"
+            f'<td class="ago" title="{_html.escape(when, quote=True)}">'
+            f"{_html.escape(when)}</td>"
+            "<td>"
+            f'<span class="source-tag type-{_html.escape(entry_type, quote=True)}">'
+            f"{_html.escape(entry_type)}</span>"
+            "</td>"
+            f"<td>{_html.escape(str(row.get('user') or '—'))}</td>"
+            "<td>"
+            f'<a href="{_html.escape(_journal_entry_url(row), quote=True)}">'
+            f"{_html.escape(target)}</a>"
+            "</td>"
+            f"<td>{_html.escape(str(row.get('llm_provider') or '—'))}</td>"
+            f"<td>{_html.escape(str(row.get('llm_model') or '—'))}</td>"
+            f"<td>{_html.escape(_journal_tokens(row.get('prompt_tokens')))}</td>"
+            f"<td>{_html.escape(_journal_tokens(row.get('completion_tokens')))}</td>"
+            "<td>"
+            f'<span class="status-badge {_html.escape(status_class, quote=True)}">'
+            f"{_html.escape(status_text)}</span>"
+            "</td>"
+            "</tr>"
+        )
+    return "\n".join(rendered)
 
 
 def _powered_by_html() -> str:
@@ -1487,7 +1564,18 @@ def index(request: Request) -> Response:
 def journal_page(request: Request) -> Response:
     if not _current_user(request):
         return RedirectResponse("/login", status_code=302)
-    return _serve_static("journal.html")
+    rows = _store.list_all_calls(limit=cfg.web_job_retention)
+    html = _static_html("journal.html")
+    count = f"({len(rows)})" if rows else ""
+    html = html.replace(
+        '<span class="hint" id="journal-count"></span>',
+        f'<span class="hint" id="journal-count">{_html.escape(count)}</span>',
+    )
+    html = html.replace(
+        '<tbody id="journal-tbody"></tbody>',
+        f'<tbody id="journal-tbody">\n{_journal_rows_html(rows)}\n</tbody>',
+    )
+    return HTMLResponse(html)
 
 
 @app.get("/help")
@@ -1688,12 +1776,7 @@ def journal_data(request: Request) -> JSONResponse:
                     "model": r["llm_model"],
                     "prompt_tokens": r["prompt_tokens"],
                     "completion_tokens": r["completion_tokens"],
-                    "url": (
-                        f"/tasks/{r['target_owner']}/{r['target_repo']}/{r['id']}"
-                        if (r.get("kind") or "review") == "task"
-                        else f"/reviews/{r['target_owner']}/{r['target_repo']}/"
-                        f"{r['target_number']}/{r['id']}"
-                    ),
+                    "url": _journal_entry_url(r),
                 }
                 for r in rows
             ]
