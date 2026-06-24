@@ -591,6 +591,78 @@ class ChatCompletionClientTests(unittest.TestCase):
         self.assertIn("tools", first_payload)
         self.assertNotIn("tools", second_payload)
 
+    def test_complete_falls_back_when_endpoint_rejects_temperature(self) -> None:
+        # First call (with temperature) returns 400 complaining the
+        # parameter is deprecated; the retry drops temperature and succeeds.
+        rejected = Mock(
+            status_code=400,
+            ok=False,
+            reason="Bad Request",
+            text=(
+                '{"error":{"code":"invalid_request_error","message":'
+                '"`temperature` is deprecated for this model.",'
+                '"type":"invalid_request_error"}}'
+            ),
+            raise_for_status=Mock(side_effect=AssertionError("should not be reached")),
+        )
+        ok = Mock(
+            status_code=200,
+            ok=True,
+            json=Mock(
+                return_value={
+                    "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+                }
+            ),
+            raise_for_status=Mock(),
+        )
+        with (
+            patch("reviewbot.llm_client.time.sleep"),
+            patch(
+                "reviewbot.llm_client.requests.post", side_effect=[rejected, ok]
+            ) as mock_post,
+        ):
+            client = ChatCompletionClient(
+                "https://example.com/v1", "token", "fixed-model"
+            )
+            result = client.complete(
+                [{"role": "user", "content": "hi"}],
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+            )
+
+        self.assertEqual(result.content, "ok")
+        # Two POSTs: first with temperature, second without.
+        self.assertEqual(mock_post.call_count, 2)
+        first_payload = json.loads(mock_post.call_args_list[0].kwargs["data"])
+        second_payload = json.loads(mock_post.call_args_list[1].kwargs["data"])
+        self.assertIn("temperature", first_payload)
+        self.assertNotIn("temperature", second_payload)
+        # Tools are unrelated to the rejection, so they're preserved.
+        self.assertIn("tools", second_payload)
+
+    def test_complete_does_not_strip_temperature_on_value_error(self) -> None:
+        # A value-range complaint mentions "temperature" but isn't a
+        # parameter rejection — it should bubble up, not silently retry.
+        rejected = Mock(
+            status_code=400,
+            ok=False,
+            reason="Bad Request",
+            text='{"error":"temperature must be between 0 and 2"}',
+            raise_for_status=Mock(side_effect=requests.HTTPError("400")),
+        )
+        with (
+            patch("reviewbot.llm_client.time.sleep"),
+            patch(
+                "reviewbot.llm_client.requests.post", return_value=rejected
+            ) as mock_post,
+        ):
+            client = ChatCompletionClient(
+                "https://example.com/v1", "token", "fixed-model"
+            )
+            with self.assertRaises(requests.HTTPError):
+                client.complete([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(mock_post.call_count, 1)
+
     def test_complete_does_not_fall_back_on_400_without_tools(self) -> None:
         # If we never sent tools, a 400 should bubble up — not silently retry.
         rejected = Mock(
