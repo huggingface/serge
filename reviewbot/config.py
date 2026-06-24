@@ -89,6 +89,13 @@ class Config:
     # off, and skip any remaining diff chunks. Set to 0 to disable.
     llm_max_input_tokens: int = 2_000_000
 
+    # Max characters of prior PR conversation (top-level issue comments,
+    # review summaries, and inline review-thread comments) fed to the model
+    # as context. Anyone can post these, so they go in an untrusted, scrubbed
+    # block. The newest entries are kept within the budget. 0 disables the
+    # fetch entirely. Set via MAX_PR_CONVERSATION_CHARS.
+    max_pr_conversation_chars: int = 16_000
+
     # When true, published reviews carry a note that they came from a
     # non-production (staging) deployment. Set via the STAGING env var.
     is_staging: bool = False
@@ -295,6 +302,7 @@ class Config:
             # PRs complete without being forced to truncate.
             tool_max_iterations=_int_env("TOOL_MAX_ITERATIONS", 30),
             llm_max_input_tokens=_int_env("LLM_MAX_INPUT_TOKENS", 2_000_000),
+            max_pr_conversation_chars=_int_env("MAX_PR_CONVERSATION_CHARS", 16_000),
             is_staging=_bool_env("STAGING", False),
             github_oauth_client_id=oauth_client_id,
             github_oauth_client_secret=oauth_client_secret,

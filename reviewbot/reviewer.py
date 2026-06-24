@@ -1010,6 +1010,118 @@ def _load_review_rules(
     return content or cfg.default_review_rules
 
 
+def _format_pr_conversation(
+    issue_comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    review_comments: list[dict[str, Any]],
+    *,
+    max_chars: int,
+    skip_comment_id: Optional[int] = None,
+) -> str:
+    """Render prior PR discussion into a compact, chronological transcript
+    for the review prompt: top-level issue comments, submitted review
+    summaries (APPROVE/REQUEST_CHANGES/COMMENT + body), and inline review-
+    thread comments (tagged with path:line).
+
+    ``skip_comment_id`` drops the comment that triggered this run (it's
+    already shown separately as the trigger comment). Output is budgeted to
+    ``max_chars`` keeping the newest entries — recent discussion is the most
+    likely to matter — with a note for anything dropped. Returns "" when
+    there's nothing to show. All content is attacker-controllable, so the
+    caller must place it in an untrusted, scrubbed block."""
+    entries: list[tuple[str, str]] = []  # (timestamp, rendered)
+
+    for c in issue_comments:
+        if skip_comment_id is not None and c.get("id") == skip_comment_id:
+            continue
+        body = (c.get("body") or "").strip()
+        if not body:
+            continue
+        author = (c.get("user") or {}).get("login") or "unknown"
+        entries.append((c.get("created_at") or "", f"@{author} commented:\n{body}"))
+
+    for r in reviews:
+        state = (r.get("state") or "").upper()
+        body = (r.get("body") or "").strip()
+        # Drop empty COMMENTED/PENDING reviews — they carry no signal (the
+        # actual inline notes come through review_comments).
+        if not body and state in ("", "COMMENTED", "PENDING"):
+            continue
+        author = (r.get("user") or {}).get("login") or "unknown"
+        head = f"@{author} reviewed ({state or 'COMMENTED'})"
+        entries.append(
+            (r.get("submitted_at") or "", f"{head}:\n{body}" if body else head)
+        )
+
+    for c in review_comments:
+        body = (c.get("body") or "").strip()
+        if not body:
+            continue
+        author = (c.get("user") or {}).get("login") or "unknown"
+        path = c.get("path") or "?"
+        line = c.get("line") or c.get("original_line") or "?"
+        entries.append(
+            (c.get("created_at") or "", f"@{author} on {path}:{line}:\n{body}")
+        )
+
+    if not entries:
+        return ""
+
+    entries.sort(key=lambda e: e[0])
+    rendered = [text for _, text in entries]
+
+    # Budget from the newest backward so recent discussion survives. Always
+    # keep at least one entry, then hard-cap below in case it's oversized.
+    kept: list[str] = []
+    total = 0
+    for text in reversed(rendered):
+        cost = len(text) + 2  # "\n\n" join separator
+        if kept and total + cost > max_chars:
+            break
+        kept.append(text)
+        total += cost
+    kept.reverse()
+
+    omitted = len(rendered) - len(kept)
+    out = "\n\n".join(kept)
+    if len(out) > max_chars:
+        out = out[:max_chars] + "\n[... truncated ...]"
+    if omitted:
+        out = f"[... {omitted} earlier comment(s) omitted ...]\n\n" + out
+    return out
+
+
+def _fetch_pr_conversation(
+    gh: GitHubClient,
+    owner: str,
+    repo: str,
+    number: int,
+    *,
+    max_chars: int,
+    skip_comment_id: Optional[int] = None,
+) -> str:
+    """Fetch and format the PR's prior conversation. Best-effort: a failure
+    to read comments must not abort the review, so we log and continue."""
+    if max_chars <= 0:
+        return ""
+    try:
+        issue_comments = gh.list_issue_comments(owner, repo, number)
+        reviews = gh.list_reviews(owner, repo, number)
+        review_comments = gh.list_review_comments(owner, repo, number)
+    except Exception:
+        log.warning(
+            "Failed to fetch PR conversation; continuing without it", exc_info=True
+        )
+        return ""
+    return _format_pr_conversation(
+        issue_comments,
+        reviews,
+        review_comments,
+        max_chars=max_chars,
+        skip_comment_id=skip_comment_id,
+    )
+
+
 class _UnparseableLLMOutput(Exception):
     """The LLM returned content we couldn't parse as JSON. Carries the raw
     content + finish_reason + metrics line so the caller can render an
@@ -1087,6 +1199,17 @@ def prepare_review(
     pr = gh.get_pr(req.owner, req.repo, req.number)
     files = gh.get_pr_files(req.owner, req.repo, req.number)
     _emit("log", f"Fetched PR with {len(files)} changed file(s)")
+
+    conversation = _fetch_pr_conversation(
+        gh,
+        req.owner,
+        req.repo,
+        req.number,
+        max_chars=cfg.max_pr_conversation_chars,
+        skip_comment_id=req.trigger_comment_id or None,
+    )
+    if conversation:
+        _emit("log", f"Including prior PR conversation ({len(conversation)} chars)")
 
     _emit("step", "context")
     ctx_result = run_context_script(
@@ -1205,6 +1328,7 @@ def prepare_review(
             diff=chunk.text,
             extra_context=extra_context,
             runner_context=runner_context,
+            conversation=conversation,
         )
 
         _emit("step", "llm")

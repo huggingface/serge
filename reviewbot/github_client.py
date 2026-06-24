@@ -34,21 +34,46 @@ class GitHubClient:
         return r.json()
 
     def get_pr_files(self, owner: str, repo: str, number: int) -> list[dict]:
-        files: list[dict] = []
+        return self._get_paginated(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files",
+            timeout=60,
+        )
+
+    def list_issue_comments(self, owner: str, repo: str, number: int) -> list[dict]:
+        """Top-level PR discussion (the issues comments timeline). PRs are
+        issues, so this is the general conversation, not inline threads."""
+        return self._get_paginated(
+            f"https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments"
+        )
+
+    def list_review_comments(self, owner: str, repo: str, number: int) -> list[dict]:
+        """Inline review-thread comments (anchored to a path/line)."""
+        return self._get_paginated(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/comments"
+        )
+
+    def list_reviews(self, owner: str, repo: str, number: int) -> list[dict]:
+        """Submitted reviews (APPROVE / REQUEST_CHANGES / COMMENT + body)."""
+        return self._get_paginated(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/reviews"
+        )
+
+    def _get_paginated(self, url: str, *, timeout: int = 30) -> list[dict]:
+        items: list[dict] = []
         page = 1
         while True:
             r = self.session.get(
-                f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files",
-                params={"per_page": 100, "page": page},
-                timeout=60,
+                url, params={"per_page": 100, "page": page}, timeout=timeout
             )
             r.raise_for_status()
             batch = r.json()
-            files.extend(batch)
+            if not isinstance(batch, list):
+                break
+            items.extend(batch)
             if len(batch) < 100:
                 break
             page += 1
-        return files
+        return items
 
     def get_file_contents(
         self, owner: str, repo: str, path: str, ref: Optional[str] = None

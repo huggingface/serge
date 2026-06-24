@@ -9,6 +9,8 @@ from reviewbot.reviewer import (
     _build_annotated_diff_chunks,
     _content_preview,
     _extract_json,
+    _fetch_pr_conversation,
+    _format_pr_conversation,
     _merge_chunk_event,
     _merge_chunk_summaries,
     _run_agentic_loop,
@@ -358,6 +360,149 @@ class InputTokenBudgetTests(unittest.TestCase):
         )
         self.assertEqual(metrics.turns, 1)
         self.assertEqual(len(llm.calls), 1)
+
+
+class FormatPrConversationTests(unittest.TestCase):
+    def test_empty_when_no_comments(self) -> None:
+        self.assertEqual(_format_pr_conversation([], [], [], max_chars=1000), "")
+
+    def test_combines_and_sorts_chronologically(self) -> None:
+        issue = [
+            {
+                "id": 1,
+                "user": {"login": "alice"},
+                "body": "first comment",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        reviews = [
+            {
+                "user": {"login": "bob"},
+                "state": "CHANGES_REQUESTED",
+                "body": "needs work",
+                "submitted_at": "2026-01-02T00:00:00Z",
+            }
+        ]
+        review_comments = [
+            {
+                "user": {"login": "carol"},
+                "body": "tighten this loop",
+                "path": "a.py",
+                "line": 12,
+                "created_at": "2026-01-03T00:00:00Z",
+            }
+        ]
+        out = _format_pr_conversation(issue, reviews, review_comments, max_chars=10_000)
+        # Chronological order: alice -> bob -> carol.
+        self.assertLess(out.index("first comment"), out.index("needs work"))
+        self.assertLess(out.index("needs work"), out.index("tighten this loop"))
+        self.assertIn("@alice commented:", out)
+        self.assertIn("@bob reviewed (CHANGES_REQUESTED):", out)
+        self.assertIn("@carol on a.py:12:", out)
+
+    def test_skips_trigger_comment_and_empty_bodies(self) -> None:
+        issue = [
+            {
+                "id": 99,
+                "user": {"login": "alice"},
+                "body": "@askserge please review",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "id": 100,
+                "user": {"login": "bob"},
+                "body": "   ",
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+        ]
+        out = _format_pr_conversation(
+            issue, [], [], max_chars=10_000, skip_comment_id=99
+        )
+        self.assertEqual(out, "")
+
+    def test_drops_empty_commented_reviews(self) -> None:
+        reviews = [
+            {
+                "user": {"login": "x"},
+                "state": "COMMENTED",
+                "body": "",
+                "submitted_at": "t",
+            },
+            {
+                "user": {"login": "y"},
+                "state": "APPROVED",
+                "body": "",
+                "submitted_at": "u",
+            },
+        ]
+        out = _format_pr_conversation([], reviews, [], max_chars=10_000)
+        # Empty COMMENTED is noise and dropped; an explicit APPROVED is kept.
+        self.assertNotIn("@x", out)
+        self.assertIn("@y reviewed (APPROVED)", out)
+
+    def test_budget_keeps_newest_and_notes_omitted(self) -> None:
+        issue = [
+            {
+                "id": i,
+                "user": {"login": f"u{i}"},
+                "body": f"comment-{i} " + "x" * 100,
+                "created_at": f"2026-01-{i:02d}T00:00:00Z",
+            }
+            for i in range(1, 6)
+        ]
+        out = _format_pr_conversation(issue, [], [], max_chars=250)
+        # Newest (comment-5) survives; oldest (comment-1) is dropped.
+        self.assertIn("comment-5", out)
+        self.assertNotIn("comment-1", out)
+        self.assertIn("earlier comment(s) omitted", out)
+
+    def test_fetch_is_best_effort_on_api_error(self) -> None:
+        class _BoomClient:
+            def list_issue_comments(self, *a, **k):
+                raise RuntimeError("boom")
+
+            def list_reviews(self, *a, **k):
+                return []
+
+            def list_review_comments(self, *a, **k):
+                return []
+
+        out = _fetch_pr_conversation(
+            _BoomClient(),  # type: ignore[arg-type]
+            "o",
+            "r",
+            1,
+            max_chars=1000,
+        )
+        self.assertEqual(out, "")
+
+    def test_fetch_disabled_when_budget_zero(self) -> None:
+        class _CountingClient:
+            def __init__(self):
+                self.called = False
+
+            def list_issue_comments(self, *a, **k):
+                self.called = True
+                return []
+
+            def list_reviews(self, *a, **k):
+                self.called = True
+                return []
+
+            def list_review_comments(self, *a, **k):
+                self.called = True
+                return []
+
+        client = _CountingClient()
+        out = _fetch_pr_conversation(
+            client,  # type: ignore[arg-type]
+            "o",
+            "r",
+            1,
+            max_chars=0,
+        )
+        self.assertEqual(out, "")
+        self.assertFalse(client.called)
 
 
 if __name__ == "__main__":

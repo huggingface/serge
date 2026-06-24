@@ -54,6 +54,19 @@ class ConfigTests(unittest.TestCase):
 
         self.assertTrue(cfg.is_staging)
 
+    def test_pr_conversation_chars_default_and_override(self) -> None:
+        with patch.dict(os.environ, {"LLM_API_KEY": "token"}, clear=True):
+            cfg = Config.from_env(require_app=False)
+        self.assertEqual(cfg.max_pr_conversation_chars, 16_000)
+
+        with patch.dict(
+            os.environ,
+            {"LLM_API_KEY": "token", "MAX_PR_CONVERSATION_CHARS": "0"},
+            clear=True,
+        ):
+            cfg = Config.from_env(require_app=False)
+        self.assertEqual(cfg.max_pr_conversation_chars, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
