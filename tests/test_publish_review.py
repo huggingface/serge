@@ -11,6 +11,7 @@ from reviewbot.reviewer import (
     ReviewDraft,
     ReviewEdits,
     ReviewRequest,
+    _UnparseableLLMOutput,
     publish_review,
     run_review,
 )
@@ -229,6 +230,32 @@ class PublishReviewTests(unittest.TestCase):
             run_review(cfg, gh, req, force_comment_event=True)
 
         self.assertEqual(gh.create_review.call_args.kwargs["event"], "COMMENT")
+
+    def test_run_review_posts_unparseable_failure_to_pr(self) -> None:
+        cfg = _make_cfg()
+        gh = MagicMock()
+        req = ReviewRequest(
+            owner="acme",
+            repo="widgets",
+            number=42,
+            trigger_comment_id=123,
+            trigger_comment_body="@askserge please review",
+            commenter="reviewer",
+        )
+        err = _UnparseableLLMOutput(
+            "partial model output",
+            "length",
+            "13 LLM turns · 12 tool calls · 234.9s · 164024 in / 51215 out tokens",
+        )
+
+        with patch("reviewbot.reviewer.prepare_review", side_effect=err):
+            run_review(cfg, gh, req, force_comment_event=True)
+
+        gh.post_issue_comment.assert_called_once()
+        owner, repo, number, body = gh.post_issue_comment.call_args.args
+        self.assertEqual((owner, repo, number), ("acme", "widgets", 42))
+        self.assertIn("LLM response was truncated", body)
+        self.assertIn("partial model output", body)
 
 
 if __name__ == "__main__":

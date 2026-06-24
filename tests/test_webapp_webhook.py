@@ -7,7 +7,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 try:
     from fastapi.testclient import TestClient
@@ -161,6 +161,53 @@ class WebappWebhookTests(unittest.TestCase):
         self.assertEqual(cfg.llm_api_key, "db-anthropic-key")
         self.assertEqual(cfg.llm_api_base, "https://api.anthropic.com")
         self.assertEqual(cfg.llm_model, "claude-opus-4-6")
+
+    def test_auto_published_webhook_posts_unparseable_failure_to_pr(self) -> None:
+        webapp = self._import_webapp()
+        job = webapp.Job(
+            id="job-1",
+            user="reviewer",
+            target_owner="acme",
+            target_repo="widgets",
+            target_number=42,
+            trigger_comment="@askserge please review",
+            llm_provider="hf",
+            llm_api_base="https://router.huggingface.co/v1",
+            llm_model="moonshotai/Kimi-K2.6",
+            created_at=1.0,
+            llm_api_key="llm-token",
+            source="webhook",
+        )
+        req = webapp.ReviewRequest(
+            owner="acme",
+            repo="widgets",
+            number=42,
+            trigger_comment_id=123,
+            trigger_comment_body="@askserge please review",
+            commenter="reviewer",
+        )
+        err = webapp._UnparseableLLMOutput(
+            "partial model output",
+            "length",
+            "13 LLM turns · 12 tool calls · 234.9s · 164024 in / 51215 out tokens",
+        )
+        gh = Mock()
+
+        with (
+            patch.object(webapp, "_bool_env_safe", return_value=True),
+            patch.object(webapp, "prepare_review", side_effect=err),
+        ):
+            webapp._execute_review(
+                job, webapp.cfg, gh, "github-token", req, auto_publish=True
+            )
+
+        self.assertEqual(job.status, "error")
+        gh.post_issue_comment.assert_called_once()
+        owner, repo, number, body = gh.post_issue_comment.call_args.args
+        self.assertEqual((owner, repo, number), ("acme", "widgets", 42))
+        self.assertIn("Serge review failed", body)
+        self.assertIn("LLM response was truncated", body)
+        self.assertIn("partial model output", body)
 
 
 class HfModelsTests(unittest.TestCase):

@@ -9,7 +9,7 @@
 
 image:
   # Bump to a newer sha-<commit> (pushed by CI on merge to main) or use latest.
-  tag: sha-87227fd
+  tag: sha-34bbe8d
 
 replicas: 1
 

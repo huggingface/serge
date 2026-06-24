@@ -468,6 +468,7 @@ def _run_webhook_review_worker(
     Mirrors the UI worker (streaming events into the job so the review
     page can follow live), but auto-publishes the result to GitHub —
     there is no human in the loop to edit + publish a draft."""
+    gh: Optional[GitHubClient] = None
     try:
         assert cfg.github_app_id and cfg.github_private_key
         token = installation_token(
@@ -493,6 +494,10 @@ def _run_webhook_review_worker(
         job.status = "error"
         job.raw_llm_output = exc.content
         job.error = exc.user_message()
+        if gh is not None:
+            _post_webhook_failure_comment(
+                gh, req, job.error, raw_output=job.raw_llm_output
+            )
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -500,6 +505,8 @@ def _run_webhook_review_worker(
         log.warning("App not installed for %s/%s (job %s)", exc.owner, exc.repo, job.id)
         job.status = "error"
         job.error = str(exc)
+        if gh is not None:
+            _post_webhook_failure_comment(gh, req, job.error)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -512,6 +519,8 @@ def _run_webhook_review_worker(
         )
         job.status = "error"
         job.error = _format_llm_error(exc)
+        if gh is not None:
+            _post_webhook_failure_comment(gh, req, job.error)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -519,6 +528,8 @@ def _run_webhook_review_worker(
         log.exception("webhook review worker crashed for job %s", job.id)
         job.status = "error"
         job.error = f"{type(exc).__name__}: review crashed (see server log)"
+        if gh is not None:
+            _post_webhook_failure_comment(gh, req, job.error)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -803,6 +814,33 @@ def _format_llm_error(exc: LLMResponseError) -> str:
     return f"LLM endpoint returned {exc.status_code}{reason_part}"
 
 
+def _post_webhook_failure_comment(
+    gh: GitHubClient,
+    req: ReviewRequest,
+    message: str,
+    *,
+    raw_output: Optional[str] = None,
+) -> None:
+    body = f"⚠️ Serge review failed: {message}"
+    if raw_output:
+        body += f"\n\n```\n{raw_output[:3000]}\n```"
+    try:
+        if req.inline is not None:
+            gh.reply_to_review_comment(
+                req.owner, req.repo, req.number, req.inline.comment_id, body
+            )
+        else:
+            gh.post_issue_comment(req.owner, req.repo, req.number, body)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "failed to post webhook failure comment for %s/%s#%d: %s",
+            req.owner,
+            req.repo,
+            req.number,
+            exc,
+        )
+
+
 def _format_github_http_error(exc: requests.HTTPError) -> str:
     """Render a GitHub REST error for the task SSE client. The message comes
     from GitHub's own response (no serge tokens), so it's safe to surface and
@@ -910,6 +948,10 @@ def _execute_review(
         job.status = "error"
         job.raw_llm_output = exc.content
         job.error = exc.user_message()
+        if auto_publish:
+            _post_webhook_failure_comment(
+                gh, req, job.error, raw_output=job.raw_llm_output
+            )
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -920,6 +962,8 @@ def _execute_review(
         log.warning("App not installed for %s/%s (job %s)", exc.owner, exc.repo, job.id)
         job.status = "error"
         job.error = str(exc)
+        if auto_publish:
+            _post_webhook_failure_comment(gh, req, job.error)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -932,6 +976,8 @@ def _execute_review(
         )
         job.status = "error"
         job.error = _format_llm_error(exc)
+        if auto_publish:
+            _post_webhook_failure_comment(gh, req, job.error)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -943,6 +989,8 @@ def _execute_review(
         # the raw repr to the SSE client — the full traceback is in the
         # server log via log.exception above.
         job.error = f"{type(exc).__name__}: review crashed (see server log)"
+        if auto_publish:
+            _post_webhook_failure_comment(gh, req, job.error)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
