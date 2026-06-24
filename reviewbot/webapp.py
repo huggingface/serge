@@ -896,14 +896,16 @@ def _execute_review(
         job.draft = draft
         if auto_publish:
             _push_event(job, "log", "Publishing review to GitHub…")
-            publish_review(worker_cfg, gh, draft)
+            # Store the effective draft publish_review actually posted (e.g.
+            # APPROVE downgraded to COMMENT) so the audit log doesn't claim
+            # an approval GitHub never received.
+            job.published_draft = publish_review(worker_cfg, gh, draft)
             job.status = "published"
-            job.published_draft = draft
             _push_event(
                 job,
                 "log",
-                f"Published review: {len(draft.comments)} inline comment(s), "
-                f"event={draft.event}",
+                f"Published review: {len(job.published_draft.comments)} inline "
+                f"comment(s), event={job.published_draft.event}",
             )
         else:
             job.status = "done"
@@ -2520,10 +2522,12 @@ async def publish(
         cfg.github_app_id, cfg.github_private_key, installation_id
     )
     gh = GitHubClient(token)
-    publish_review(cfg, gh, job.draft, edits=edits)
+    # Persist exactly what publish_review posted — including any APPROVE ->
+    # COMMENT downgrade — instead of re-deriving the draft separately (which
+    # could drift from the publish path).
+    job.published_draft = publish_review(cfg, gh, job.draft, edits=edits)
     job.status = "published"
     job.review_edits = _review_edits_to_dict(edits)
-    job.published_draft = _apply_review_edits(job.draft, edits)
     _store.update_status(job.id, "published")
     _store.save_published_review(
         job.id,
@@ -2574,28 +2578,6 @@ def _review_edits_to_dict(edits: ReviewEdits) -> dict[str, Any]:
         "comment_overrides": dict(edits.comment_overrides),
         "discarded_comment_ids": sorted(edits.discarded_comment_ids),
     }
-
-
-def _apply_review_edits(draft: ReviewDraft, edits: ReviewEdits) -> ReviewDraft:
-    comments: list[DraftComment] = []
-    for comment in draft.comments:
-        if comment.id in edits.discarded_comment_ids:
-            continue
-        body = edits.comment_overrides.get(comment.id, comment.body)
-        if not isinstance(body, str) or not body.strip():
-            continue
-        comments.append(dataclasses.replace(comment, body=body))
-
-    event = edits.event or draft.event
-    if event not in ("COMMENT", "REQUEST_CHANGES", "APPROVE"):
-        event = draft.event
-
-    return dataclasses.replace(
-        draft,
-        summary=edits.summary if edits.summary is not None else draft.summary,
-        event=event,
-        comments=comments,
-    )
 
 
 @app.post("/reviews/{owner}/{repo}/{number}/{job_id}/discard")

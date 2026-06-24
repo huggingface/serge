@@ -11,6 +11,13 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from reviewbot.reviewer import (
+    DraftComment,
+    ReviewDraft,
+    ReviewEdits,
+    effective_draft,
+)
+
 try:
     from fastapi import HTTPException
     from fastapi.testclient import TestClient
@@ -119,8 +126,9 @@ class WebappReviewsTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["default_max_input_tokens"], 2000000)
 
-    def test_apply_review_edits_materializes_published_draft(self):
-        draft = self.webapp.ReviewDraft(
+    # --- effective_draft (single source of truth for what gets posted) ---
+    def _sample_draft(self, **overrides):
+        kwargs = dict(
             owner="acme",
             repo="widgets",
             number=7,
@@ -128,36 +136,141 @@ class WebappReviewsTests(unittest.TestCase):
             summary="generated summary",
             event="COMMENT",
             comments=[
-                self.webapp.DraftComment(
-                    id="c1",
-                    path="a.py",
-                    side="RIGHT",
-                    line=10,
-                    body="generated body",
+                DraftComment(
+                    id="c1", path="a.py", side="RIGHT", line=10, body="generated body"
                 ),
-                self.webapp.DraftComment(
-                    id="c2",
-                    path="b.py",
-                    side="RIGHT",
-                    line=20,
-                    body="discard me",
+                DraftComment(
+                    id="c2", path="b.py", side="RIGHT", line=20, body="discard me"
                 ),
             ],
         )
-        edits = self.webapp.ReviewEdits(
+        kwargs.update(overrides)
+        return ReviewDraft(**kwargs)
+
+    def test_effective_draft_materializes_edits(self):
+        draft = self._sample_draft()
+        edits = ReviewEdits(
             summary="edited summary",
             event="REQUEST_CHANGES",
             comment_overrides={"c1": "edited body"},
             discarded_comment_ids={"c2"},
         )
 
-        published = self.webapp._apply_review_edits(draft, edits)
+        published = effective_draft(draft, edits, allow_approve=True)
 
         self.assertEqual(published.summary, "edited summary")
         self.assertEqual(published.event, "REQUEST_CHANGES")
         self.assertEqual(len(published.comments), 1)
         self.assertEqual(published.comments[0].id, "c1")
         self.assertEqual(published.comments[0].body, "edited body")
+
+    def test_effective_draft_downgrades_approve_when_disallowed(self):
+        # The generated draft asks to APPROVE and the user leaves it
+        # untouched. With allow_approve off, GitHub receives COMMENT, so the
+        # effective (= published) draft must reflect COMMENT too.
+        draft = self._sample_draft(event="APPROVE")
+
+        published = effective_draft(draft, None, allow_approve=False)
+
+        self.assertEqual(published.event, "COMMENT")
+
+    def test_effective_draft_keeps_approve_when_allowed(self):
+        draft = self._sample_draft(event="APPROVE")
+
+        published = effective_draft(draft, None, allow_approve=True)
+
+        self.assertEqual(published.event, "APPROVE")
+
+    # --- _review_changes (audit diff between generated and published) -----
+    def test_review_changes_event_and_summary(self):
+        generated = self._sample_draft(event="APPROVE")
+        published = self._sample_draft(event="COMMENT", summary="edited")
+        changes = self.webapp._review_changes(generated, published)
+        self.assertTrue(changes["event"])
+        self.assertTrue(changes["summary"])
+        self.assertEqual(changes["edited_comment_ids"], [])
+        self.assertEqual(changes["discarded_comment_ids"], [])
+
+    def test_review_changes_edited_comment(self):
+        generated = self._sample_draft()
+        published = effective_draft(
+            generated,
+            ReviewEdits(comment_overrides={"c1": "edited body"}),
+            allow_approve=True,
+        )
+        changes = self.webapp._review_changes(generated, published)
+        self.assertEqual(changes["edited_comment_ids"], ["c1"])
+        self.assertEqual(changes["discarded_comment_ids"], [])
+
+    def test_review_changes_discarded_comment(self):
+        generated = self._sample_draft()
+        published = effective_draft(
+            generated,
+            ReviewEdits(discarded_comment_ids={"c2"}),
+            allow_approve=True,
+        )
+        changes = self.webapp._review_changes(generated, published)
+        self.assertEqual(changes["discarded_comment_ids"], ["c2"])
+        self.assertEqual(changes["edited_comment_ids"], [])
+
+    def test_review_changes_no_changes(self):
+        generated = self._sample_draft()
+        published = effective_draft(generated, None, allow_approve=True)
+        changes = self.webapp._review_changes(generated, published)
+        self.assertFalse(changes["summary"])
+        self.assertFalse(changes["event"])
+        self.assertEqual(changes["edited_comment_ids"], [])
+        self.assertEqual(changes["discarded_comment_ids"], [])
+
+    # --- audit endpoint payload shape ------------------------------------
+    def test_review_draft_endpoint_returns_audit(self):
+        generated = self._sample_draft(event="APPROVE")
+        published = effective_draft(generated, None, allow_approve=False)
+        job = self.webapp.Job(
+            id="job-audit-1",
+            user="dev",
+            target_owner="acme",
+            target_repo="widgets",
+            target_number=7,
+            trigger_comment="@askserge please review",
+            llm_provider="hf",
+            llm_api_base="",
+            llm_model="some-model",
+            created_at=0.0,
+            source="webhook",
+            status="published",
+            draft=generated,
+            published_draft=published,
+            review_edits={
+                "summary": None,
+                "event": None,
+                "comment_overrides": {},
+                "discarded_comment_ids": [],
+            },
+        )
+        with self.webapp._jobs_lock:
+            self.webapp._jobs[job.id] = job
+
+        client = TestClient(self.webapp.app)
+        r = client.get("/reviews/acme/widgets/7/job-audit-1/draft")
+        self.assertEqual(r.status_code, 200, r.text)
+        audit = r.json()["audit"]
+        self.assertEqual(
+            set(audit),
+            {
+                "trigger_comment",
+                "generated_draft",
+                "published_draft",
+                "review_edits",
+                "changes",
+                "trace",
+            },
+        )
+        self.assertEqual(audit["trigger_comment"], "@askserge please review")
+        self.assertEqual(audit["generated_draft"]["event"], "APPROVE")
+        self.assertEqual(audit["published_draft"]["event"], "COMMENT")
+        # The APPROVE -> COMMENT downgrade must surface as an event change.
+        self.assertTrue(audit["changes"]["event"])
 
 
 if __name__ == "__main__":
