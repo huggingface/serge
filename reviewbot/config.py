@@ -166,6 +166,11 @@ class Config:
     task_tool_max_iterations: Optional[int] = None
     # Cap on serge-authored commits per fix branch (follow-up loop guard).
     task_max_followups: int = 5
+    # Optional Slack notification for PRs created by the /tasks flow.
+    # Defaults to the org-level CI feedback Slack secrets; the transformers CI
+    # names remain supported as fallbacks.
+    slack_bot_token: Optional[str] = None
+    slack_report_channel: Optional[str] = None
 
     @classmethod
     def from_env(
@@ -327,4 +332,16 @@ class Config:
             ),
             task_tool_max_iterations=(_int_env("TASK_TOOL_MAX_ITERATIONS", 0) or None),
             task_max_followups=_int_env("TASK_MAX_FOLLOWUPS", 5),
+            slack_bot_token=(
+                os.environ.get("SLACK_CIFEEDBACK_BOT_TOKEN")
+                or os.environ.get("CI_SLACK_BOT_TOKEN")
+                or ""
+            ).strip()
+            or None,
+            slack_report_channel=(
+                os.environ.get("SLACK_CIFEEDBACK_CHANNEL")
+                or os.environ.get("SLACK_REPORT_CHANNEL")
+                or ""
+            ).strip()
+            or None,
         )

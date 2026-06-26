@@ -58,6 +58,7 @@ from .reviewer import (
     publish_review,
     run_followup,
 )
+from .slack_tool import post_task_finished_notification
 from .store import JobStore, decode_draft
 from .tasks import (
     TaskError,
@@ -298,7 +299,10 @@ class Job:
     # For task jobs: the inbound spec and the published outcome.
     task_spec: Optional[dict[str, Any]] = None
     task_result: Optional[dict[str, Any]] = None
-    status: str = "running"  # running | done | error | discarded | published
+    # running | done | error | discarded | published | no_fix
+    # Tasks end as "published" (a PR/commit landed) or "no_fix" (completed but
+    # serge proposed no patch); reviews use done/published/discarded.
+    status: str = "running"
     draft: Optional[ReviewDraft] = None
     review_edits: Optional[dict[str, Any]] = None
     published_draft: Optional[ReviewDraft] = None
@@ -1198,7 +1202,12 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             )
         job.task_result = result.to_json()
         _store.save_task_result(job.id, _json.dumps(job.task_result))
-        job.status = "done"
+        # A task only counts as "published" when serge actually wrote to GitHub
+        # (opened a PR or pushed a follow-up commit). When the LLM proposes no
+        # safe patch the task still completes cleanly but produces nothing —
+        # surface that as "no_fix" so the journal/dashboard doesn't conflate a
+        # group serge couldn't fix with one that produced a PR.
+        job.status = "no_fix" if result.no_change else "published"
         emit("log", result.message)
         emit("step", "done")
         emit("done", "")
@@ -1250,8 +1259,30 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         emit("error", job.error)
         emit("done", "")
     finally:
+        _notify_task_finished(worker_cfg, req, job)
         _clone_cache.release(checkout)
         _persist_terminal(job)
+
+
+def _notify_task_finished(worker_cfg: Config, req: TaskRequest, job: Job) -> None:
+    if not req.slack_notify_task_finished:
+        return
+    result = job.task_result or {}
+    try:
+        pr_number = result.get("pr_number") or req.pr_number
+        post_task_finished_notification(
+            token=worker_cfg.slack_bot_token,
+            channel=req.slack_channel or worker_cfg.slack_report_channel,
+            repo_full_name=req.repo_full_name,
+            status=job.status,
+            message=result.get("message") or job.error or "",
+            pr_number=pr_number,
+            pr_url=result.get("url"),
+            job_id=job.id,
+            error=job.error,
+        )
+    except Exception:
+        log.debug("failed to notify Slack for finished task %s", job.id, exc_info=True)
 
 
 def _bool_env_safe(name: str, default: bool) -> bool:

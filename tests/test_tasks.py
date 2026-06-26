@@ -6,6 +6,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from reviewbot.clone_cache import CloneCache
 from reviewbot.config import Config
@@ -153,6 +154,42 @@ class BuildTaskRequestTests(unittest.TestCase):
         with self.assertRaises(TaskError):
             build_task_request(
                 {"instruction": "x", "output": {"branch_prefix": "evil/x"}},
+                owner="a",
+                repo="b",
+            )
+
+    def test_notifications_slack_channel_is_dynamic(self):
+        req = build_task_request(
+            {
+                "instruction": "x",
+                "notifications": {
+                    "slack_channel": "#transformers-ci-daily-models",
+                    "task_finished": True,
+                    "pr_created": False,
+                },
+            },
+            owner="a",
+            repo="b",
+        )
+        self.assertEqual(req.slack_channel, "#transformers-ci-daily-models")
+        self.assertTrue(req.slack_notify_task_finished)
+        self.assertFalse(req.slack_notify_pr_created)
+
+    def test_notifications_must_be_object(self):
+        with self.assertRaises(TaskError):
+            build_task_request(
+                {"instruction": "x", "notifications": "#ci"},
+                owner="a",
+                repo="b",
+            )
+
+    def test_notification_booleans_must_be_boolean(self):
+        with self.assertRaises(TaskError):
+            build_task_request(
+                {
+                    "instruction": "x",
+                    "notifications": {"task_finished": ["yes"]},
+                },
                 owner="a",
                 repo="b",
             )
@@ -333,21 +370,55 @@ class PublishTaskTests(unittest.TestCase):
         )
         plan = TaskPlan(title="Fix hello", body="desc", patch=self._PATCH)
         gh = _FakeGH()
-        result = publish_task(
-            self.cfg,
-            gh,
-            req,
-            plan,
-            checkout=co,
-            clone_cache=self.cache,
-            job_id="abcd1234",
-        )
+        with patch("reviewbot.tasks.post_task_pr_created_notification") as notify:
+            result = publish_task(
+                self.cfg,
+                gh,
+                req,
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
         self.assertFalse(result.no_change)
         self.assertEqual(result.pr_number, 99)
         self.assertEqual(result.branch, "serge/fix-abcd1234")
         self.assertEqual(gh.created_refs[0][0], "refs/heads/serge/fix-abcd1234")
         self.assertEqual(gh.created_pr["base"], "main")
         self.assertEqual(result.changed_files, ["hello.txt"])
+        notify.assert_called_once()
+
+    def test_new_pr_notification_uses_request_slack_channel(self):
+        co = self._checkout("main")
+        req = TaskRequest(
+            owner="acme",
+            repo="widget",
+            base_ref="main",
+            instruction="fix",
+            context="",
+            mode="new_pr",
+            slack_channel="#dynamic-ci",
+            slack_notify_task_finished=True,
+        )
+        plan = TaskPlan(title="Fix hello", body="desc", patch=self._PATCH)
+        gh = _FakeGH()
+        cfg = _make_cfg(
+            slack_bot_token="tok",
+            slack_report_channel="#default-ci",
+        )
+        with patch("reviewbot.tasks.post_task_pr_created_notification") as notify:
+            publish_task(
+                cfg,
+                gh,
+                req,
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+
+        self.assertEqual(notify.call_args.kwargs["token"], "tok")
+        self.assertEqual(notify.call_args.kwargs["channel"], "#dynamic-ci")
 
     def test_existing_pr_flow(self):
         co = self._checkout("serge/fix-1")
