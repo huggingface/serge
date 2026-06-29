@@ -66,8 +66,10 @@ from .tasks import (
     TaskRequest,
     build_task_request,
     prepare_task,
+    publish_command_result,
     publish_task,
     resolve_existing_pr,
+    run_command_task,
     task_candidate_requests,
 )
 from .triggers import build_review_request
@@ -422,12 +424,16 @@ def _bearer_token(request: Request) -> str:
 
 
 def _resolve_task_worker_cfg(
-    owner: str, repo: str
+    owner: str, repo: str, *, require_llm_key: bool = True
 ) -> tuple[Config, str, str, Optional[str]]:
     """Resolve the LLM credentials a task should run with, requiring a
     provider_config that has opted this repo into the write-capable flow
     (``task_write_enabled``). Raises HTTPException(403) when no such config
-    exists. Returns ``(worker_cfg, provider, api_base, model)``."""
+    exists. Returns ``(worker_cfg, provider, api_base, model)``.
+
+    ``require_llm_key`` is False for command tasks: they run a deterministic
+    command with no LLM, so the per-repo write opt-in is still required but a
+    usable API key is not."""
     matched = _store.find_provider_config_for_repo(owner=owner, repo=repo)
     if matched is None or not matched.get("task_write_enabled"):
         raise HTTPException(
@@ -440,7 +446,7 @@ def _resolve_task_worker_cfg(
         )
     provider = matched["provider"]
     llm_api_key = (matched.get("api_key") or "").strip()
-    if not llm_api_key:
+    if not llm_api_key and require_llm_key:
         raise HTTPException(
             status_code=403, detail="provider config for this repo has no API key"
         )
@@ -1148,6 +1154,32 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             )
         emit("log", f"Checkout ready in {time.monotonic() - t0:.1f}s")
         worker_cfg = dataclasses.replace(worker_cfg, repo_checkout_path=checkout.path)
+
+        # Command task: run the allowlisted command deterministically (no LLM,
+        # no candidate splitting) and commit whatever it changed in the tree.
+        if req.is_command:
+            changes, _output_tail = run_command_task(
+                worker_cfg,
+                req,
+                checkout=checkout,
+                clone_cache=_clone_cache,
+                emit=emit,
+            )
+            cmd_result = publish_command_result(
+                worker_cfg,
+                gh,
+                req,
+                changes=changes,
+                job_id=job.id,
+                emit=emit,
+            )
+            job.task_result = cmd_result.to_json()
+            _store.save_task_result(job.id, _json.dumps(job.task_result))
+            job.status = "no_fix" if cmd_result.no_change else "published"
+            emit("log", cmd_result.message)
+            emit("step", "done")
+            emit("done", "")
+            return
 
         candidate_reqs = task_candidate_requests(req)
         last_no_change: Optional[TaskResult] = None
@@ -2171,13 +2203,19 @@ async def submit_task(request: Request) -> JSONResponse:
     if body_repo and body_repo.lower() != claims.repository.lower():
         raise HTTPException(status_code=403, detail="repo_claim_mismatch")
 
+    # Command tasks (deterministic, no LLM) are gated by a separate flag and
+    # an exact-match allowlist. Pass the allowlist only when enabled so a
+    # command request on a deployment with the feature off is cleanly rejected.
+    allowed_commands = cfg.task_command_allowlist if cfg.task_command_enabled else ()
     try:
-        req = build_task_request(payload, owner=owner, repo=repo)
+        req = build_task_request(
+            payload, owner=owner, repo=repo, allowed_commands=allowed_commands
+        )
     except TaskError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc))
 
     worker_cfg, provider, llm_api_base, llm_model = _resolve_task_worker_cfg(
-        owner, repo
+        owner, repo, require_llm_key=not req.is_command
     )
 
     spec_summary = {
@@ -2187,6 +2225,7 @@ async def submit_task(request: Request) -> JSONResponse:
         "branch_prefix": req.branch_prefix,
         "instruction": req.instruction[:1000],
         "context_chars": len(req.context),
+        "command": req.command_str or None,
         "actor": claims.actor,
         "workflow_ref": claims.workflow_ref,
     }

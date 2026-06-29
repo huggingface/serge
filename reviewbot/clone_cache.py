@@ -439,6 +439,17 @@ class CloneCache:
         finally:
             os.unlink(patch_path)
 
+    def stage_all(self, checkout: Checkout) -> None:
+        """Stage every worktree change (``git add -A``).
+
+        :meth:`apply_patch` stages as it applies (``--index``), but a command
+        task writes the worktree directly (e.g. ``make fix-repo`` rewriting
+        files), leaving the index untouched. Staging first makes those edits
+        visible to :meth:`collect_changes`, which diffs the index against
+        HEAD. ``git add`` honours the repo's ``.gitignore``, so build
+        artifacts the repo already ignores are not picked up."""
+        self._git(checkout.path, "add", "-A", timeout=120)
+
     def collect_changes(self, checkout: Checkout) -> list[FileChange]:
         """Return the set of files changed in the index relative to its HEAD
         commit (i.e. what :meth:`apply_patch` just staged). New/modified

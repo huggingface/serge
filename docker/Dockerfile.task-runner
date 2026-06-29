@@ -1,0 +1,44 @@
+# Example command-task runner image.
+#
+# A command task (POST /tasks with a `command` field) runs an allowlisted
+# command — e.g. `make fix-repo` — against a checkout of the target repo,
+# inside a throwaway, network-isolated container, and serge commits whatever
+# the command changed in the worktree. This image is that container: it must
+# carry the target repo's toolchain so the command runs WITHOUT network at
+# run time (serge runs it with `docker --network none`).
+#
+# This example targets huggingface/transformers `make fix-repo`, which only
+# needs the `[quality]` extra (ruff, ty, libcst, GitPython, datasets, rich,
+# tomli, transformers-mlinter) plus setuptools — NOT torch or any model deps.
+# See the transformers analysis: fix-repo's fix-mode checkers are all
+# source/AST based and run fine on `.[quality]` alone.
+#
+# Build (pin the ref so the toolchain versions match the PRs you fix):
+#   docker build -f docker/Dockerfile.task-runner \
+#     --build-arg TRANSFORMERS_REF=main \
+#     -t serge/transformers-quality:latest .
+#
+# Then point serge at it:  TASK_COMMAND_IMAGE=serge/transformers-quality:latest
+FROM python:3.10-slim
+
+# git + make are needed by `make fix-repo`; build-essential is not (the
+# quality toolchain is pure-python wheels). ca-certificates only matters at
+# build time (run time has no network).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git make ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the quality toolchain. Installing the extra from a pinned ref keeps
+# the tool versions (ruff==…, ty==…) in lockstep with the repo's setup.py, so
+# `make fix-repo` produces the same output the repo's own CI would.
+# setuptools is required by `python setup.py deps_table_update` and is not in
+# slim images by default.
+ARG TRANSFORMERS_REF=main
+RUN pip install --no-cache-dir setuptools \
+    && pip install --no-cache-dir \
+       "transformers[quality] @ git+https://github.com/huggingface/transformers.git@${TRANSFORMERS_REF}"
+
+# serge runs the container as the host uid:gid (so files written into the
+# bind-mounted worktree are owned by serge, not root) and overrides the
+# workdir to the checkout path, so no USER / WORKDIR / ENTRYPOINT is needed
+# here. The command (e.g. `make fix-repo`) is supplied by serge at run time.

@@ -20,12 +20,13 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from . import __version__
-from .clone_cache import Checkout, CloneCache
+from . import __version__, sandbox
+from .clone_cache import Checkout, CloneCache, FileChange
 from .compression import MessageCompressor
 from .config import Config
 from .github_client import SERGE_GIT_EMAIL, GitHubClient
@@ -39,6 +40,7 @@ from .reviewer import (
     _UnparseableLLMOutput,
 )
 from .slack_tool import post_task_pr_created_notification
+from .tools import _helper_subprocess_env
 
 log = logging.getLogger(__name__)
 
@@ -93,10 +95,22 @@ class TaskRequest:
     slack_notify_task_finished: bool = False
     # Resolved during processing (existing_pr): the PR's head branch.
     head_branch: Optional[str] = None
+    # Command task: the allowlisted argv to run (e.g. ``["make", "fix-repo"]``).
+    # When set, serge runs this deterministically instead of the LLM loop —
+    # the command's worktree edits ARE the patch. None for an LLM task.
+    command: Optional[list[str]] = None
 
     @property
     def repo_full_name(self) -> str:
         return f"{self.owner}/{self.repo}"
+
+    @property
+    def is_command(self) -> bool:
+        return self.command is not None
+
+    @property
+    def command_str(self) -> str:
+        return " ".join(self.command or [])
 
 
 @dataclass
@@ -162,17 +176,62 @@ def task_candidate_requests(req: TaskRequest) -> list[TaskRequest]:
 # ---------------------------------------------------------------------------
 # Request building / validation
 # ---------------------------------------------------------------------------
+def _parse_command(
+    payload: dict[str, Any], allowed_commands: tuple[str, ...]
+) -> Optional[list[str]]:
+    """Validate an optional ``command`` field into an argv, or return None.
+
+    A command task names a single command (string or argv list). It is
+    accepted only if its normalized string form is in ``allowed_commands`` —
+    the caller picks from a fixed operator-defined menu and cannot pass
+    arbitrary commands or extra arguments. Raises :class:`TaskError` when a
+    command is present but not allowed."""
+    raw = payload.get("command")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        command_str = raw.strip()
+        argv = shlex.split(command_str)
+    elif isinstance(raw, list) and all(isinstance(p, str) for p in raw):
+        argv = [p for p in raw]
+        command_str = " ".join(argv)
+    else:
+        raise TaskError("command must be a string or a list of strings")
+    if not argv:
+        raise TaskError("command must not be empty")
+    if command_str not in allowed_commands:
+        raise TaskError(
+            f"command {command_str!r} is not in the allowlist for this deployment",
+            status_code=403,
+        )
+    return argv
+
+
 def build_task_request(
-    payload: dict[str, Any], *, owner: str, repo: str
+    payload: dict[str, Any],
+    *,
+    owner: str,
+    repo: str,
+    allowed_commands: tuple[str, ...] = (),
 ) -> TaskRequest:
     """Validate an inbound /tasks payload into a TaskRequest.
 
     ``owner``/``repo`` come from the verified OIDC ``repository`` claim and
     are authoritative; any ``repo`` in the body must match (checked by the
-    caller). Raises :class:`TaskError` on malformed input."""
+    caller). ``allowed_commands`` is the deployment's command-task allowlist;
+    a ``command`` field is validated against it. Raises :class:`TaskError` on
+    malformed input."""
+    command = _parse_command(payload, allowed_commands)
+
     instruction = (payload.get("instruction") or "").strip()
     if not instruction:
-        raise TaskError("instruction is required")
+        if command is not None:
+            # A command task is self-describing; the command IS the work.
+            instruction = (
+                f"Run `{' '.join(command)}` and open a PR with the resulting changes."
+            )
+        else:
+            raise TaskError("instruction is required")
     context = payload.get("context")
     if context is not None and not isinstance(context, str):
         raise TaskError("context must be a string")
@@ -231,6 +290,7 @@ def build_task_request(
         slack_channel=slack_channel,
         slack_notify_pr_created=slack_notify_pr_created,
         slack_notify_task_finished=slack_notify_task_finished,
+        command=command,
     )
 
 
@@ -456,6 +516,101 @@ def _decorate_body(cfg: Config, plan: TaskPlan, req: TaskRequest) -> str:
     return body
 
 
+def _commit_changes(
+    cfg: Config,
+    gh: GitHubClient,
+    req: TaskRequest,
+    *,
+    changes: list[FileChange],
+    title: str,
+    body: str,
+    job_id: str,
+    emit_fn: Callable[[str, str], None],
+) -> TaskResult:
+    """Commit a set of worktree changes via the Git Data API and open/update
+    a PR. Shared by the LLM patch path (:func:`publish_task`) and the
+    deterministic command path (:func:`publish_command_result`). ``changes``
+    must be non-empty. Never pushes to a non-serge branch."""
+    changed_files = [c.path for c in changes]
+    emit_fn(
+        "log",
+        f"Change touches {len(changed_files)} file(s): {', '.join(changed_files)}",
+    )
+
+    owner, repo = req.owner, req.repo
+    emit_fn("step", "commit")
+    entries = _tree_entries(gh, owner, repo, changes)
+
+    if req.mode == "existing_pr":
+        head_branch = req.head_branch
+        assert head_branch and head_branch.startswith(SERGE_BRANCH_NAMESPACE)
+        parent_sha = gh.get_ref_sha(owner, repo, f"heads/{head_branch}")
+        base_tree = gh.get_commit_tree_sha(owner, repo, parent_sha)
+        tree_sha = gh.create_tree(owner, repo, base_tree, entries)
+        commit_sha = gh.create_commit(
+            owner,
+            repo,
+            message=title,
+            tree_sha=tree_sha,
+            parents=[parent_sha],
+        )
+        gh.update_ref(owner, repo, f"heads/{head_branch}", commit_sha)
+        emit_fn("log", f"Pushed commit {commit_sha[:8]} to {head_branch}")
+        return TaskResult(
+            mode=req.mode,
+            pr_number=req.pr_number,
+            branch=head_branch,
+            commit_sha=commit_sha,
+            changed_files=changed_files,
+            message=f"Pushed follow-up commit to PR #{req.pr_number}.",
+            url=f"https://github.com/{owner}/{repo}/pull/{req.pr_number}",
+        )
+
+    # new_pr
+    branch = f"{req.branch_prefix}-{job_id[:8]}"
+    parent_sha = gh.get_ref_sha(owner, repo, f"heads/{req.base_ref}")
+    base_tree = gh.get_commit_tree_sha(owner, repo, parent_sha)
+    tree_sha = gh.create_tree(owner, repo, base_tree, entries)
+    commit_sha = gh.create_commit(
+        owner,
+        repo,
+        message=title,
+        tree_sha=tree_sha,
+        parents=[parent_sha],
+    )
+    gh.create_ref(owner, repo, f"refs/heads/{branch}", commit_sha)
+    emit_fn("log", f"Created branch {branch} at {commit_sha[:8]}")
+    pr = gh.create_pull_request(
+        owner,
+        repo,
+        title=title,
+        head=branch,
+        base=req.base_ref,
+        body=body,
+    )
+    emit_fn("log", f"Opened PR #{pr.get('number')}: {pr.get('html_url')}")
+    if req.slack_notify_pr_created:
+        post_task_pr_created_notification(
+            token=cfg.slack_bot_token,
+            channel=req.slack_channel or cfg.slack_report_channel,
+            repo_full_name=req.repo_full_name,
+            pr_number=pr.get("number"),
+            pr_url=pr.get("html_url"),
+            title=title,
+            branch=branch,
+            changed_files=changed_files,
+        )
+    return TaskResult(
+        mode=req.mode,
+        pr_number=pr.get("number"),
+        branch=branch,
+        commit_sha=commit_sha,
+        changed_files=changed_files,
+        message=f"Opened PR #{pr.get('number')}.",
+        url=pr.get("html_url"),
+    )
+
+
 def publish_task(
     cfg: Config,
     gh: GitHubClient,
@@ -496,81 +651,148 @@ def publish_task(
             no_change=True,
             message="Patch applied but produced no file changes.",
         )
-    changed_files = [c.path for c in changes]
-    _emit(
-        "log", f"Patch touches {len(changed_files)} file(s): {', '.join(changed_files)}"
+
+    return _commit_changes(
+        cfg,
+        gh,
+        req,
+        changes=changes,
+        title=plan.title,
+        body=_decorate_body(cfg, plan, req),
+        job_id=job_id,
+        emit_fn=_emit,
     )
 
-    owner, repo = req.owner, req.repo
-    _emit("step", "commit")
-    entries = _tree_entries(gh, owner, repo, changes)
-    body = _decorate_body(cfg, plan, req)
 
-    if req.mode == "existing_pr":
-        head_branch = req.head_branch
-        assert head_branch and head_branch.startswith(SERGE_BRANCH_NAMESPACE)
-        parent_sha = gh.get_ref_sha(owner, repo, f"heads/{head_branch}")
-        base_tree = gh.get_commit_tree_sha(owner, repo, parent_sha)
-        tree_sha = gh.create_tree(owner, repo, base_tree, entries)
-        commit_sha = gh.create_commit(
-            owner,
-            repo,
-            message=plan.title,
-            tree_sha=tree_sha,
-            parents=[parent_sha],
+# ---------------------------------------------------------------------------
+# Command tasks: run a deterministic, allowlisted command → commit the diff
+# ---------------------------------------------------------------------------
+def _decorate_command_body(
+    cfg: Config, req: TaskRequest, changed_files: list[str]
+) -> str:
+    lines = [
+        f"Automated change produced by serge running `{req.command_str}`.",
+        "",
+        f"Touched {len(changed_files)} file(s):",
+        "",
+    ]
+    lines += [f"- `{p}`" for p in changed_files[:50]]
+    if len(changed_files) > 50:
+        lines.append(f"- … and {len(changed_files) - 50} more")
+    body = "\n".join(lines)
+    if req.context.strip():
+        body += f"\n\n## Context\n\n{req.context.strip()}"
+    body += (
+        "\n\n---\n_This change was produced automatically by serge by running "
+        f"`{req.command_str}` in a network-isolated sandbox; review before "
+        "merging._"
+    )
+    if cfg.is_staging:
+        body += "\n\n_Note: produced by a staging deployment._"
+    body += f"\n\n_serge `v{__version__}`_"
+    return body
+
+
+def run_command_task(
+    cfg: Config,
+    req: TaskRequest,
+    *,
+    checkout: Checkout,
+    clone_cache: CloneCache,
+    emit: Optional[Callable[[str, str], None]] = None,
+) -> tuple[list[FileChange], str]:
+    """Run the request's allowlisted command in the sandbox against the
+    checkout, stage the result, and return ``(changes, output_tail)``.
+
+    The command runs network-isolated (docker ``--network none`` or bwrap
+    ``--unshare-net``) with the worktree as the only writable path and no
+    serge secrets in its environment. Raises :class:`TaskError` on a
+    non-zero exit, timeout, or an unavailable sandbox."""
+    assert req.command is not None
+
+    def _emit(kind: str, text: str) -> None:
+        if emit is not None:
+            emit(kind, text)
+
+    _emit("step", "command")
+    try:
+        argv = sandbox.wrap_task_command(
+            req.command,
+            workdir=checkout.path,
+            write_root=checkout.path,
+            backend=cfg.task_sandbox_backend,
+            image=cfg.task_command_image,
+            mode=cfg.helper_sandbox,
+            memory=cfg.task_command_memory,
         )
-        gh.update_ref(owner, repo, f"heads/{head_branch}", commit_sha)
-        _emit("log", f"Pushed commit {commit_sha[:8]} to {head_branch}")
+    except (sandbox.DockerUnavailable, sandbox.SandboxUnavailable) as exc:
+        raise TaskError(f"command sandbox unavailable: {exc}", status_code=500)
+
+    _emit("log", f"Running `{req.command_str}` (timeout {cfg.task_command_timeout}s)…")
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=cfg.task_command_timeout,
+            cwd=checkout.path,
+            env=_helper_subprocess_env(),
+        )
+    except subprocess.TimeoutExpired:
+        raise TaskError(
+            f"command `{req.command_str}` timed out after {cfg.task_command_timeout}s",
+            status_code=504,
+        )
+    except FileNotFoundError as exc:
+        # e.g. the docker CLI vanished between the availability check and run.
+        raise TaskError(f"could not launch command: {exc}", status_code=500)
+
+    output = (proc.stdout or "") + (proc.stderr or "")
+    tail = "\n".join(output.splitlines()[-40:])
+    if proc.returncode != 0:
+        raise TaskError(
+            f"command `{req.command_str}` exited {proc.returncode}:\n{tail}",
+            status_code=422,
+        )
+
+    clone_cache.stage_all(checkout)
+    changes = clone_cache.collect_changes(checkout)
+    return changes, tail
+
+
+def publish_command_result(
+    cfg: Config,
+    gh: GitHubClient,
+    req: TaskRequest,
+    *,
+    changes: list[FileChange],
+    job_id: str,
+    emit: Optional[Callable[[str, str], None]] = None,
+) -> TaskResult:
+    """Commit the changes produced by a command task and open/update a PR.
+    Returns a no-change result when the command touched nothing."""
+
+    def _emit(kind: str, text: str) -> None:
+        if emit is not None:
+            emit(kind, text)
+
+    if not changes:
+        _emit("log", f"`{req.command_str}` produced no changes; nothing to commit")
         return TaskResult(
             mode=req.mode,
-            pr_number=req.pr_number,
-            branch=head_branch,
-            commit_sha=commit_sha,
-            changed_files=changed_files,
-            message=f"Pushed follow-up commit to PR #{req.pr_number}.",
-            url=f"https://github.com/{owner}/{repo}/pull/{req.pr_number}",
+            no_change=True,
+            message=f"`{req.command_str}` produced no changes.",
         )
 
-    # new_pr
-    branch = f"{req.branch_prefix}-{job_id[:8]}"
-    parent_sha = gh.get_ref_sha(owner, repo, f"heads/{req.base_ref}")
-    base_tree = gh.get_commit_tree_sha(owner, repo, parent_sha)
-    tree_sha = gh.create_tree(owner, repo, base_tree, entries)
-    commit_sha = gh.create_commit(
-        owner,
-        repo,
-        message=plan.title,
-        tree_sha=tree_sha,
-        parents=[parent_sha],
-    )
-    gh.create_ref(owner, repo, f"refs/heads/{branch}", commit_sha)
-    _emit("log", f"Created branch {branch} at {commit_sha[:8]}")
-    pr = gh.create_pull_request(
-        owner,
-        repo,
-        title=plan.title,
-        head=branch,
-        base=req.base_ref,
-        body=body,
-    )
-    _emit("log", f"Opened PR #{pr.get('number')}: {pr.get('html_url')}")
-    if req.slack_notify_pr_created:
-        post_task_pr_created_notification(
-            token=cfg.slack_bot_token,
-            channel=req.slack_channel or cfg.slack_report_channel,
-            repo_full_name=req.repo_full_name,
-            pr_number=pr.get("number"),
-            pr_url=pr.get("html_url"),
-            title=plan.title,
-            branch=branch,
-            changed_files=changed_files,
-        )
-    return TaskResult(
-        mode=req.mode,
-        pr_number=pr.get("number"),
-        branch=branch,
-        commit_sha=commit_sha,
-        changed_files=changed_files,
-        message=f"Opened PR #{pr.get('number')}.",
-        url=pr.get("html_url"),
+    changed_files = [c.path for c in changes]
+    title = req.title or f"serge: {req.command_str}"
+    return _commit_changes(
+        cfg,
+        gh,
+        req,
+        changes=changes,
+        title=title,
+        body=_decorate_command_body(cfg, req, changed_files),
+        job_id=job_id,
+        emit_fn=_emit,
     )

@@ -166,6 +166,25 @@ class Config:
     task_tool_max_iterations: Optional[int] = None
     # Cap on serge-authored commits per fix branch (follow-up loop guard).
     task_max_followups: int = 5
+
+    # --- Command tasks (deterministic, no LLM) ------------------------
+    # A command task runs a fixed, allowlisted command (e.g. ``make
+    # fix-repo``) against a checked-out ref and commits the resulting
+    # worktree diff — no LLM is involved; the command *is* the patch
+    # producer. Gated separately from the LLM task flow because it executes
+    # arbitrary repo build code.
+    #
+    # ``task_command_allowlist`` is the exact set of command strings serge
+    # will run (e.g. ``("make fix-repo",)``); a request naming anything else
+    # is rejected. ``task_command_image`` is the docker image (deps baked in)
+    # used by the ``docker`` backend; ``task_sandbox_backend`` selects
+    # docker | bwrap | auto. The command always runs network-isolated.
+    task_command_enabled: bool = False
+    task_command_allowlist: tuple[str, ...] = ()
+    task_command_image: Optional[str] = None
+    task_command_timeout: int = 1800
+    task_command_memory: Optional[str] = None
+    task_sandbox_backend: str = sandbox.AUTO_BACKEND
     # Optional Slack notification for PRs created by the /tasks flow.
     # Defaults to the org-level CI feedback Slack secrets; the transformers CI
     # names remain supported as fallbacks.
@@ -332,6 +351,20 @@ class Config:
             ),
             task_tool_max_iterations=(_int_env("TASK_TOOL_MAX_ITERATIONS", 0) or None),
             task_max_followups=_int_env("TASK_MAX_FOLLOWUPS", 5),
+            task_command_enabled=_bool_env("TASK_COMMAND_ENABLED", False),
+            task_command_allowlist=tuple(
+                c.strip()
+                for c in (os.environ.get("TASK_COMMAND_ALLOWLIST") or "").split(",")
+                if c.strip()
+            ),
+            task_command_image=(os.environ.get("TASK_COMMAND_IMAGE") or "").strip()
+            or None,
+            task_command_timeout=_int_env("TASK_COMMAND_TIMEOUT", 1800),
+            task_command_memory=(os.environ.get("TASK_COMMAND_MEMORY") or "").strip()
+            or None,
+            task_sandbox_backend=sandbox.normalize_backend(
+                os.environ.get("TASK_SANDBOX_BACKEND")
+            ),
             slack_bot_token=(
                 os.environ.get("SLACK_CIFEEDBACK_BOT_TOKEN")
                 or os.environ.get("CI_SLACK_BOT_TOKEN")

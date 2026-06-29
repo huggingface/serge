@@ -17,8 +17,10 @@ from reviewbot.tasks import (
     TaskRequest,
     _selected_failure_context,
     build_task_request,
+    publish_command_result,
     publish_task,
     resolve_existing_pr,
+    run_command_task,
     task_candidate_requests,
 )
 
@@ -508,6 +510,175 @@ class PublishTaskTests(unittest.TestCase):
         # Sanity: the email the loop-cap counts by is the one stamped on
         # commits, so follow-ups are countable.
         self.assertTrue(SERGE_GIT_EMAIL)
+
+
+class CommandTaskParsingTests(unittest.TestCase):
+    ALLOW = ("make fix-repo", "make style")
+
+    def test_command_string_in_allowlist(self):
+        req = build_task_request(
+            {"command": "make fix-repo"},
+            owner="a",
+            repo="b",
+            allowed_commands=self.ALLOW,
+        )
+        self.assertTrue(req.is_command)
+        self.assertEqual(req.command, ["make", "fix-repo"])
+        self.assertEqual(req.command_str, "make fix-repo")
+        self.assertIn("make fix-repo", req.instruction)
+
+    def test_command_list_form(self):
+        req = build_task_request(
+            {"command": ["make", "style"]},
+            owner="a",
+            repo="b",
+            allowed_commands=self.ALLOW,
+        )
+        self.assertEqual(req.command, ["make", "style"])
+
+    def test_command_not_in_allowlist_rejected(self):
+        with self.assertRaises(TaskError) as ctx:
+            build_task_request(
+                {"command": "rm -rf /"},
+                owner="a",
+                repo="b",
+                allowed_commands=self.ALLOW,
+            )
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_command_rejected_when_allowlist_empty(self):
+        with self.assertRaises(TaskError) as ctx:
+            build_task_request(
+                {"command": "make fix-repo"}, owner="a", repo="b", allowed_commands=()
+            )
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_command_with_existing_pr_mode(self):
+        req = build_task_request(
+            {
+                "command": "make fix-repo",
+                "output": {"mode": "existing_pr", "pr_number": 7},
+            },
+            owner="a",
+            repo="b",
+            allowed_commands=self.ALLOW,
+        )
+        self.assertTrue(req.is_command)
+        self.assertEqual(req.mode, "existing_pr")
+        self.assertEqual(req.pr_number, 7)
+
+    def test_non_command_task_unaffected(self):
+        req = build_task_request(
+            {"instruction": "fix the tests"},
+            owner="a",
+            repo="b",
+            allowed_commands=self.ALLOW,
+        )
+        self.assertFalse(req.is_command)
+        self.assertIsNone(req.command)
+
+
+class CommandTaskRunTests(unittest.TestCase):
+    """End-to-end command-task run against a real worktree, sandbox off."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = self._tmp.name
+        self.src = os.path.join(root, "src")
+        os.makedirs(self.src)
+        _git(self.src, "init", "--quiet", "-b", "main")
+        with open(os.path.join(self.src, "hello.txt"), "w") as f:
+            f.write("hi from main\n")
+        _git(self.src, "add", "-A")
+        _git(self.src, "commit", "--quiet", "-m", "main commit")
+        self.cache = CloneCache(os.path.join(root, "cache"))
+        # bwrap backend + sandbox off so the command runs directly (no docker
+        # / bwrap needed in the test environment).
+        self.cfg = _make_cfg(
+            helper_sandbox="off",
+            task_sandbox_backend="bwrap",
+            task_command_timeout=30,
+        )
+
+    def _checkout(self, ref="main"):
+        return self.cache.acquire_ref(
+            token="",
+            owner="acme",
+            repo="widget",
+            ref=ref,
+            job_id="abcd1234",
+            remote_url=self.src,
+        )
+
+    def _req(self, command):
+        return TaskRequest(
+            owner="acme",
+            repo="widget",
+            base_ref="main",
+            instruction="",
+            context="",
+            mode="new_pr",
+            command=command,
+        )
+
+    def test_command_edits_tree_and_opens_pr(self):
+        co = self._checkout("main")
+        req = self._req(["sh", "-c", "echo patched > hello.txt"])
+        changes, _tail = run_command_task(
+            self.cfg, req, checkout=co, clone_cache=self.cache
+        )
+        self.assertEqual([c.path for c in changes], ["hello.txt"])
+
+        gh = _FakeGH()
+        with patch("reviewbot.tasks.post_task_pr_created_notification"):
+            result = publish_command_result(
+                self.cfg, gh, req, changes=changes, job_id="abcd1234"
+            )
+        self.assertFalse(result.no_change)
+        self.assertEqual(result.pr_number, 99)
+        self.assertEqual(result.changed_files, ["hello.txt"])
+        self.assertIn("sh -c", gh.created_pr["body"])
+
+    def test_command_no_change_is_no_change(self):
+        co = self._checkout("main")
+        req = self._req(["sh", "-c", "true"])
+        changes, _tail = run_command_task(
+            self.cfg, req, checkout=co, clone_cache=self.cache
+        )
+        self.assertEqual(changes, [])
+        gh = _FakeGH()
+        result = publish_command_result(
+            self.cfg, gh, req, changes=changes, job_id="abcd1234"
+        )
+        self.assertTrue(result.no_change)
+        self.assertIsNone(gh.created_pr)
+
+    def test_command_failure_raises_422(self):
+        co = self._checkout("main")
+        req = self._req(["sh", "-c", "echo boom >&2; exit 3"])
+        with self.assertRaises(TaskError) as ctx:
+            run_command_task(self.cfg, req, checkout=co, clone_cache=self.cache)
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("boom", str(ctx.exception))
+
+    def test_gitignored_artifacts_not_committed(self):
+        co = self._checkout("main")
+        req = self._req(
+            [
+                "sh",
+                "-c",
+                "echo build/ > .gitignore && mkdir -p build && "
+                "echo junk > build/x.o && echo patched > hello.txt",
+            ]
+        )
+        changes, _tail = run_command_task(
+            self.cfg, req, checkout=co, clone_cache=self.cache
+        )
+        paths = sorted(c.path for c in changes)
+        self.assertIn("hello.txt", paths)
+        self.assertIn(".gitignore", paths)
+        self.assertNotIn("build/x.o", paths)
 
 
 if __name__ == "__main__":
