@@ -45,18 +45,24 @@ AUTO = "auto"
 OFF = "off"
 _VALID_MODES = frozenset({REQUIRE, AUTO, OFF})
 
-# Backends for the command-task sandbox (TASK_SANDBOX_BACKEND). Distinct
+# Backends for the task-command sandbox (TASK_SANDBOX_BACKEND). Distinct
 # from HELPER_SANDBOX's require/auto/off (which selects bwrap-or-nothing for
-# the read-only review subprocesses). A command task — e.g. ``make
-# fix-repo`` — runs arbitrary repo build code that needs the *target repo's*
-# dependency environment, which serge's own venv does not provide. The
-# ``docker`` backend runs it in a throwaway, network-isolated container built
-# from a per-repo image with those deps baked in; ``bwrap`` reuses serge's
-# venv (only viable when the command needs no extra deps).
+# the read-only review subprocesses). A task command — e.g. the post-LLM
+# normalize hook running ``make fix-repo`` — runs arbitrary repo build code
+# that needs the *target repo's* dependency environment, which serge's own
+# venv does not provide. The ``docker`` backend runs it in a throwaway,
+# network-isolated container built from a per-repo image with those deps baked
+# in; ``kubernetes`` runs it as a one-shot Job in an isolated namespace (for
+# k8s deployments); ``bwrap`` reuses serge's venv (only viable when the command
+# needs no extra deps). Docker stays a first-class backend so a non-k8s
+# deployment never needs Kubernetes.
 BWRAP_BACKEND = "bwrap"
 DOCKER_BACKEND = "docker"
+KUBERNETES_BACKEND = "kubernetes"
 AUTO_BACKEND = "auto"
-_VALID_BACKENDS = frozenset({BWRAP_BACKEND, DOCKER_BACKEND, AUTO_BACKEND})
+_VALID_BACKENDS = frozenset(
+    {BWRAP_BACKEND, DOCKER_BACKEND, KUBERNETES_BACKEND, AUTO_BACKEND}
+)
 
 # Read-only /etc files a sandboxed tool plausibly needs (name resolution,
 # user lookup, timezone, TLS roots) — deliberately NOT all of /etc, which
@@ -295,14 +301,16 @@ def wrap_task_command(
     network: bool = False,
     memory: str | None = None,
 ) -> list[str]:
-    """Resolve the command-task sandbox backend and return the argv to run.
+    """Resolve a local (subprocess) task-command sandbox backend and return
+    the argv to run.
 
     ``backend`` is ``bwrap`` | ``docker`` | ``auto``. ``auto`` picks docker
     when an ``image`` is configured and the docker CLI is present, else falls
     back to bwrap (which uses serge's own venv and the ``mode`` require/auto/off
     semantics). Raises :class:`DockerUnavailable` when docker is explicitly
     required but unusable, or :class:`SandboxUnavailable` when bwrap is required
-    but unusable."""
+    but unusable. The ``kubernetes`` backend is not handled here — it does not
+    run as a local subprocess; see ``reviewbot/normalize.py``."""
     backend = normalize_backend(backend)
     if backend == AUTO_BACKEND:
         backend = DOCKER_BACKEND if (image and docker_available()) else BWRAP_BACKEND
@@ -310,8 +318,8 @@ def wrap_task_command(
     if backend == DOCKER_BACKEND:
         if not image:
             raise DockerUnavailable(
-                "docker command-task backend requires a configured image "
-                "(TASK_COMMAND_IMAGE)"
+                "docker task-command backend requires a configured image "
+                "(TASK_NORMALIZE_IMAGE)"
             )
         if not docker_available():
             raise DockerUnavailable(

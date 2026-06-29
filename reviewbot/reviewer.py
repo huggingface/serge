@@ -653,13 +653,25 @@ def _run_agentic_loop(
     emit: Optional[Callable[[str, str], None]] = None,
     prior_prompt_tokens: int = 0,
     final_force_message: Optional[str] = None,
+    validate: Optional[Callable[[ChatResult], Optional[str]]] = None,
+    max_validation_retries: int = 0,
 ) -> tuple[ChatResult, _AggregateMetrics]:
     """Run a tool-augmented chat loop until the model emits a final
     (non-tool) response, falling back to a final non-tool turn if the
     iteration budget is exhausted.
 
     Returns the *last* ChatResult (whose ``content`` carries the JSON
-    review) and an aggregate-metrics struct."""
+    review) and an aggregate-metrics struct.
+
+    ``validate`` (optional) turns the final answer into a verification gate:
+    when the model emits a non-tool response, ``validate(chat)`` is called and,
+    if it returns a non-empty string, that string is appended to the *same*
+    conversation as a user turn and the loop continues so the model can correct
+    its answer (used by /tasks to feed the repo normalizer's rejection back to
+    the model). ``validate`` returning ``None`` accepts the answer. The model
+    gets at most ``max_validation_retries`` such corrective re-prompts; after
+    that the last answer is returned regardless. Reviews pass no ``validate``
+    and are unaffected."""
     messages = list(initial_messages)
     metrics = _AggregateMetrics()
     tools_arg = build_tool_specs(tool_env) if tool_env is not None else None
@@ -704,6 +716,7 @@ def _run_agentic_loop(
     ABSOLUTE_ITER_CEILING = max(60, (iter_cap or 0) * 2)
     iteration = 0
     blind_tool_turns = 0
+    validation_retries = 0
     while True:
         iteration += 1
         if iteration > ABSOLUTE_ITER_CEILING:
@@ -776,7 +789,27 @@ def _run_agentic_loop(
         _emit_metrics(emit, metrics)
 
         if not chat.tool_calls:
-            return chat, metrics
+            if validate is None:
+                return chat, metrics
+            # Verification gate: let the caller check the final answer (for
+            # /tasks: apply the patch + run the repo normalizer). A non-empty
+            # string is a rejection to feed back; None accepts.
+            feedback = validate(chat)
+            if feedback is None or validation_retries >= max_validation_retries:
+                return chat, metrics
+            validation_retries += 1
+            if emit is not None:
+                emit(
+                    "log",
+                    f"Patch validation failed (correction "
+                    f"{validation_retries}/{max_validation_retries}); "
+                    "asking the model to fix it",
+                )
+            # Continue the SAME conversation: append the rejected answer and
+            # the feedback, then loop so the model can browse + correct.
+            messages.append({"role": "assistant", "content": chat.content or None})
+            messages.append({"role": "user", "content": feedback})
+            continue
 
         # A "blind" tool turn is one where the model fired tool calls
         # without reasoning or content — i.e. chaining tools without

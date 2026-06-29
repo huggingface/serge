@@ -2,6 +2,7 @@
 branch-ownership guard + loop cap, and publish_task's commit/PR flow (real
 worktree via CloneCache, fake GitHub Git Data API)."""
 
+import json
 import os
 import subprocess
 import tempfile
@@ -16,11 +17,10 @@ from reviewbot.tasks import (
     TaskPlan,
     TaskRequest,
     _selected_failure_context,
+    _validate_patch,
     build_task_request,
-    publish_command_result,
     publish_task,
     resolve_existing_pr,
-    run_command_task,
     task_candidate_requests,
 )
 
@@ -512,74 +512,19 @@ class PublishTaskTests(unittest.TestCase):
         self.assertTrue(SERGE_GIT_EMAIL)
 
 
-class CommandTaskParsingTests(unittest.TestCase):
-    ALLOW = ("make fix-repo", "make style")
+class ValidatePatchTests(unittest.TestCase):
+    """The in-loop verification gate (_validate_patch), against a real
+    worktree. Runs with the bwrap backend + sandbox off so the normalize
+    command runs directly (no docker / bwrap needed in the test environment)."""
 
-    def test_command_string_in_allowlist(self):
-        req = build_task_request(
-            {"command": "make fix-repo"},
-            owner="a",
-            repo="b",
-            allowed_commands=self.ALLOW,
-        )
-        self.assertTrue(req.is_command)
-        self.assertEqual(req.command, ["make", "fix-repo"])
-        self.assertEqual(req.command_str, "make fix-repo")
-        self.assertIn("make fix-repo", req.instruction)
-
-    def test_command_list_form(self):
-        req = build_task_request(
-            {"command": ["make", "style"]},
-            owner="a",
-            repo="b",
-            allowed_commands=self.ALLOW,
-        )
-        self.assertEqual(req.command, ["make", "style"])
-
-    def test_command_not_in_allowlist_rejected(self):
-        with self.assertRaises(TaskError) as ctx:
-            build_task_request(
-                {"command": "rm -rf /"},
-                owner="a",
-                repo="b",
-                allowed_commands=self.ALLOW,
-            )
-        self.assertEqual(ctx.exception.status_code, 403)
-
-    def test_command_rejected_when_allowlist_empty(self):
-        with self.assertRaises(TaskError) as ctx:
-            build_task_request(
-                {"command": "make fix-repo"}, owner="a", repo="b", allowed_commands=()
-            )
-        self.assertEqual(ctx.exception.status_code, 403)
-
-    def test_command_with_existing_pr_mode(self):
-        req = build_task_request(
-            {
-                "command": "make fix-repo",
-                "output": {"mode": "existing_pr", "pr_number": 7},
-            },
-            owner="a",
-            repo="b",
-            allowed_commands=self.ALLOW,
-        )
-        self.assertTrue(req.is_command)
-        self.assertEqual(req.mode, "existing_pr")
-        self.assertEqual(req.pr_number, 7)
-
-    def test_non_command_task_unaffected(self):
-        req = build_task_request(
-            {"instruction": "fix the tests"},
-            owner="a",
-            repo="b",
-            allowed_commands=self.ALLOW,
-        )
-        self.assertFalse(req.is_command)
-        self.assertIsNone(req.command)
-
-
-class CommandTaskRunTests(unittest.TestCase):
-    """End-to-end command-task run against a real worktree, sandbox off."""
+    _PATCH = (
+        "diff --git a/hello.txt b/hello.txt\n"
+        "--- a/hello.txt\n"
+        "+++ b/hello.txt\n"
+        "@@ -1 +1 @@\n"
+        "-hi from main\n"
+        "+hi patched\n"
+    )
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -593,92 +538,191 @@ class CommandTaskRunTests(unittest.TestCase):
         _git(self.src, "add", "-A")
         _git(self.src, "commit", "--quiet", "-m", "main commit")
         self.cache = CloneCache(os.path.join(root, "cache"))
-        # bwrap backend + sandbox off so the command runs directly (no docker
-        # / bwrap needed in the test environment).
-        self.cfg = _make_cfg(
-            helper_sandbox="off",
-            task_sandbox_backend="bwrap",
-            task_command_timeout=30,
-        )
-
-    def _checkout(self, ref="main"):
-        return self.cache.acquire_ref(
+        self.co = self.cache.acquire_ref(
             token="",
             owner="acme",
             repo="widget",
-            ref=ref,
+            ref="main",
             job_id="abcd1234",
             remote_url=self.src,
         )
 
-    def _req(self, command):
+    def _cfg(self, **overrides):
+        base = dict(helper_sandbox="off", task_sandbox_backend="bwrap")
+        base.update(overrides)
+        return _make_cfg(**base)
+
+    def _content(self, patch):
+        return json.dumps({"title": "t", "body": "b", "patch": patch})
+
+    def _validate(self, cfg, content):
+        return _validate_patch(
+            cfg,
+            checkout=self.co,
+            clone_cache=self.cache,
+            content=content,
+            emit=lambda *a: None,
+        )
+
+    def _wt(self, name):
+        return os.path.join(self.co.path, name)
+
+    def test_clean_normalize_prepares_combined_worktree(self):
+        # Patch applies + normalizer creates an extra file + exits 0 ->
+        # accepted (no feedback, prepared) with BOTH edits in the worktree.
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", "echo generated > extra.txt"],
+            task_normalize_timeout=30,
+        )
+        feedback, prepared = self._validate(cfg, self._content(self._PATCH))
+        self.assertIsNone(feedback)
+        self.assertTrue(prepared)
+        with open(self._wt("hello.txt")) as f:
+            self.assertEqual(f.read(), "hi patched\n")
+        self.assertTrue(os.path.exists(self._wt("extra.txt")))
+        # The combined change is what publish_task would commit.
+        self.cache.stage_all(self.co)
+        changed = sorted(c.path for c in self.cache.collect_changes(self.co))
+        self.assertEqual(changed, ["extra.txt", "hello.txt"])
+
+    def test_normalizer_failure_feeds_back_and_resets(self):
+        # Non-zero normalizer exit -> feedback to the model, worktree reset
+        # clean (so the next attempt starts pristine).
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", "echo boom >&2; exit 3"],
+            task_normalize_timeout=30,
+        )
+        feedback, prepared = self._validate(cfg, self._content(self._PATCH))
+        self.assertFalse(prepared)
+        self.assertIsNotNone(feedback)
+        self.assertIn("normalizer", feedback.lower())
+        self.assertIn("boom", feedback)
+        # Worktree restored to the pristine checkout.
+        with open(self._wt("hello.txt")) as f:
+            self.assertEqual(f.read(), "hi from main\n")
+        self.assertEqual(self.cache.collect_changes(self.co), [])
+
+    def test_unapplyable_patch_feeds_back(self):
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", "true"], task_normalize_timeout=30
+        )
+        bad = (
+            "diff --git a/hello.txt b/hello.txt\n"
+            "--- a/hello.txt\n"
+            "+++ b/hello.txt\n"
+            "@@ -1 +1 @@\n"
+            "-does not match\n"
+            "+nope\n"
+        )
+        feedback, prepared = self._validate(cfg, self._content(bad))
+        self.assertFalse(prepared)
+        self.assertIsNotNone(feedback)
+        self.assertIn("apply", feedback.lower())
+
+    def test_unavailable_sandbox_accepts_best_effort(self):
+        # docker backend with no image -> NormalizeError; not the model's
+        # fault, so the applied patch is accepted (prepared) un-normalized.
+        cfg = self._cfg(
+            task_sandbox_backend="docker",
+            task_normalize_command=["make", "fix-repo"],
+            task_normalize_timeout=30,
+        )
+        feedback, prepared = self._validate(cfg, self._content(self._PATCH))
+        self.assertIsNone(feedback)
+        self.assertTrue(prepared)
+        with open(self._wt("hello.txt")) as f:
+            self.assertEqual(f.read(), "hi patched\n")
+
+    def test_empty_patch_accepted_not_prepared(self):
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", "true"], task_normalize_timeout=30
+        )
+        feedback, prepared = self._validate(cfg, self._content(""))
+        self.assertIsNone(feedback)
+        self.assertFalse(prepared)
+
+
+class PublishPreparedTests(unittest.TestCase):
+    """publish_task commits a worktree already prepared by validation,
+    without re-applying the patch."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = self._tmp.name
+        self.src = os.path.join(root, "src")
+        os.makedirs(self.src)
+        _git(self.src, "init", "--quiet", "-b", "main")
+        with open(os.path.join(self.src, "hello.txt"), "w") as f:
+            f.write("hi from main\n")
+        _git(self.src, "add", "-A")
+        _git(self.src, "commit", "--quiet", "-m", "main commit")
+        self.cache = CloneCache(os.path.join(root, "cache"))
+        self.cfg = _make_cfg()
+
+    def _checkout(self):
+        return self.cache.acquire_ref(
+            token="",
+            owner="acme",
+            repo="widget",
+            ref="main",
+            job_id="abcd1234",
+            remote_url=self.src,
+        )
+
+    def _req(self):
         return TaskRequest(
             owner="acme",
             repo="widget",
             base_ref="main",
-            instruction="",
+            instruction="fix",
             context="",
             mode="new_pr",
-            command=command,
         )
 
-    def test_command_edits_tree_and_opens_pr(self):
-        co = self._checkout("main")
-        req = self._req(["sh", "-c", "echo patched > hello.txt"])
-        changes, _tail = run_command_task(
-            self.cfg, req, checkout=co, clone_cache=self.cache
+    def test_prepared_worktree_is_committed_as_is(self):
+        co = self._checkout()
+        # Simulate what _validate_patch leaves behind: edits already in the
+        # worktree (not staged). publish_task must NOT re-apply plan.patch.
+        with open(os.path.join(co.path, "hello.txt"), "w") as f:
+            f.write("hi patched\n")
+        with open(os.path.join(co.path, "extra.txt"), "w") as f:
+            f.write("generated\n")
+        plan = TaskPlan(
+            title="Fix hello",
+            body="desc",
+            patch="this patch text is never applied",
+            worktree_prepared=True,
         )
-        self.assertEqual([c.path for c in changes], ["hello.txt"])
-
         gh = _FakeGH()
         with patch("reviewbot.tasks.post_task_pr_created_notification"):
-            result = publish_command_result(
-                self.cfg, gh, req, changes=changes, job_id="abcd1234"
+            result = publish_task(
+                self.cfg,
+                gh,
+                self._req(),
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
             )
         self.assertFalse(result.no_change)
-        self.assertEqual(result.pr_number, 99)
-        self.assertEqual(result.changed_files, ["hello.txt"])
-        self.assertIn("sh -c", gh.created_pr["body"])
+        self.assertEqual(sorted(result.changed_files), ["extra.txt", "hello.txt"])
 
-    def test_command_no_change_is_no_change(self):
-        co = self._checkout("main")
-        req = self._req(["sh", "-c", "true"])
-        changes, _tail = run_command_task(
-            self.cfg, req, checkout=co, clone_cache=self.cache
-        )
-        self.assertEqual(changes, [])
+    def test_prepared_but_clean_worktree_is_no_change(self):
+        co = self._checkout()
+        plan = TaskPlan(title="t", body="b", patch="x", worktree_prepared=True)
         gh = _FakeGH()
-        result = publish_command_result(
-            self.cfg, gh, req, changes=changes, job_id="abcd1234"
+        result = publish_task(
+            self.cfg,
+            gh,
+            self._req(),
+            plan,
+            checkout=co,
+            clone_cache=self.cache,
+            job_id="abcd1234",
         )
         self.assertTrue(result.no_change)
         self.assertIsNone(gh.created_pr)
-
-    def test_command_failure_raises_422(self):
-        co = self._checkout("main")
-        req = self._req(["sh", "-c", "echo boom >&2; exit 3"])
-        with self.assertRaises(TaskError) as ctx:
-            run_command_task(self.cfg, req, checkout=co, clone_cache=self.cache)
-        self.assertEqual(ctx.exception.status_code, 422)
-        self.assertIn("boom", str(ctx.exception))
-
-    def test_gitignored_artifacts_not_committed(self):
-        co = self._checkout("main")
-        req = self._req(
-            [
-                "sh",
-                "-c",
-                "echo build/ > .gitignore && mkdir -p build && "
-                "echo junk > build/x.o && echo patched > hello.txt",
-            ]
-        )
-        changes, _tail = run_command_task(
-            self.cfg, req, checkout=co, clone_cache=self.cache
-        )
-        paths = sorted(c.path for c in changes)
-        self.assertIn("hello.txt", paths)
-        self.assertIn(".gitignore", paths)
-        self.assertNotIn("build/x.o", paths)
 
 
 if __name__ == "__main__":

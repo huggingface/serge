@@ -20,17 +20,17 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
-import shlex
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from . import __version__, sandbox
+from . import __version__
 from .clone_cache import Checkout, CloneCache, FileChange
 from .compression import MessageCompressor
 from .config import Config
 from .github_client import SERGE_GIT_EMAIL, GitHubClient
 from .llm_client import ChatCompletionClient
+from .normalize import NormalizeError, run_normalize
 from .prompts import build_task_system_prompt, build_task_user_prompt
 from .reviewer import (
     _extract_json,
@@ -40,7 +40,6 @@ from .reviewer import (
     _UnparseableLLMOutput,
 )
 from .slack_tool import post_task_pr_created_notification
-from .tools import _helper_subprocess_env
 
 log = logging.getLogger(__name__)
 
@@ -95,22 +94,10 @@ class TaskRequest:
     slack_notify_task_finished: bool = False
     # Resolved during processing (existing_pr): the PR's head branch.
     head_branch: Optional[str] = None
-    # Command task: the allowlisted argv to run (e.g. ``["make", "fix-repo"]``).
-    # When set, serge runs this deterministically instead of the LLM loop —
-    # the command's worktree edits ARE the patch. None for an LLM task.
-    command: Optional[list[str]] = None
 
     @property
     def repo_full_name(self) -> str:
         return f"{self.owner}/{self.repo}"
-
-    @property
-    def is_command(self) -> bool:
-        return self.command is not None
-
-    @property
-    def command_str(self) -> str:
-        return " ".join(self.command or [])
 
 
 @dataclass
@@ -124,6 +111,10 @@ class TaskPlan:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     model: Optional[str] = None
+    # True when the patch was validated in-loop (see :func:`_validate_patch`):
+    # the worktree already holds the applied + normalized result, so
+    # :func:`publish_task` commits it directly instead of re-applying.
+    worktree_prepared: bool = False
 
 
 @dataclass
@@ -176,62 +167,20 @@ def task_candidate_requests(req: TaskRequest) -> list[TaskRequest]:
 # ---------------------------------------------------------------------------
 # Request building / validation
 # ---------------------------------------------------------------------------
-def _parse_command(
-    payload: dict[str, Any], allowed_commands: tuple[str, ...]
-) -> Optional[list[str]]:
-    """Validate an optional ``command`` field into an argv, or return None.
-
-    A command task names a single command (string or argv list). It is
-    accepted only if its normalized string form is in ``allowed_commands`` —
-    the caller picks from a fixed operator-defined menu and cannot pass
-    arbitrary commands or extra arguments. Raises :class:`TaskError` when a
-    command is present but not allowed."""
-    raw = payload.get("command")
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        command_str = raw.strip()
-        argv = shlex.split(command_str)
-    elif isinstance(raw, list) and all(isinstance(p, str) for p in raw):
-        argv = [p for p in raw]
-        command_str = " ".join(argv)
-    else:
-        raise TaskError("command must be a string or a list of strings")
-    if not argv:
-        raise TaskError("command must not be empty")
-    if command_str not in allowed_commands:
-        raise TaskError(
-            f"command {command_str!r} is not in the allowlist for this deployment",
-            status_code=403,
-        )
-    return argv
-
-
 def build_task_request(
     payload: dict[str, Any],
     *,
     owner: str,
     repo: str,
-    allowed_commands: tuple[str, ...] = (),
 ) -> TaskRequest:
     """Validate an inbound /tasks payload into a TaskRequest.
 
     ``owner``/``repo`` come from the verified OIDC ``repository`` claim and
     are authoritative; any ``repo`` in the body must match (checked by the
-    caller). ``allowed_commands`` is the deployment's command-task allowlist;
-    a ``command`` field is validated against it. Raises :class:`TaskError` on
-    malformed input."""
-    command = _parse_command(payload, allowed_commands)
-
+    caller). Raises :class:`TaskError` on malformed input."""
     instruction = (payload.get("instruction") or "").strip()
     if not instruction:
-        if command is not None:
-            # A command task is self-describing; the command IS the work.
-            instruction = (
-                f"Run `{' '.join(command)}` and open a PR with the resulting changes."
-            )
-        else:
-            raise TaskError("instruction is required")
+        raise TaskError("instruction is required")
     context = payload.get("context")
     if context is not None and not isinstance(context, str):
         raise TaskError("context must be a string")
@@ -290,7 +239,6 @@ def build_task_request(
         slack_channel=slack_channel,
         slack_notify_pr_created=slack_notify_pr_created,
         slack_notify_task_finished=slack_notify_task_finished,
-        command=command,
     )
 
 
@@ -348,18 +296,117 @@ def resolve_existing_pr(gh: GitHubClient, req: TaskRequest, cfg: Config) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Agentic loop → patch
+# Agentic loop → patch (with in-loop normalize validation)
 # ---------------------------------------------------------------------------
+def _validate_patch(
+    cfg: Config,
+    *,
+    checkout: Checkout,
+    clone_cache: CloneCache,
+    content: Optional[str],
+    emit: Callable[[str, str], None],
+) -> tuple[Optional[str], bool]:
+    """Validate the model's final answer by applying its patch to a clean
+    worktree and running the repo normalizer.
+
+    Returns ``(feedback, prepared)``:
+
+    - ``feedback`` is a non-empty string when the patch should be sent back to
+      the model for correction (it didn't apply, or the normalizer rejected
+      it); ``None`` when the answer is accepted. The worktree is reset to a
+      clean checkout before returning feedback.
+    - ``prepared`` is True when the worktree now holds the applied (and, when
+      the normalizer ran cleanly, normalized) result, ready for
+      :func:`publish_task` to commit directly.
+
+    Only called when ``cfg.task_normalize_command`` is set."""
+    command = cfg.task_normalize_command
+    assert command is not None
+
+    try:
+        result = _extract_json(content)
+    except ValueError:
+        # Unparseable — not something the normalizer can speak to. Accept here
+        # and let prepare_task's own extraction raise the proper error.
+        return None, False
+
+    patch = result.get("patch")
+    if not isinstance(patch, str) or not patch.strip():
+        # No patch to validate (a "no safe fix" answer); accept as-is.
+        return None, False
+
+    clone_cache.reset_worktree(checkout)
+    try:
+        clone_cache.apply_patch(checkout, patch)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:1200]
+        return (
+            "Your patch was rejected — `git apply` could not apply it to a "
+            f"clean checkout:\n\n{stderr}\n\nReturn a corrected unified diff. "
+            "Check the file paths and that the hunk context lines match the "
+            "current code exactly.",
+            False,
+        )
+
+    emit("step", "normalize")
+    emit("log", f"Validating the patch with `{' '.join(command)}`…")
+    try:
+        returncode, tail = run_normalize(
+            command,
+            workdir=checkout.path,
+            write_root=checkout.path,
+            backend=cfg.task_sandbox_backend,
+            image=cfg.task_normalize_image,
+            mode=cfg.helper_sandbox,
+            timeout=cfg.task_normalize_timeout,
+            memory=cfg.task_normalize_memory,
+        )
+    except NormalizeError as exc:
+        # Infrastructure problem (sandbox unavailable, timeout) — not the
+        # model's fault. Accept the applied patch best-effort rather than
+        # blaming the LLM; CI still catches anything the normalizer would have.
+        log.warning("normalizer unavailable during validation: %s", exc)
+        emit(
+            "log", f"Normalizer unavailable ({exc}); accepting the patch un-normalized."
+        )
+        return None, True
+
+    if returncode != 0:
+        clone_cache.reset_worktree(checkout)
+        cmd = " ".join(command)
+        return (
+            f"Your patch applied cleanly, but the repository's normalizer "
+            f"(`{cmd}`) then failed (exit {returncode}):\n\n{tail}\n\n"
+            "Revise the patch so the normalizer passes. Common causes: editing "
+            "an auto-generated file instead of its modular/source counterpart, "
+            "leaving a copied block out of sync, or a lint/format issue the "
+            "fixer cannot resolve on its own.",
+            False,
+        )
+
+    emit("log", "Patch validated; normalizer is clean.")
+    return None, True
+
+
 def prepare_task(
     cfg: Config,
     req: TaskRequest,
     *,
+    checkout: Checkout,
+    clone_cache: CloneCache,
     existing_diff: Optional[str] = None,
     chunk_callback: Optional[Callable[[str, str], None]] = None,
 ) -> TaskPlan:
     """Run the agentic loop (read-only browse tools rooted at the checkout)
     and return the LLM's proposed patch + PR meta. ``cfg.repo_checkout_path``
-    must already point at the worktree."""
+    must already point at ``checkout``.
+
+    When ``cfg.task_normalize_command`` is set, the loop also runs an in-loop
+    verification gate (see :func:`_validate_patch`): each final patch is
+    applied to the worktree and the repo normalizer is run; a failure is fed
+    back to the model (up to ``cfg.task_normalize_max_retries`` times) so it can
+    correct the patch. On success the worktree holds the applied + normalized
+    result and the returned plan has ``worktree_prepared=True``."""
 
     def _emit(kind: str, text: str) -> None:
         if chunk_callback is not None:
@@ -388,6 +435,22 @@ def prepare_task(
         existing_diff=existing_diff,
     )
 
+    # Wire the normalize verification gate into the loop when configured. The
+    # closure records whether the accepted answer left the worktree prepared.
+    normalize_configured = bool(cfg.task_normalize_command)
+    outcome = {"prepared": False}
+
+    def _validate(chat) -> Optional[str]:
+        feedback, prepared = _validate_patch(
+            cfg,
+            checkout=checkout,
+            clone_cache=clone_cache,
+            content=chat.content,
+            emit=_emit,
+        )
+        outcome["prepared"] = prepared
+        return feedback
+
     _emit("step", "llm")
     _emit("log", "Calling LLM to produce a patch…")
     chat, metrics = _run_agentic_loop(
@@ -400,6 +463,8 @@ def prepare_task(
         tool_env=tool_env,
         emit=_emit,
         final_force_message=_TASK_FORCE_FINAL_MESSAGE,
+        validate=_validate if normalize_configured else None,
+        max_validation_retries=cfg.task_normalize_max_retries,
     )
     metrics_line = _format_aggregated_metrics(metrics)
     _emit("log", f"LLM done: {metrics_line}")
@@ -419,6 +484,12 @@ def prepare_task(
     if not isinstance(patch, str):
         patch = ""
 
+    # If validation never accepted a prepared worktree (retries exhausted, or
+    # normalize not configured), make sure the worktree is clean so
+    # publish_task's own apply path starts from a pristine checkout.
+    if normalize_configured and not outcome["prepared"]:
+        clone_cache.reset_worktree(checkout)
+
     return TaskPlan(
         title=req.title or title,
         body=body,
@@ -427,6 +498,7 @@ def prepare_task(
         prompt_tokens=metrics.prompt_tokens,
         completion_tokens=metrics.completion_tokens,
         model=llm.model,
+        worktree_prepared=outcome["prepared"],
     )
 
 
@@ -528,9 +600,7 @@ def _commit_changes(
     emit_fn: Callable[[str, str], None],
 ) -> TaskResult:
     """Commit a set of worktree changes via the Git Data API and open/update
-    a PR. Shared by the LLM patch path (:func:`publish_task`) and the
-    deterministic command path (:func:`publish_command_result`). ``changes``
-    must be non-empty. Never pushes to a non-serge branch."""
+    a PR. ``changes`` must be non-empty. Never pushes to a non-serge branch."""
     changed_files = [c.path for c in changes]
     emit_fn(
         "log",
@@ -622,15 +692,21 @@ def publish_task(
     job_id: str,
     emit: Optional[Callable[[str, str], None]] = None,
 ) -> TaskResult:
-    """Apply the patch in the worktree and commit it via the Git Data API,
-    opening a new PR (new_pr) or pushing onto the serge fix branch
-    (existing_pr). Never pushes to a non-serge branch."""
+    """Commit the task's change via the Git Data API, opening a new PR
+    (new_pr) or pushing onto the serge fix branch (existing_pr). Never pushes
+    to a non-serge branch.
+
+    When ``plan.worktree_prepared`` is set, the in-loop validation
+    (:func:`_validate_patch`) already applied + normalized the worktree, so we
+    just stage and commit it. Otherwise we apply ``plan.patch`` here (the path
+    taken when no normalizer is configured, or when validation was abandoned
+    and left a clean checkout)."""
 
     def _emit(kind: str, text: str) -> None:
         if emit is not None:
             emit(kind, text)
 
-    if not plan.patch.strip():
+    if not plan.worktree_prepared and not plan.patch.strip():
         _emit("log", "LLM proposed no patch; nothing to commit")
         return TaskResult(
             mode=req.mode,
@@ -638,12 +714,17 @@ def publish_task(
             message=plan.body or "No fix was proposed.",
         )
 
-    _emit("step", "apply")
-    try:
-        clone_cache.apply_patch(checkout, plan.patch)
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:800]
-        raise TaskError(f"patch did not apply cleanly: {stderr}", status_code=422)
+    if plan.worktree_prepared:
+        _emit("log", "Committing the validated, normalized worktree.")
+    else:
+        _emit("step", "apply")
+        try:
+            clone_cache.apply_patch(checkout, plan.patch)
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:800]
+            raise TaskError(f"patch did not apply cleanly: {stderr}", status_code=422)
+
+    clone_cache.stage_all(checkout)
     changes = clone_cache.collect_changes(checkout)
     if not changes:
         return TaskResult(
@@ -659,140 +740,6 @@ def publish_task(
         changes=changes,
         title=plan.title,
         body=_decorate_body(cfg, plan, req),
-        job_id=job_id,
-        emit_fn=_emit,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Command tasks: run a deterministic, allowlisted command → commit the diff
-# ---------------------------------------------------------------------------
-def _decorate_command_body(
-    cfg: Config, req: TaskRequest, changed_files: list[str]
-) -> str:
-    lines = [
-        f"Automated change produced by serge running `{req.command_str}`.",
-        "",
-        f"Touched {len(changed_files)} file(s):",
-        "",
-    ]
-    lines += [f"- `{p}`" for p in changed_files[:50]]
-    if len(changed_files) > 50:
-        lines.append(f"- … and {len(changed_files) - 50} more")
-    body = "\n".join(lines)
-    if req.context.strip():
-        body += f"\n\n## Context\n\n{req.context.strip()}"
-    body += (
-        "\n\n---\n_This change was produced automatically by serge by running "
-        f"`{req.command_str}` in a network-isolated sandbox; review before "
-        "merging._"
-    )
-    if cfg.is_staging:
-        body += "\n\n_Note: produced by a staging deployment._"
-    body += f"\n\n_serge `v{__version__}`_"
-    return body
-
-
-def run_command_task(
-    cfg: Config,
-    req: TaskRequest,
-    *,
-    checkout: Checkout,
-    clone_cache: CloneCache,
-    emit: Optional[Callable[[str, str], None]] = None,
-) -> tuple[list[FileChange], str]:
-    """Run the request's allowlisted command in the sandbox against the
-    checkout, stage the result, and return ``(changes, output_tail)``.
-
-    The command runs network-isolated (docker ``--network none`` or bwrap
-    ``--unshare-net``) with the worktree as the only writable path and no
-    serge secrets in its environment. Raises :class:`TaskError` on a
-    non-zero exit, timeout, or an unavailable sandbox."""
-    assert req.command is not None
-
-    def _emit(kind: str, text: str) -> None:
-        if emit is not None:
-            emit(kind, text)
-
-    _emit("step", "command")
-    try:
-        argv = sandbox.wrap_task_command(
-            req.command,
-            workdir=checkout.path,
-            write_root=checkout.path,
-            backend=cfg.task_sandbox_backend,
-            image=cfg.task_command_image,
-            mode=cfg.helper_sandbox,
-            memory=cfg.task_command_memory,
-        )
-    except (sandbox.DockerUnavailable, sandbox.SandboxUnavailable) as exc:
-        raise TaskError(f"command sandbox unavailable: {exc}", status_code=500)
-
-    _emit("log", f"Running `{req.command_str}` (timeout {cfg.task_command_timeout}s)…")
-    try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=cfg.task_command_timeout,
-            cwd=checkout.path,
-            env=_helper_subprocess_env(),
-        )
-    except subprocess.TimeoutExpired:
-        raise TaskError(
-            f"command `{req.command_str}` timed out after {cfg.task_command_timeout}s",
-            status_code=504,
-        )
-    except FileNotFoundError as exc:
-        # e.g. the docker CLI vanished between the availability check and run.
-        raise TaskError(f"could not launch command: {exc}", status_code=500)
-
-    output = (proc.stdout or "") + (proc.stderr or "")
-    tail = "\n".join(output.splitlines()[-40:])
-    if proc.returncode != 0:
-        raise TaskError(
-            f"command `{req.command_str}` exited {proc.returncode}:\n{tail}",
-            status_code=422,
-        )
-
-    clone_cache.stage_all(checkout)
-    changes = clone_cache.collect_changes(checkout)
-    return changes, tail
-
-
-def publish_command_result(
-    cfg: Config,
-    gh: GitHubClient,
-    req: TaskRequest,
-    *,
-    changes: list[FileChange],
-    job_id: str,
-    emit: Optional[Callable[[str, str], None]] = None,
-) -> TaskResult:
-    """Commit the changes produced by a command task and open/update a PR.
-    Returns a no-change result when the command touched nothing."""
-
-    def _emit(kind: str, text: str) -> None:
-        if emit is not None:
-            emit(kind, text)
-
-    if not changes:
-        _emit("log", f"`{req.command_str}` produced no changes; nothing to commit")
-        return TaskResult(
-            mode=req.mode,
-            no_change=True,
-            message=f"`{req.command_str}` produced no changes.",
-        )
-
-    changed_files = [c.path for c in changes]
-    title = req.title or f"serge: {req.command_str}"
-    return _commit_changes(
-        cfg,
-        gh,
-        req,
-        changes=changes,
-        title=title,
-        body=_decorate_command_body(cfg, req, changed_files),
         job_id=job_id,
         emit_fn=_emit,
     )

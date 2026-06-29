@@ -439,6 +439,18 @@ class CloneCache:
         finally:
             os.unlink(patch_path)
 
+    def reset_worktree(self, checkout: Checkout) -> None:
+        """Discard all worktree changes, restoring it to its HEAD commit.
+
+        Used between patch-validation attempts (see ``tasks._validate_patch``)
+        so each attempt applies the model's patch to a pristine checkout, and
+        as the fallback cleanup when validation is abandoned. ``reset --hard``
+        clears the index + tracked files; ``clean -fd`` removes untracked files
+        the normalizer may have created (honouring ``.gitignore``, so ignored
+        build artifacts are left alone)."""
+        self._git(checkout.path, "reset", "--hard", "HEAD", timeout=60)
+        self._git(checkout.path, "clean", "-fdq", timeout=60)
+
     def stage_all(self, checkout: Checkout) -> None:
         """Stage every worktree change (``git add -A``).
 

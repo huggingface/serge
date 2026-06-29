@@ -1,11 +1,11 @@
-# Example command-task runner image.
+# Example normalize-validation runner image.
 #
-# A command task (POST /tasks with a `command` field) runs an allowlisted
-# command — e.g. `make fix-repo` — against a checkout of the target repo,
-# inside a throwaway, network-isolated container, and serge commits whatever
-# the command changed in the worktree. This image is that container: it must
-# carry the target repo's toolchain so the command runs WITHOUT network at
-# run time (serge runs it with `docker --network none`).
+# serge's in-loop normalize validation runs the target repo's own normalizer —
+# e.g. `make style && make fix-repo` — against a task worktree inside a
+# throwaway, network-isolated container to validate (and normalize) each LLM
+# patch before committing it. This image is that container: it must carry the
+# target repo's toolchain so the normalizer runs WITHOUT network at run time
+# (serge runs it with `docker --network none`).
 #
 # This example targets huggingface/transformers `make fix-repo`, which only
 # needs the `[quality]` extra (ruff, ty, libcst, GitPython, datasets, rich,
@@ -18,7 +18,7 @@
 #     --build-arg TRANSFORMERS_REF=main \
 #     -t serge/transformers-quality:latest .
 #
-# Then point serge at it:  TASK_COMMAND_IMAGE=serge/transformers-quality:latest
+# Then point serge at it:  TASK_NORMALIZE_IMAGE=serge/transformers-quality:latest
 FROM python:3.10-slim
 
 # git + make are needed by `make fix-repo`; build-essential is not (the
@@ -41,4 +41,5 @@ RUN pip install --no-cache-dir setuptools \
 # serge runs the container as the host uid:gid (so files written into the
 # bind-mounted worktree are owned by serge, not root) and overrides the
 # workdir to the checkout path, so no USER / WORKDIR / ENTRYPOINT is needed
-# here. The command (e.g. `make fix-repo`) is supplied by serge at run time.
+# here. The normalize command (e.g. `make fix-repo`) is supplied by serge at
+# run time via TASK_NORMALIZE_COMMAND.

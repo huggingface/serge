@@ -1,5 +1,6 @@
 import logging
 import os
+import shlex
 import stat
 import tempfile
 from dataclasses import dataclass
@@ -167,23 +168,29 @@ class Config:
     # Cap on serge-authored commits per fix branch (follow-up loop guard).
     task_max_followups: int = 5
 
-    # --- Command tasks (deterministic, no LLM) ------------------------
-    # A command task runs a fixed, allowlisted command (e.g. ``make
-    # fix-repo``) against a checked-out ref and commits the resulting
-    # worktree diff — no LLM is involved; the command *is* the patch
-    # producer. Gated separately from the LLM task flow because it executes
-    # arbitrary repo build code.
+    # --- Post-LLM normalize hook --------------------------------------
+    # After the LLM patch is applied to the worktree and before serge
+    # commits, optionally run the target repo's own normalizer (e.g. ``make
+    # style && make fix-repo``) in a sandbox and fold its edits into the same
+    # commit, so the opened PR is already conformant to the repo's standards
+    # (no red repo-consistency CI, no follow-up commit). Opt-in: when
+    # ``task_normalize_command`` is unset, the hook is skipped entirely and
+    # serge stays repo-agnostic.
     #
-    # ``task_command_allowlist`` is the exact set of command strings serge
-    # will run (e.g. ``("make fix-repo",)``); a request naming anything else
-    # is rejected. ``task_command_image`` is the docker image (deps baked in)
-    # used by the ``docker`` backend; ``task_sandbox_backend`` selects
-    # docker | bwrap | auto. The command always runs network-isolated.
-    task_command_enabled: bool = False
-    task_command_allowlist: tuple[str, ...] = ()
-    task_command_image: Optional[str] = None
-    task_command_timeout: int = 1800
-    task_command_memory: Optional[str] = None
+    # ``task_normalize_command`` is the argv to run (operator/repo config,
+    # never request-supplied). ``task_normalize_image`` is the docker image
+    # (the repo's toolchain baked in) used by the ``docker`` backend;
+    # ``task_sandbox_backend`` selects bwrap | docker | kubernetes | auto. The
+    # command always runs network-isolated.
+    task_normalize_command: Optional[list[str]] = None
+    task_normalize_image: Optional[str] = None
+    task_normalize_timeout: int = 1800
+    task_normalize_memory: Optional[str] = None
+    # How many times the LLM may be asked to correct its patch when the
+    # normalizer rejects it (or the patch fails to apply). 0 disables the
+    # feedback loop (validate once, accept whatever the model produced). The
+    # model gets up to ``task_normalize_max_retries + 1`` patch attempts.
+    task_normalize_max_retries: int = 2
     task_sandbox_backend: str = sandbox.AUTO_BACKEND
     # Optional Slack notification for PRs created by the /tasks flow.
     # Defaults to the org-level CI feedback Slack secrets; the transformers CI
@@ -351,17 +358,17 @@ class Config:
             ),
             task_tool_max_iterations=(_int_env("TASK_TOOL_MAX_ITERATIONS", 0) or None),
             task_max_followups=_int_env("TASK_MAX_FOLLOWUPS", 5),
-            task_command_enabled=_bool_env("TASK_COMMAND_ENABLED", False),
-            task_command_allowlist=tuple(
-                c.strip()
-                for c in (os.environ.get("TASK_COMMAND_ALLOWLIST") or "").split(",")
-                if c.strip()
+            task_normalize_command=(
+                shlex.split(os.environ.get("TASK_NORMALIZE_COMMAND") or "") or None
             ),
-            task_command_image=(os.environ.get("TASK_COMMAND_IMAGE") or "").strip()
+            task_normalize_image=(os.environ.get("TASK_NORMALIZE_IMAGE") or "").strip()
             or None,
-            task_command_timeout=_int_env("TASK_COMMAND_TIMEOUT", 1800),
-            task_command_memory=(os.environ.get("TASK_COMMAND_MEMORY") or "").strip()
+            task_normalize_timeout=_int_env("TASK_NORMALIZE_TIMEOUT", 1800),
+            task_normalize_memory=(
+                os.environ.get("TASK_NORMALIZE_MEMORY") or ""
+            ).strip()
             or None,
+            task_normalize_max_retries=_int_env("TASK_NORMALIZE_MAX_RETRIES", 2),
             task_sandbox_backend=sandbox.normalize_backend(
                 os.environ.get("TASK_SANDBOX_BACKEND")
             ),
