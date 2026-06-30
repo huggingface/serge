@@ -191,6 +191,12 @@ class Config:
     # feedback loop (validate once, accept whatever the model produced). The
     # model gets up to ``task_normalize_max_retries + 1`` patch attempts.
     task_normalize_max_retries: int = 2
+    # Optional free-text guidance injected into the task system prompt and the
+    # normalize-failure feedback, alongside the normalize command. Use it to
+    # encode policy the command itself can't express — e.g. "prefer root-cause
+    # fixes over `# noqa`/`# type: ignore` suppressions", or repo-specific
+    # conventions. Operator config, never request-supplied.
+    task_normalize_guidance: Optional[str] = None
     task_sandbox_backend: str = sandbox.AUTO_BACKEND
     # Optional Slack notification for PRs created by the /tasks flow.
     # Defaults to the org-level CI feedback Slack secrets; the transformers CI
@@ -369,6 +375,10 @@ class Config:
             ).strip()
             or None,
             task_normalize_max_retries=_int_env("TASK_NORMALIZE_MAX_RETRIES", 2),
+            task_normalize_guidance=(
+                os.environ.get("TASK_NORMALIZE_GUIDANCE") or ""
+            ).strip()
+            or None,
             task_sandbox_backend=sandbox.normalize_backend(
                 os.environ.get("TASK_SANDBOX_BACKEND")
             ),

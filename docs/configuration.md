@@ -126,6 +126,14 @@ before. See [normalize validation](tasks-normalize.md) for the full setup.
 | `TASK_NORMALIZE_TIMEOUT` | `1800` | Per-run timeout (seconds). |
 | `TASK_NORMALIZE_MEMORY` | unset | Optional docker `--memory` cap (e.g. `4g`). |
 | `TASK_NORMALIZE_MAX_RETRIES` | `2` | How many times a normalizer rejection is fed back to the model for correction. `0` = validate once, no corrective re-prompts. |
+| `TASK_NORMALIZE_GUIDANCE` | unset | Free-text policy injected into the task system prompt and the normalize-failure feedback (e.g. "prefer root-cause fixes over `# noqa`"). For anything the command itself can't express. |
+
+Task fixes also read the repo's own conventions file (`REVIEW_RULES_PATH`,
+default `.ai/review-rules.md`) straight from the checked-out branch and inject
+it into the patch-writing prompt — the same file the review flow uses. Point it
+at `AGENTS.md` (or any committed path) if that's where your conventions live.
+The model is told, regardless of config, to fix root causes and use
+suppressions (`# noqa`, `# type: ignore`) only as a last resort.
 
 ## Server
 

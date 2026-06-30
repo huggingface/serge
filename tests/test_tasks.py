@@ -9,13 +9,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from reviewbot.clone_cache import CloneCache
+from reviewbot.clone_cache import Checkout, CloneCache
 from reviewbot.config import Config
 from reviewbot.github_client import SERGE_GIT_EMAIL
 from reviewbot.tasks import (
     TaskError,
     TaskPlan,
     TaskRequest,
+    _read_repo_conventions,
     _selected_failure_context,
     _validate_patch,
     build_task_request,
@@ -597,10 +598,23 @@ class ValidatePatchTests(unittest.TestCase):
         self.assertIsNotNone(feedback)
         self.assertIn("normalizer", feedback.lower())
         self.assertIn("boom", feedback)
+        # Guides the model toward root-cause fixes over suppressions.
+        self.assertIn("ROOT CAUSE", feedback)
+        self.assertIn("noqa", feedback)
         # Worktree restored to the pristine checkout.
         with open(self._wt("hello.txt")) as f:
             self.assertEqual(f.read(), "hi from main\n")
         self.assertEqual(self.cache.collect_changes(self.co), [])
+
+    def test_operator_guidance_is_appended_to_feedback(self):
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", "echo boom >&2; exit 3"],
+            task_normalize_timeout=30,
+            task_normalize_guidance="HOUSE RULE: never add new dependencies.",
+        )
+        feedback, prepared = self._validate(cfg, self._content(self._PATCH))
+        self.assertFalse(prepared)
+        self.assertIn("HOUSE RULE: never add new dependencies.", feedback)
 
     def test_unapplyable_patch_feeds_back(self):
         cfg = self._cfg(
@@ -723,6 +737,43 @@ class PublishPreparedTests(unittest.TestCase):
         )
         self.assertTrue(result.no_change)
         self.assertIsNone(gh.created_pr)
+
+
+class ReadRepoConventionsTests(unittest.TestCase):
+    """_read_repo_conventions reads the repo's rules file straight from the
+    task worktree, falling back to the deployment default."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.wt = self._tmp.name
+        self.co = Checkout(path=self.wt, branch="main", bare="", owner="a", repo="b")
+
+    def _cfg(self, **overrides):
+        base = dict(
+            review_rules_path=".ai/review-rules.md",
+            default_review_rules="DEFAULT RULES",
+        )
+        base.update(overrides)
+        return _make_cfg(**base)
+
+    def test_reads_rules_file_from_worktree(self):
+        os.makedirs(os.path.join(self.wt, ".ai"))
+        with open(os.path.join(self.wt, ".ai", "review-rules.md"), "w") as f:
+            f.write("Edit modular_*.py, never the generated file.\n")
+        out = _read_repo_conventions(self._cfg(), self.co)
+        self.assertEqual(out, "Edit modular_*.py, never the generated file.")
+
+    def test_falls_back_to_default_when_absent(self):
+        self.assertEqual(_read_repo_conventions(self._cfg(), self.co), "DEFAULT RULES")
+
+    def test_configurable_path_can_point_at_agents_md(self):
+        with open(os.path.join(self.wt, "AGENTS.md"), "w") as f:
+            f.write("House conventions live here.\n")
+        cfg = self._cfg(review_rules_path="AGENTS.md")
+        self.assertEqual(
+            _read_repo_conventions(cfg, self.co), "House conventions live here."
+        )
 
 
 if __name__ == "__main__":

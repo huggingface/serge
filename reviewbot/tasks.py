@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -374,18 +375,43 @@ def _validate_patch(
     if returncode != 0:
         clone_cache.reset_worktree(checkout)
         cmd = " ".join(command)
-        return (
+        msg = (
             f"Your patch applied cleanly, but the repository's normalizer "
             f"(`{cmd}`) then failed (exit {returncode}):\n\n{tail}\n\n"
-            "Revise the patch so the normalizer passes. Common causes: editing "
-            "an auto-generated file instead of its modular/source counterpart, "
+            "Revise the patch so the normalizer passes. Fix the ROOT CAUSE — "
+            "suppress a check (`# noqa`, `# type: ignore`, disabling a rule) "
+            "only as a last resort, for a deliberate and justified exception, "
+            "and explain why in a comment. Common causes: editing an "
+            "auto-generated file instead of its modular/source counterpart, "
             "leaving a copied block out of sync, or a lint/format issue the "
-            "fixer cannot resolve on its own.",
-            False,
+            "fixer cannot resolve on its own."
         )
+        if cfg.task_normalize_guidance:
+            msg += f"\n\n{cfg.task_normalize_guidance.strip()}"
+        return msg, False
 
     emit("log", "Patch validated; normalizer is clean.")
     return None, True
+
+
+def _read_repo_conventions(cfg: Config, checkout: Checkout) -> str:
+    """Read the repo's own conventions file (``cfg.review_rules_path``, e.g.
+    ``.ai/review-rules.md``) from the task worktree, falling back to the
+    deployment default.
+
+    Safe to read straight from the worktree: a task checks out the repo's own
+    trusted branch (base or a serge fix branch), not an untrusted fork PR head,
+    so there's no need for the default-branch overlay the review flow uses."""
+    rel = (cfg.review_rules_path or "").strip()
+    if rel:
+        try:
+            with open(os.path.join(checkout.path, rel), encoding="utf-8") as fh:
+                content = fh.read().strip()
+        except OSError:
+            content = ""
+        if content:
+            return content
+    return cfg.default_review_rules
 
 
 def prepare_task(
@@ -426,7 +452,11 @@ def prepare_task(
         stream=cfg.llm_stream,
         compressor=MessageCompressor.from_env(),
     )
-    system_prompt = build_task_system_prompt(tools_enabled=tool_env is not None)
+    system_prompt = build_task_system_prompt(
+        _read_repo_conventions(cfg, checkout),
+        cfg.task_normalize_guidance,
+        tools_enabled=tool_env is not None,
+    )
     user_prompt = build_task_user_prompt(
         repo_full_name=req.repo_full_name,
         base_ref=req.base_ref,

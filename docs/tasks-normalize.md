@@ -137,6 +137,21 @@ TASK_SANDBOX_BACKEND=docker
 The per-repo write opt-in (`task_write_enabled` on the repo's provider config)
 is the same as for the LLM task flow — the hook commits through the same path.
 
+### Guiding the model
+
+The model is always told to fix the **root cause** and to use suppressions
+(`# noqa`, `# type: ignore`) only as a last resort. You can add more policy two
+ways, both repo-agnostic:
+
+- **`TASK_NORMALIZE_GUIDANCE`** — operator free-text appended to the system
+  prompt and to the normalize-failure feedback (e.g. "never add a new
+  dependency to satisfy a check").
+- **The repo's conventions file** (`REVIEW_RULES_PATH`, default
+  `.ai/review-rules.md`; can point at `AGENTS.md`) — read from the checked-out
+  branch and injected into the patch-writing prompt, so the model knows the
+  repo's rules (e.g. "edit `modular_*.py`, never the generated `modeling_*.py`")
+  *before* it writes the patch, not just after the normalizer rejects it.
+
 ## Security model
 
 Same trust boundary as the LLM task flow, with stronger isolation for running
