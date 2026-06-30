@@ -48,7 +48,7 @@ class AcquireRefTests(unittest.TestCase):
         with open(full, "w") as f:
             f.write(content)
 
-    def _acquire(self, ref="main", job_id="job1"):
+    def _acquire(self, ref="main", job_id="job1", standalone=False):
         return self.cache.acquire_ref(
             token="",
             owner="acme",
@@ -56,6 +56,7 @@ class AcquireRefTests(unittest.TestCase):
             ref=ref,
             job_id=job_id,
             remote_url=self.src,
+            standalone=standalone,
         )
 
     def test_acquire_ref_checks_out_branch(self):
@@ -67,6 +68,50 @@ class AcquireRefTests(unittest.TestCase):
     def test_acquire_ref_serge_branch(self):
         co = self._acquire(ref="serge/fix-1", job_id="job2")
         self.assertIsNotNone(co)
+
+    def test_default_checkout_is_linked_worktree(self):
+        # Without `standalone`, acquire_ref keeps the cheap linked worktree
+        # (used by reviews / the bwrap dev backend / host-side runs): its
+        # `.git` is a *file* pointing at the shared bare repo, not a directory.
+        co = self._acquire()
+        self.assertTrue(os.path.isfile(os.path.join(co.path, ".git")))
+
+    def test_acquire_ref_checkout_is_self_contained(self):
+        # The normalize sandbox binds only the worktree dir, so the gitdir
+        # must live inside it: a standalone clone has a real `.git` directory,
+        # whereas a linked `git worktree` would leave a `.git` *file* pointing
+        # at the shared bare repo (outside the bind mount), breaking every
+        # in-sandbox git command.
+        co = self._acquire(standalone=True)
+        self.assertTrue(
+            os.path.isdir(os.path.join(co.path, ".git")),
+            ".git must be a real directory (self-contained clone), not a "
+            "linked-worktree pointer file",
+        )
+        # git works using only paths inside the checkout — prove it by running
+        # a git command after pointing GIT_CONFIG_NOSYSTEM and an empty HOME so
+        # nothing outside co.path can satisfy it.
+        proc = subprocess.run(
+            ["git", "-C", co.path, "rev-parse", "--is-inside-work-tree"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", ""), "HOME": "/nonexistent"},
+        )
+        self.assertEqual(proc.stdout.strip(), "true")
+
+    def test_acquire_ref_current_branch_is_main(self):
+        # transformers' repo-consistency checkers special-case
+        # `git branch --show-current == main` to check ALL files; the checkout
+        # must report `main` regardless of which ref was fetched.
+        co = self._acquire(ref="serge/fix-1", job_id="branchcheck", standalone=True)
+        proc = subprocess.run(
+            ["git", "-C", co.path, "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.stdout.strip(), "main")
 
     def test_acquire_ref_missing_branch_returns_none(self):
         co = self._acquire(ref="nope", job_id="jobX")
@@ -102,6 +147,27 @@ class AcquireRefTests(unittest.TestCase):
         self.assertIsNone(changes["del.txt"].content)
         self.assertEqual(changes["new.txt"].status, "A")
         self.assertEqual(changes["new.txt"].content, b"brand new\n")
+
+    def test_standalone_apply_patch_and_collect_changes(self):
+        # The real /tasks path: patch applied as uncommitted changes on the
+        # `main` branch of a standalone clone, then collected via the staged
+        # diff. Mirrors the worktree test to guard the clone path equally.
+        co = self._acquire(standalone=True)
+        patch = (
+            "diff --git a/hello.txt b/hello.txt\n"
+            "--- a/hello.txt\n"
+            "+++ b/hello.txt\n"
+            "@@ -1 +1 @@\n"
+            "-hi from main\n"
+            "+hi patched\n"
+        )
+        self.cache.apply_patch(co, patch)
+        changes = {c.path: c for c in self.cache.collect_changes(co)}
+        self.assertEqual(changes["hello.txt"].status, "M")
+        self.assertEqual(changes["hello.txt"].content, b"hi patched\n")
+        # reset_worktree must restore the standalone checkout to its base.
+        self.cache.reset_worktree(co)
+        self.assertEqual(self.cache.collect_changes(co), [])
 
     def test_apply_patch_failure_raises(self):
         co = self._acquire()

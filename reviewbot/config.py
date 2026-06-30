@@ -204,6 +204,23 @@ class Config:
     slack_bot_token: Optional[str] = None
     slack_report_channel: Optional[str] = None
 
+    @property
+    def needs_isolated_checkout(self) -> bool:
+        """Whether the /tasks checkout must be a self-contained git clone
+        rather than a linked worktree.
+
+        True only when an in-loop normalizer runs inside a container sandbox
+        that binds *just* the worktree (``docker``/``kubernetes``, and
+        ``auto`` which may resolve to docker), so in-sandbox git works. When
+        normalize is unconfigured, or the dev-only ``bwrap`` backend is used,
+        the cheaper linked worktree is kept (see
+        :meth:`CloneCache.acquire_ref`)."""
+        return bool(self.task_normalize_command) and self.task_sandbox_backend in (
+            sandbox.DOCKER_BACKEND,
+            sandbox.KUBERNETES_BACKEND,
+            sandbox.AUTO_BACKEND,
+        )
+
     @classmethod
     def from_env(
         cls,
