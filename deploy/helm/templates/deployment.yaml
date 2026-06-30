@@ -70,6 +70,12 @@ spec:
           volumeMounts:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
+            {{- if .Values.normalize.kubernetes.enabled }}
+            # Shared RWX worktree cache: serge writes the clone here and each
+            # normalize Job mounts the same claim (by subPath).
+            - name: worktrees
+              mountPath: {{ .Values.normalize.kubernetes.worktree.mountPath }}
+            {{- end }}
       volumes:
         - name: data
           {{- if .Values.persistence.enabled }}
@@ -78,6 +84,11 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if .Values.normalize.kubernetes.enabled }}
+        - name: worktrees
+          persistentVolumeClaim:
+            claimName: {{ include "name" . }}-worktrees
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{ toYaml . | nindent 8 }}
       {{- end }}

@@ -198,6 +198,17 @@ class Config:
     # conventions. Operator config, never request-supplied.
     task_normalize_guidance: Optional[str] = None
     task_sandbox_backend: str = sandbox.AUTO_BACKEND
+    # Kubernetes normalize backend (TASK_SANDBOX_BACKEND=kubernetes). The Job
+    # runs the normalizer on the worktree, which serge writes to a shared RWX
+    # PVC. ``task_k8s_namespace`` defaults to the in-cluster namespace at
+    # runtime; ``task_k8s_worktree_pvc`` is the claim the Job mounts;
+    # ``task_k8s_worktree_volume_root`` is where that PVC is mounted in serge
+    # (defaults to the clone-cache dir) — the worktree's path *relative* to it
+    # becomes the Job's volume subPath, so the Job sees only its own worktree.
+    task_k8s_namespace: Optional[str] = None
+    task_k8s_worktree_pvc: Optional[str] = None
+    task_k8s_worktree_volume_root: Optional[str] = None
+    task_k8s_service_account: Optional[str] = None
     # Optional Slack notification for PRs created by the /tasks flow.
     # Defaults to the org-level CI feedback Slack secrets; the transformers CI
     # names remain supported as fallbacks.
@@ -399,6 +410,20 @@ class Config:
             task_sandbox_backend=sandbox.normalize_backend(
                 os.environ.get("TASK_SANDBOX_BACKEND")
             ),
+            task_k8s_namespace=(os.environ.get("TASK_K8S_NAMESPACE") or "").strip()
+            or None,
+            task_k8s_worktree_pvc=(
+                os.environ.get("TASK_K8S_WORKTREE_PVC") or ""
+            ).strip()
+            or None,
+            task_k8s_worktree_volume_root=(
+                os.environ.get("TASK_K8S_WORKTREE_VOLUME_ROOT") or ""
+            ).strip()
+            or None,
+            task_k8s_service_account=(
+                os.environ.get("TASK_K8S_SERVICE_ACCOUNT") or ""
+            ).strip()
+            or None,
             slack_bot_token=(
                 os.environ.get("SLACK_CIFEEDBACK_BOT_TOKEN")
                 or os.environ.get("CI_SLACK_BOT_TOKEN")

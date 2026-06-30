@@ -34,6 +34,12 @@ web = [
 headroom = [
   "headroom-ai>=0.22",
 ]
+# Kubernetes normalize backend (TASK_SANDBOX_BACKEND=kubernetes). Only needed
+# for k8s deployments; the docker/bwrap backends require nothing extra. The
+# client is imported lazily so non-k8s installs never pay for it.
+kubernetes = [
+  "kubernetes>=29",
+]
 
 [project.scripts]
 reviewbot-action = "reviewbot.action_runner:main"

@@ -84,3 +84,38 @@ existingSecret: ""
 
 extraEnv: []
 extraEnvFrom: []
+
+# In-loop normalize gate (TASK_SANDBOX_BACKEND=kubernetes): run each task's
+# normalizer in a one-shot, locked-down Kubernetes Job. When enabled, the chart
+# creates the RBAC (serge's SA may manage Jobs/pods/logs), a shared RWX worktree
+# PVC, and a deny-all-egress NetworkPolicy for the Job pods, and wires the TASK_*
+# env. Leave disabled for docker/bwrap deployments — Kubernetes is never
+# mandatory. Requires serviceAccount.create=true (the RoleBinding targets it).
+normalize:
+  kubernetes:
+    enabled: false
+    # Image with the repo toolchain baked in (TASK_NORMALIZE_IMAGE). The Job
+    # has no network, so everything must already be in the image.
+    image: ""
+    # Shell-style command for TASK_NORMALIZE_COMMAND (parsed with shlex). Curate
+    # it to exclude network/git-history-only checkers such as add_dates, e.g.
+    #   bash -lc 'make style && python utils/checkers.py <checkers> --fix --keep-going'
+    command: ""
+    timeout: 1800
+    memory: ""          # optional Job memory limit (e.g. 4Gi)
+    maxRetries: 2
+    guidance: ""        # optional TASK_NORMALIZE_GUIDANCE
+    reviewRulesPath: "" # optional REVIEW_RULES_PATH (e.g. .ai/AGENTS.md)
+    namespace: ""       # Job namespace; "" = the release namespace
+    # ServiceAccount for the Job *pods* (not serge). "" uses the namespace
+    # default; the pod gets no API token regardless (automountServiceAccountToken
+    # is false), so it needs no permissions.
+    podServiceAccount: ""
+    # Shared ReadWriteMany volume for task worktrees: serge writes the
+    # self-contained clone here and the Job mounts the same claim (by subPath).
+    # REQUIRES a storage class that supports ReadWriteMany (EFS, Filestore, ...).
+    # WEB_CLONE_CACHE_DIR is set to mountPath so the cache lives on this volume.
+    worktree:
+      mountPath: /var/lib/reviewbot-clones
+      storageClass: ""
+      size: 20Gi
