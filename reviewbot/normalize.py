@@ -62,6 +62,7 @@ def run_normalize(
     k8s_worktree_pvc: Optional[str] = None,
     k8s_worktree_volume_root: Optional[str] = None,
     k8s_service_account: Optional[str] = None,
+    k8s_node_selector: Optional[str] = None,
 ) -> tuple[int, str]:
     """Run ``command`` against the worktree in the selected sandbox backend.
 
@@ -90,6 +91,7 @@ def run_normalize(
             worktree_pvc=k8s_worktree_pvc,
             worktree_volume_root=k8s_worktree_volume_root,
             service_account=k8s_service_account,
+            node_selector=k8s_node_selector,
         )
     return _run_subprocess(
         command,
@@ -164,6 +166,7 @@ def _run_kubernetes(
     worktree_pvc: Optional[str],
     worktree_volume_root: Optional[str],
     service_account: Optional[str],
+    node_selector: Optional[str],
 ) -> tuple[int, str]:
     """kubernetes backend: run the command as a one-shot Job in a locked-down
     namespace (see ``reviewbot/k8s_sandbox.py``). The Job runs as serge's
@@ -172,7 +175,12 @@ def _run_kubernetes(
     ``k8s_sandbox`` (and, transitively, the optional ``kubernetes`` client) is
     imported here rather than at module load, so it is only required when this
     backend is actually selected."""
-    from .k8s_sandbox import K8sSandboxError, K8sSettings, run_job
+    from .k8s_sandbox import (
+        K8sSandboxError,
+        K8sSettings,
+        parse_node_selector,
+        run_job,
+    )
 
     if network:
         # Egress is denied by the cluster NetworkPolicy on the sandbox label;
@@ -188,6 +196,7 @@ def _run_kubernetes(
         worktree_volume_root=worktree_volume_root,
         namespace=namespace,
         service_account=service_account,
+        node_selector=parse_node_selector(node_selector),
     )
     try:
         return run_job(

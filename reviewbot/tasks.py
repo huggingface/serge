@@ -370,6 +370,7 @@ def _validate_patch(
                 cfg.task_k8s_worktree_volume_root or cfg.web_clone_cache_dir or None
             ),
             k8s_service_account=cfg.task_k8s_service_account,
+            k8s_node_selector=cfg.task_k8s_node_selector,
         )
     except NormalizeError as exc:
         # Infrastructure problem (sandbox unavailable, timeout) — not the

@@ -71,6 +71,26 @@ class K8sSettings:
     worktree_volume_root: Optional[str] = None
     namespace: Optional[str] = None
     service_account: Optional[str] = None
+    node_selector: Optional[dict] = None
+
+
+def parse_node_selector(raw: Optional[str]) -> Optional[dict]:
+    """Parse a ``"key=value,key2=value2"`` string into a nodeSelector dict.
+
+    Keys may contain ``/`` and ``.`` (e.g. ``scheduling.cast.ai/node-template``);
+    only the first ``=`` is used as the separator. Returns ``None`` when empty."""
+    if not raw:
+        return None
+    out: dict = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        key, sep, value = pair.partition("=")
+        key = key.strip()
+        if key and sep:
+            out[key] = value.strip()
+    return out or None
 
 
 def _sanitize_dns1123(text: str) -> str:
@@ -211,6 +231,8 @@ def build_job_manifest(
     }
     if settings.service_account:
         pod_spec["serviceAccountName"] = settings.service_account
+    if settings.node_selector:
+        pod_spec["nodeSelector"] = dict(settings.node_selector)
 
     return {
         "apiVersion": "batch/v1",
@@ -373,7 +395,7 @@ def _collect_pod_result(core, namespace: str, job_name: str) -> tuple[int, str]:
     pod_name = pod.metadata.name
 
     exit_code = 1
-    for cs in (getattr(pod.status, "container_statuses", None) or []):
+    for cs in getattr(pod.status, "container_statuses", None) or []:
         term = getattr(cs.state, "terminated", None) if cs.state else None
         if term is not None and term.exit_code is not None:
             exit_code = term.exit_code
@@ -403,4 +425,6 @@ def _delete_job(batch, job_name: str, namespace: str) -> None:
             body=V1DeleteOptions(propagation_policy="Background"),
         )
     except ApiException as exc:  # pragma: no cover - cleanup is best-effort
-        log.warning("could not delete normalize Job %s: %s", job_name, exc.reason or exc)
+        log.warning(
+            "could not delete normalize Job %s: %s", job_name, exc.reason or exc
+        )

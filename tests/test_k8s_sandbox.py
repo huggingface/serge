@@ -95,7 +95,9 @@ class ManifestTests(unittest.TestCase):
         # serge running as uid 0 must not assert runAsNonRoot (would contradict
         # the explicit runAsUser and be rejected by the kubelet).
         m = self._build(uid=0, gid=0)
-        self.assertNotIn("runAsNonRoot", m["spec"]["template"]["spec"]["securityContext"])
+        self.assertNotIn(
+            "runAsNonRoot", m["spec"]["template"]["spec"]["securityContext"]
+        )
 
     def test_missing_image_pvc_or_root_raise(self):
         with self.assertRaises(K8sSandboxError):
@@ -119,7 +121,9 @@ class HelperTests(unittest.TestCase):
         self.assertLessEqual(len(name), 63)
         self.assertTrue(all(c.islower() or c.isdigit() or c == "-" for c in name))
         self.assertFalse(name.startswith("-") or name.endswith("-"))
-        self.assertNotEqual(name, make_job_name("/data/clones/worktrees/Acme__Widget__job1"))
+        self.assertNotEqual(
+            name, make_job_name("/data/clones/worktrees/Acme__Widget__job1")
+        )
 
     def test_resolve_namespace_prefers_explicit(self):
         self.assertEqual(resolve_namespace(_settings(namespace="explicit")), "explicit")
@@ -153,8 +157,10 @@ class _FakeApiException(Exception):
 def _install_fake_kubernetes():
     """Inject minimal fake ``kubernetes`` modules so the lazy imports inside
     run_job resolve without the real client installed. Returns a cleanup fn."""
-    saved = {k: sys.modules.get(k) for k in (
-        "kubernetes", "kubernetes.client", "kubernetes.client.rest")}
+    saved = {
+        k: sys.modules.get(k)
+        for k in ("kubernetes", "kubernetes.client", "kubernetes.client.rest")
+    }
 
     kmod = types.ModuleType("kubernetes")
     cmod = types.ModuleType("kubernetes.client")
@@ -213,7 +219,9 @@ class RunJobTests(unittest.TestCase):
         batch, core = self._clients(
             statuses=[running, done], pod=_pod_with(0), log_text="a\nb\nc"
         )
-        with mock.patch.object(k8s_sandbox, "_load_clients", return_value=(batch, core)):
+        with mock.patch.object(
+            k8s_sandbox, "_load_clients", return_value=(batch, core)
+        ):
             rc, tail = k8s_sandbox.run_job(
                 ["make", "style"],
                 image="img:1",
@@ -233,7 +241,9 @@ class RunJobTests(unittest.TestCase):
     def test_failed_job_surfaces_container_exit_code(self):
         done = types.SimpleNamespace(succeeded=None, failed=1, conditions=None)
         batch, core = self._clients(statuses=[done], pod=_pod_with(2))
-        with mock.patch.object(k8s_sandbox, "_load_clients", return_value=(batch, core)):
+        with mock.patch.object(
+            k8s_sandbox, "_load_clients", return_value=(batch, core)
+        ):
             rc, _ = k8s_sandbox.run_job(
                 ["make", "style"],
                 image="img:1",
@@ -255,7 +265,9 @@ class RunJobTests(unittest.TestCase):
             status=types.SimpleNamespace(container_statuses=None),
         )
         batch, core = self._clients(statuses=[done], pod=pod)
-        with mock.patch.object(k8s_sandbox, "_load_clients", return_value=(batch, core)):
+        with mock.patch.object(
+            k8s_sandbox, "_load_clients", return_value=(batch, core)
+        ):
             rc, _ = k8s_sandbox.run_job(
                 ["make", "style"],
                 image="img:1",
@@ -276,7 +288,9 @@ class RunJobTests(unittest.TestCase):
             status=running
         )
         core = mock.Mock()
-        with mock.patch.object(k8s_sandbox, "_load_clients", return_value=(batch, core)):
+        with mock.patch.object(
+            k8s_sandbox, "_load_clients", return_value=(batch, core)
+        ):
             with self.assertRaises(K8sSandboxError):
                 k8s_sandbox.run_job(
                     ["make", "style"],
@@ -295,7 +309,9 @@ class RunJobTests(unittest.TestCase):
         batch = mock.Mock()
         batch.create_namespaced_job.side_effect = _FakeApiException("forbidden")
         core = mock.Mock()
-        with mock.patch.object(k8s_sandbox, "_load_clients", return_value=(batch, core)):
+        with mock.patch.object(
+            k8s_sandbox, "_load_clients", return_value=(batch, core)
+        ):
             with self.assertRaises(K8sSandboxError):
                 k8s_sandbox.run_job(
                     ["make", "style"],

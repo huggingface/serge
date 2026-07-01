@@ -35,4 +35,7 @@ data:
   {{- with $k.podServiceAccount }}
   TASK_K8S_SERVICE_ACCOUNT: {{ . | quote }}
   {{- end }}
+  {{- with $k.nodeSelector }}
+  TASK_K8S_NODE_SELECTOR: {{ . | quote }}
+  {{- end }}
   {{- end }}

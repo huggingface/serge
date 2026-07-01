@@ -111,6 +111,10 @@ normalize:
     # default; the pod gets no API token regardless (automountServiceAccountToken
     # is false), so it needs no permissions.
     podServiceAccount: ""
+    # nodeSelector for the Job pods, as "key=value,key2=value2". On CASTAI
+    # clusters, target a node template, e.g.
+    # "scheduling.cast.ai/node-template=default-by-castai".
+    nodeSelector: ""
     # Shared ReadWriteMany volume for task worktrees: serge writes the
     # self-contained clone here and the Job mounts the same claim (by subPath).
     # REQUIRES a storage class that supports ReadWriteMany (EFS, Filestore, ...).

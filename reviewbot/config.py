@@ -209,6 +209,9 @@ class Config:
     task_k8s_worktree_pvc: Optional[str] = None
     task_k8s_worktree_volume_root: Optional[str] = None
     task_k8s_service_account: Optional[str] = None
+    # nodeSelector for the normalize Job pods, as "key=value,key2=value2"
+    # (e.g. "scheduling.cast.ai/node-template=default-by-castai").
+    task_k8s_node_selector: Optional[str] = None
     # Optional Slack notification for PRs created by the /tasks flow.
     # Defaults to the org-level CI feedback Slack secrets; the transformers CI
     # names remain supported as fallbacks.
@@ -422,6 +425,10 @@ class Config:
             or None,
             task_k8s_service_account=(
                 os.environ.get("TASK_K8S_SERVICE_ACCOUNT") or ""
+            ).strip()
+            or None,
+            task_k8s_node_selector=(
+                os.environ.get("TASK_K8S_NODE_SELECTOR") or ""
             ).strip()
             or None,
             slack_bot_token=(
