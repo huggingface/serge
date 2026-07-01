@@ -690,6 +690,11 @@ def _commit_changes(
     )
     gh.create_ref(owner, repo, f"refs/heads/{branch}", commit_sha)
     emit_fn("log", f"Created branch {branch} at {commit_sha[:8]}")
+    # Open as a draft, then immediately mark ready-for-review. The
+    # draft->ready transition is what fires the `ready_for_review` webhook that
+    # reviewer-assignment workflows (e.g. transformers' assign-reviewers.yml)
+    # listen for; a PR born non-draft never emits that event and gets no
+    # reviewers routed to it.
     pr = gh.create_pull_request(
         owner,
         repo,
@@ -697,8 +702,12 @@ def _commit_changes(
         head=branch,
         base=req.base_ref,
         body=body,
+        draft=True,
     )
-    emit_fn("log", f"Opened PR #{pr.get('number')}: {pr.get('html_url')}")
+    gh.mark_pull_request_ready(pr["node_id"])
+    emit_fn(
+        "log", f"Opened PR #{pr.get('number')} (draft->ready): {pr.get('html_url')}"
+    )
     if req.slack_notify_pr_created:
         post_task_pr_created_notification(
             token=cfg.slack_bot_token,

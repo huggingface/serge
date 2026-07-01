@@ -271,10 +271,17 @@ class GitHubClient:
         head: str,
         base: str,
         body: str,
+        draft: bool = False,
     ) -> dict:
         r = self.session.post(
             f"https://api.github.com/repos/{owner}/{repo}/pulls",
-            json={"title": title, "head": head, "base": base, "body": body},
+            json={
+                "title": title,
+                "head": head,
+                "base": base,
+                "body": body,
+                "draft": draft,
+            },
             timeout=60,
         )
         if not r.ok:
@@ -283,6 +290,34 @@ class GitHubClient:
                 response=r,
             )
         return r.json()
+
+    def mark_pull_request_ready(self, node_id: str) -> None:
+        """Transition a draft PR to ready-for-review via the GraphQL
+        ``markPullRequestReadyForReview`` mutation. The REST ``PATCH /pulls``
+        endpoint cannot flip ``draft``, so this is the only way. The
+        draft->ready transition is what fires the ``ready_for_review`` webhook
+        that downstream reviewer-assignment workflows listen for. ``node_id``
+        is the GraphQL global ID returned in the create-PR response."""
+        query = (
+            "mutation($id: ID!) { markPullRequestReadyForReview(input: "
+            "{pullRequestId: $id}) { pullRequest { id isDraft } } }"
+        )
+        r = self.session.post(
+            "https://api.github.com/graphql",
+            json={"query": query, "variables": {"id": node_id}},
+            timeout=60,
+        )
+        if not r.ok:
+            raise requests.HTTPError(
+                f"{r.status_code} marking PR ready for review: {r.text}",
+                response=r,
+            )
+        errors = (r.json() or {}).get("errors")
+        if errors:
+            raise requests.HTTPError(
+                f"GraphQL errors marking PR ready for review: {errors}",
+                response=r,
+            )
 
     def count_branch_commits_by_author(
         self, owner: str, repo: str, branch: str, *, author_email: str, cap: int = 100

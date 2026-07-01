@@ -120,14 +120,22 @@ class _FakeGH:
         self.updated_refs.append((ref, sha))
         return {}
 
-    def create_pull_request(self, owner, repo, *, title, head, base, body):
+    def create_pull_request(self, owner, repo, *, title, head, base, body, draft=False):
         self.created_pr = {
             "title": title,
             "head": head,
             "base": base,
             "body": body,
+            "draft": draft,
         }
-        return {"number": 99, "html_url": "https://github.com/o/r/pull/99"}
+        return {
+            "number": 99,
+            "html_url": "https://github.com/o/r/pull/99",
+            "node_id": "PR_node_99",
+        }
+
+    def mark_pull_request_ready(self, node_id):
+        self.marked_ready = node_id
 
 
 class BuildTaskRequestTests(unittest.TestCase):
