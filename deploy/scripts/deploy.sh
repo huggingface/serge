@@ -6,7 +6,7 @@ CHART_DIR="${ROOT_DIR}/deploy/helm"
 
 release="serge"
 namespace="serge"
-values_file="${CHART_DIR}/env/prod.yaml"
+values_files=()
 secret_file=""
 expected_context=""
 dry_run=0
@@ -20,7 +20,8 @@ Usage: deploy/scripts/deploy.sh [options]
 Options:
   -n, --namespace NAME       Kubernetes namespace (default: serge)
   -r, --release NAME         Helm release name (default: serge)
-  -f, --values FILE          Helm values file (default: deploy/helm/env/prod.yaml)
+  -f, --values FILE          Helm values file; repeat to layer overlays, later
+                             files win (default: deploy/helm/env/prod.yaml)
       --secret-file FILE     Apply a local Secret manifest before deploying
       --context NAME         Require this kubectl context before deploying
       --from-head            Pin image.tag to HEAD's sha-<commit>, waiting for
@@ -42,7 +43,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -f|--values)
-      values_file="$2"
+      values_files+=("$2")
       shift 2
       ;;
     --secret-file)
@@ -88,10 +89,22 @@ if [[ ! -d "${CHART_DIR}" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${values_file}" ]]; then
-  echo "values file not found: ${values_file}" >&2
-  exit 1
+if [[ "${#values_files[@]}" -eq 0 ]]; then
+  values_files=("${CHART_DIR}/env/prod.yaml")
 fi
+
+for vf in "${values_files[@]}"; do
+  if [[ ! -f "${vf}" ]]; then
+    echo "values file not found: ${vf}" >&2
+    exit 1
+  fi
+done
+
+# Assemble helm's repeated -f flags once; later files override earlier ones.
+helm_values_args=()
+for vf in "${values_files[@]}"; do
+  helm_values_args+=(-f "${vf}")
+done
 
 # --from-head: derive HEAD's image tag, wait for CI to publish it, then pin it
 # in the values file. The CI tag format mirrors docker/metadata-action's
@@ -136,12 +149,15 @@ if [[ "${from_head}" -eq 1 ]]; then
     esac
   done
 
-  # Pin the tag in the values file (portable in-place edit). Only the single
-  # image.tag line is touched.
+  # Pin the tag in the primary values file (portable in-place edit). Only the
+  # single image.tag line is touched. image.tag lives in the base values file
+  # (prod.yaml), so we edit the first -f file; overlays layered after it do not
+  # carry serge's image.tag.
+  primary_values="${values_files[0]}"
   tmp_values="$(mktemp)"
-  sed -E "s|^([[:space:]]*tag:[[:space:]]*).*|\1${image_tag}|" "${values_file}" > "${tmp_values}"
-  mv "${tmp_values}" "${values_file}"
-  echo "Pinned image.tag: ${image_tag} in ${values_file}"
+  sed -E "s|^([[:space:]]*tag:[[:space:]]*).*|\1${image_tag}|" "${primary_values}" > "${tmp_values}"
+  mv "${tmp_values}" "${primary_values}"
+  echo "Pinned image.tag: ${image_tag} in ${primary_values}"
 fi
 
 current_context="$(kubectl config current-context)"
@@ -153,10 +169,10 @@ fi
 echo "Context: ${current_context}"
 echo "Namespace: ${namespace}"
 echo "Release: ${release}"
-echo "Values: ${values_file}"
+echo "Values: ${values_files[*]}"
 
 if [[ "${dry_run}" -eq 1 ]]; then
-  helm template "${release}" "${CHART_DIR}" -n "${namespace}" -f "${values_file}"
+  helm template "${release}" "${CHART_DIR}" -n "${namespace}" "${helm_values_args[@]}"
   exit 0
 fi
 
@@ -188,7 +204,7 @@ fi
 
 helm upgrade --install "${release}" "${CHART_DIR}" \
   -n "${namespace}" \
-  -f "${values_file}" \
+  "${helm_values_args[@]}" \
   --wait \
   --timeout 10m
 
