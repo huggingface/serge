@@ -78,12 +78,35 @@ class GitDataMethodsTests(unittest.TestCase):
             payload={"number": 7, "html_url": "u"}
         )
         pr = self.gh.create_pull_request(
-            "o", "r", title="t", head="serge/fix-1", base="main", body="b"
+            "o", "r", title="t", head="serge/fix-1", base="main", body="b", draft=True
         )
         self.assertEqual(pr["number"], 7)
         body = self.gh.session.post.call_args.kwargs["json"]
         self.assertEqual(body["head"], "serge/fix-1")
         self.assertEqual(body["base"], "main")
+        self.assertTrue(body["draft"])
+
+    def test_mark_pull_request_ready(self):
+        self.gh.session.post.return_value = _resp(
+            payload={
+                "data": {
+                    "markPullRequestReadyForReview": {"pullRequest": {"isDraft": False}}
+                }
+            }
+        )
+        self.gh.mark_pull_request_ready("PR_node_1")
+        body = self.gh.session.post.call_args.kwargs["json"]
+        self.assertEqual(body["variables"]["id"], "PR_node_1")
+        self.assertIn("markPullRequestReadyForReview", body["query"])
+
+    def test_mark_pull_request_ready_graphql_errors(self):
+        import requests
+
+        self.gh.session.post.return_value = _resp(
+            payload={"errors": [{"message": "not found"}]}
+        )
+        with self.assertRaises(requests.HTTPError):
+            self.gh.mark_pull_request_ready("PR_node_1")
 
     def test_count_branch_commits_by_author(self):
         self.gh.session.get.return_value = _resp(

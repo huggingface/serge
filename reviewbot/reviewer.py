@@ -887,20 +887,42 @@ def _run_agentic_loop(
     # `{"type": "json_object"}`, accepting only `"json_schema"`). The
     # force message already instructs "single JSON object only", and
     # _extract_json parses the result forgivingly.
-    chat = llm.complete(
-        messages,
-        max_tokens=cfg.llm_max_tokens,
-        chunk_callback=chunk_cb,
-        extra=final_extra,
-    )
-    metrics.turns += 1
-    metrics.latency_seconds += chat.latency_seconds
-    if chat.prompt_tokens is not None:
-        metrics.prompt_tokens += chat.prompt_tokens
-    if chat.completion_tokens is not None:
-        metrics.completion_tokens += chat.completion_tokens
-    _emit_metrics(emit, metrics)
-    return chat, metrics
+    while True:
+        chat = llm.complete(
+            messages,
+            max_tokens=cfg.llm_max_tokens,
+            chunk_callback=chunk_cb,
+            extra=final_extra,
+        )
+        metrics.turns += 1
+        metrics.latency_seconds += chat.latency_seconds
+        if chat.prompt_tokens is not None:
+            metrics.prompt_tokens += chat.prompt_tokens
+        if chat.completion_tokens is not None:
+            metrics.completion_tokens += chat.completion_tokens
+        _emit_metrics(emit, metrics)
+
+        # The verification gate must run on the forced final answer too —
+        # exhausting the tool budget must not silently bypass validation (for
+        # /tasks this is the normalize gate; skipping it here is how
+        # un-normalized patches reach an opened PR). Corrections on this path
+        # are tool-less: the model fixes its diff from the normalizer's
+        # feedback, which needs no browsing.
+        if validate is None:
+            return chat, metrics
+        feedback = validate(chat)
+        if feedback is None or validation_retries >= max_validation_retries:
+            return chat, metrics
+        validation_retries += 1
+        if emit is not None:
+            emit(
+                "log",
+                f"Patch validation failed (correction "
+                f"{validation_retries}/{max_validation_retries}); "
+                "asking the model to fix it (no tools)",
+            )
+        messages.append({"role": "assistant", "content": chat.content or None})
+        messages.append({"role": "user", "content": feedback})
 
 
 def _wrap_chunk_cb(

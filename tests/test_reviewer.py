@@ -448,6 +448,63 @@ class ValidationGateTests(unittest.TestCase):
         self.assertEqual(chat.content, '{"patch": "v1"}')
         self.assertEqual(len(llm.calls), 1)
 
+    def test_force_final_path_still_validates(self) -> None:
+        """Regression: exhausting the tool budget must NOT bypass the
+        verification gate. The forced final answer has to go through
+        ``validate`` (with tool-less corrections) exactly like an in-budget
+        final answer, or un-normalized patches reach an opened PR."""
+        cfg = _CfgStub(llm_max_input_tokens=1_500_000)
+        # Turn 1: a tool call that pushes cumulative input tokens over the cap,
+        # forcing the loop into its tool-less final-answer tail. Turns 2/3 are
+        # the forced final answer + its tool-less correction.
+        results = [
+            ChatResult(
+                content="",
+                usage={"prompt_tokens": 1_200_000, "completion_tokens": 50},
+                tool_calls=[ToolCall(id="t0", name="noop", arguments="{}")],
+            ),
+            ChatResult(
+                content='{"patch": "v1"}',
+                usage={"prompt_tokens": 400_000, "completion_tokens": 30},
+            ),
+            ChatResult(
+                content='{"patch": "v2"}',
+                usage={"prompt_tokens": 400_000, "completion_tokens": 30},
+            ),
+        ]
+        llm = _FakeLLM(results)
+        seen: list[str] = []
+
+        def validate(chat: ChatResult) -> str | None:
+            seen.append(chat.content)
+            return "normalizer failed, fix it" if chat.content == '{"patch": "v1"}' else None
+
+        chat, metrics = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "go"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+            prior_prompt_tokens=400_000,
+            validate=validate,
+            max_validation_retries=2,
+        )
+        # The forced final answer WAS validated, and its rejection drove a
+        # tool-less correction that was then accepted.
+        self.assertEqual(seen, ['{"patch": "v1"}', '{"patch": "v2"}'])
+        self.assertEqual(chat.content, '{"patch": "v2"}')
+        # Turn 1 (tool) + forced final v1 + tool-less correction v2.
+        self.assertEqual(len(llm.calls), 3)
+        # Both forced-final calls run without tools.
+        self.assertNotIn("tools", llm.calls[1])
+        self.assertNotIn("tools", llm.calls[2])
+        # The normalizer feedback re-entered the same conversation.
+        self.assertTrue(
+            any(
+                m.get("role") == "user" and m.get("content") == "normalizer failed, fix it"
+                for m in llm.calls[2]["messages"]
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

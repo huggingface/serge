@@ -39,6 +39,12 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["create", "get", "list", "watch", "delete"]
+  # run_job polls read_namespaced_job_status, which reads the jobs/status
+  # subresource — RBAC treats it separately from "jobs", so it needs its own
+  # grant or every normalize Job 403s on the first status poll.
+  - apiGroups: ["batch"]
+    resources: ["jobs/status"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
