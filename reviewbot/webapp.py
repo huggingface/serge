@@ -58,6 +58,7 @@ from .reviewer import (
     publish_review,
     run_followup,
 )
+from .slack_tool import post_task_finished_notification
 from .store import JobStore, decode_draft
 from .tasks import (
     TaskError,
@@ -298,8 +299,13 @@ class Job:
     # For task jobs: the inbound spec and the published outcome.
     task_spec: Optional[dict[str, Any]] = None
     task_result: Optional[dict[str, Any]] = None
-    status: str = "running"  # running | done | error | discarded | published
+    # running | done | error | discarded | published | no_fix
+    # Tasks end as "published" (a PR/commit landed) or "no_fix" (completed but
+    # serge proposed no patch); reviews use done/published/discarded.
+    status: str = "running"
     draft: Optional[ReviewDraft] = None
+    review_edits: Optional[dict[str, Any]] = None
+    published_draft: Optional[ReviewDraft] = None
     error: Optional[str] = None
     raw_llm_output: Optional[str] = None  # only set on parse-failure errors
     queue: "asyncio.Queue[dict[str, Any]]" = field(default_factory=asyncio.Queue)
@@ -468,6 +474,7 @@ def _run_webhook_review_worker(
     Mirrors the UI worker (streaming events into the job so the review
     page can follow live), but auto-publishes the result to GitHub —
     there is no human in the loop to edit + publish a draft."""
+    gh: Optional[GitHubClient] = None
     try:
         assert cfg.github_app_id and cfg.github_private_key
         token = installation_token(
@@ -493,6 +500,10 @@ def _run_webhook_review_worker(
         job.status = "error"
         job.raw_llm_output = exc.content
         job.error = exc.user_message()
+        if gh is not None:
+            _post_webhook_failure_comment(
+                gh, req, job.error, raw_output=job.raw_llm_output
+            )
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -500,6 +511,8 @@ def _run_webhook_review_worker(
         log.warning("App not installed for %s/%s (job %s)", exc.owner, exc.repo, job.id)
         job.status = "error"
         job.error = str(exc)
+        if gh is not None:
+            _post_webhook_failure_comment(gh, req, job.error)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -512,6 +525,8 @@ def _run_webhook_review_worker(
         )
         job.status = "error"
         job.error = _format_llm_error(exc)
+        if gh is not None:
+            _post_webhook_failure_comment(gh, req, job.error)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -519,6 +534,8 @@ def _run_webhook_review_worker(
         log.exception("webhook review worker crashed for job %s", job.id)
         job.status = "error"
         job.error = f"{type(exc).__name__}: review crashed (see server log)"
+        if gh is not None:
+            _post_webhook_failure_comment(gh, req, job.error)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -784,6 +801,12 @@ def _persist_terminal(job: Job) -> None:
             draft=job.draft,
             history=history_copy,
         )
+        if job.published_draft is not None:
+            _store.save_published_review(
+                job.id,
+                edits=job.review_edits,
+                published_draft=job.published_draft,
+            )
     except Exception:  # noqa: BLE001
         log.exception("failed to persist terminal state for job %s", job.id)
 
@@ -801,6 +824,33 @@ def _format_llm_error(exc: LLMResponseError) -> str:
     if excerpt:
         return f"LLM endpoint returned {exc.status_code}{reason_part}: {excerpt}"
     return f"LLM endpoint returned {exc.status_code}{reason_part}"
+
+
+def _post_webhook_failure_comment(
+    gh: GitHubClient,
+    req: ReviewRequest,
+    message: str,
+    *,
+    raw_output: Optional[str] = None,
+) -> None:
+    body = f"⚠️ Serge review failed: {message}"
+    if raw_output:
+        body += f"\n\n```\n{raw_output[:3000]}\n```"
+    try:
+        if req.inline is not None:
+            gh.reply_to_review_comment(
+                req.owner, req.repo, req.number, req.inline.comment_id, body
+            )
+        else:
+            gh.post_issue_comment(req.owner, req.repo, req.number, body)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "failed to post webhook failure comment for %s/%s#%d: %s",
+            req.owner,
+            req.repo,
+            req.number,
+            exc,
+        )
 
 
 def _format_github_http_error(exc: requests.HTTPError) -> str:
@@ -888,13 +938,16 @@ def _execute_review(
         job.draft = draft
         if auto_publish:
             _push_event(job, "log", "Publishing review to GitHub…")
-            publish_review(worker_cfg, gh, draft)
+            # Store the effective draft publish_review actually posted (e.g.
+            # APPROVE downgraded to COMMENT) so the audit log doesn't claim
+            # an approval GitHub never received.
+            job.published_draft = publish_review(worker_cfg, gh, draft)
             job.status = "published"
             _push_event(
                 job,
                 "log",
-                f"Published review: {len(draft.comments)} inline comment(s), "
-                f"event={draft.event}",
+                f"Published review: {len(job.published_draft.comments)} inline "
+                f"comment(s), event={job.published_draft.event}",
             )
         else:
             job.status = "done"
@@ -910,6 +963,10 @@ def _execute_review(
         job.status = "error"
         job.raw_llm_output = exc.content
         job.error = exc.user_message()
+        if auto_publish:
+            _post_webhook_failure_comment(
+                gh, req, job.error, raw_output=job.raw_llm_output
+            )
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -920,6 +977,8 @@ def _execute_review(
         log.warning("App not installed for %s/%s (job %s)", exc.owner, exc.repo, job.id)
         job.status = "error"
         job.error = str(exc)
+        if auto_publish:
+            _post_webhook_failure_comment(gh, req, job.error)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -932,6 +991,8 @@ def _execute_review(
         )
         job.status = "error"
         job.error = _format_llm_error(exc)
+        if auto_publish:
+            _post_webhook_failure_comment(gh, req, job.error)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -943,6 +1004,8 @@ def _execute_review(
         # the raw repr to the SSE client — the full traceback is in the
         # server log via log.exception above.
         job.error = f"{type(exc).__name__}: review crashed (see server log)"
+        if auto_publish:
+            _post_webhook_failure_comment(gh, req, job.error)
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
@@ -1139,7 +1202,12 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             )
         job.task_result = result.to_json()
         _store.save_task_result(job.id, _json.dumps(job.task_result))
-        job.status = "done"
+        # A task only counts as "published" when serge actually wrote to GitHub
+        # (opened a PR or pushed a follow-up commit). When the LLM proposes no
+        # safe patch the task still completes cleanly but produces nothing —
+        # surface that as "no_fix" so the journal/dashboard doesn't conflate a
+        # group serge couldn't fix with one that produced a PR.
+        job.status = "no_fix" if result.no_change else "published"
         emit("log", result.message)
         emit("step", "done")
         emit("done", "")
@@ -1191,8 +1259,30 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         emit("error", job.error)
         emit("done", "")
     finally:
+        _notify_task_finished(worker_cfg, req, job)
         _clone_cache.release(checkout)
         _persist_terminal(job)
+
+
+def _notify_task_finished(worker_cfg: Config, req: TaskRequest, job: Job) -> None:
+    if not req.slack_notify_task_finished:
+        return
+    result = job.task_result or {}
+    try:
+        pr_number = result.get("pr_number") or req.pr_number
+        post_task_finished_notification(
+            token=worker_cfg.slack_bot_token,
+            channel=req.slack_channel or worker_cfg.slack_report_channel,
+            repo_full_name=req.repo_full_name,
+            status=job.status,
+            message=result.get("message") or job.error or "",
+            pr_number=pr_number,
+            pr_url=result.get("url"),
+            job_id=job.id,
+            error=job.error,
+        )
+    except Exception:
+        log.debug("failed to notify Slack for finished task %s", job.id, exc_info=True)
 
 
 def _bool_env_safe(name: str, default: bool) -> bool:
@@ -1409,14 +1499,91 @@ def _require_same_origin(request: Request) -> None:
     raise HTTPException(status_code=403, detail="bad_origin")
 
 
-def _serve_static(name: str) -> HTMLResponse:
+def _static_html(name: str) -> str:
     path = os.path.join(_STATIC_DIR, name)
     with open(path, "r", encoding="utf-8") as f:
         html = f.read()
     if name.endswith(".html"):
         html = html.replace("<!-- POWERED_BY -->", _powered_by_html())
         html = html.replace("<!-- APP_INSTALL_LINK -->", _app_install_html())
+    return html
+
+
+def _serve_static(name: str) -> HTMLResponse:
+    html = _static_html(name)
     return HTMLResponse(html)
+
+
+def _journal_entry_url(row: dict[str, Any]) -> str:
+    kind = row.get("kind") or "review"
+    owner = row["target_owner"]
+    repo = row["target_repo"]
+    if kind == "task":
+        return f"/tasks/{owner}/{repo}/{row['id']}"
+    return f"/reviews/{owner}/{repo}/{row['target_number']}/{row['id']}"
+
+
+def _journal_type(row: dict[str, Any]) -> str:
+    if (row.get("kind") or "review") == "task":
+        return "task"
+    if row.get("source") == "webhook":
+        return "webhook"
+    return "webapp"
+
+
+def _journal_tokens(n: Any) -> str:
+    if not isinstance(n, int) or n <= 0:
+        return "—"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def _journal_rows_html(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<tr><td colspan="9" class="hint">No calls yet.</td></tr>'
+    rendered: list[str] = []
+    for row in rows:
+        created = row.get("created_at")
+        try:
+            created_ts = float(created)
+        except (TypeError, ValueError):
+            created_ts = 0.0
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(created_ts))
+        entry_type = _journal_type(row)
+        status_text = str(row.get("status") or "unknown")
+        status_class = re.sub(r"[^a-zA-Z0-9_-]+", "-", status_text)
+        target = (
+            f"{row['target_owner']}/{row['target_repo']}"
+            if (row.get("kind") or "review") == "task"
+            else f"{row['target_owner']}/{row['target_repo']}#{row['target_number']}"
+        )
+        rendered.append(
+            "<tr>"
+            f'<td class="ago" title="{_html.escape(when, quote=True)}">'
+            f"{_html.escape(when)}</td>"
+            "<td>"
+            f'<span class="source-tag type-{_html.escape(entry_type, quote=True)}">'
+            f"{_html.escape(entry_type)}</span>"
+            "</td>"
+            f"<td>{_html.escape(str(row.get('user') or '—'))}</td>"
+            "<td>"
+            f'<a href="{_html.escape(_journal_entry_url(row), quote=True)}">'
+            f"{_html.escape(target)}</a>"
+            "</td>"
+            f"<td>{_html.escape(str(row.get('llm_provider') or '—'))}</td>"
+            f"<td>{_html.escape(str(row.get('llm_model') or '—'))}</td>"
+            f"<td>{_html.escape(_journal_tokens(row.get('prompt_tokens')))}</td>"
+            f"<td>{_html.escape(_journal_tokens(row.get('completion_tokens')))}</td>"
+            "<td>"
+            f'<span class="status-badge {_html.escape(status_class, quote=True)}">'
+            f"{_html.escape(status_text)}</span>"
+            "</td>"
+            "</tr>"
+        )
+    return "\n".join(rendered)
 
 
 def _powered_by_html() -> str:
@@ -1487,7 +1654,18 @@ def index(request: Request) -> Response:
 def journal_page(request: Request) -> Response:
     if not _current_user(request):
         return RedirectResponse("/login", status_code=302)
-    return _serve_static("journal.html")
+    rows = _store.list_all_calls(limit=cfg.web_job_retention)
+    html = _static_html("journal.html")
+    count = f"({len(rows)})" if rows else ""
+    html = html.replace(
+        '<span class="hint" id="journal-count"></span>',
+        f'<span class="hint" id="journal-count">{_html.escape(count)}</span>',
+    )
+    html = html.replace(
+        '<tbody id="journal-tbody"></tbody>',
+        f'<tbody id="journal-tbody">\n{_journal_rows_html(rows)}\n</tbody>',
+    )
+    return HTMLResponse(html)
 
 
 @app.get("/help")
@@ -1688,12 +1866,7 @@ def journal_data(request: Request) -> JSONResponse:
                     "model": r["llm_model"],
                     "prompt_tokens": r["prompt_tokens"],
                     "completion_tokens": r["completion_tokens"],
-                    "url": (
-                        f"/tasks/{r['target_owner']}/{r['target_repo']}/{r['id']}"
-                        if (r.get("kind") or "review") == "task"
-                        else f"/reviews/{r['target_owner']}/{r['target_repo']}/"
-                        f"{r['target_number']}/{r['id']}"
-                    ),
+                    "url": _journal_entry_url(r),
                 }
                 for r in rows
             ]
@@ -2293,6 +2466,12 @@ def _load_job_from_store(job_id: str) -> Optional[Job]:
         error=row["error"],
         raw_llm_output=row["raw_llm_output"],
         draft=decode_draft(row["draft_json"]) if row.get("draft_json") else None,
+        review_edits=_safe_json_obj(row.get("review_edits_json")),
+        published_draft=(
+            decode_draft(row["published_draft_json"])
+            if row.get("published_draft_json")
+            else None
+        ),
     )
     job.task_spec = _safe_json_obj(row.get("task_spec_json"))
     job.task_result = _safe_json_obj(row.get("result_json"))
@@ -2351,6 +2530,7 @@ def review_draft(
             "status": job.status,
             "error": job.error,
             "draft": _draft_to_dict(job.draft),
+            "audit": _review_audit_to_dict(job),
         }
     )
 
@@ -2368,6 +2548,49 @@ def _draft_to_dict(draft: ReviewDraft) -> dict[str, Any]:
         "model": draft.model,
         "version": __version__,
         "comments": [dataclasses.asdict(c) for c in draft.comments],
+    }
+
+
+def _review_audit_to_dict(job: Job) -> dict[str, Any]:
+    published = job.published_draft
+    changed: dict[str, Any] = {
+        "summary": False,
+        "event": False,
+        "edited_comment_ids": [],
+        "discarded_comment_ids": [],
+    }
+    if job.draft is not None and published is not None:
+        changed = _review_changes(job.draft, published)
+    return {
+        "trigger_comment": job.trigger_comment,
+        "generated_draft": _draft_to_dict(job.draft) if job.draft else None,
+        "published_draft": _draft_to_dict(published) if published else None,
+        "review_edits": job.review_edits,
+        "changes": changed,
+        "trace": [
+            {"kind": e.get("kind"), "text": e.get("text"), "ts": e.get("ts")}
+            for e in job.history
+            if e.get("kind") not in _NOISY_KINDS
+        ],
+    }
+
+
+def _review_changes(generated: ReviewDraft, published: ReviewDraft) -> dict[str, Any]:
+    generated_comments = {c.id: c for c in generated.comments}
+    published_comments = {c.id: c for c in published.comments}
+    edited_comment_ids = [
+        c.id
+        for c in published.comments
+        if c.id in generated_comments and c.body != generated_comments[c.id].body
+    ]
+    discarded_comment_ids = [
+        c.id for c in generated.comments if c.id not in published_comments
+    ]
+    return {
+        "summary": published.summary != generated.summary,
+        "event": published.event != generated.event,
+        "edited_comment_ids": edited_comment_ids,
+        "discarded_comment_ids": discarded_comment_ids,
     }
 
 
@@ -2461,9 +2684,18 @@ async def publish(
         cfg.github_app_id, cfg.github_private_key, installation_id
     )
     gh = GitHubClient(token)
-    publish_review(cfg, gh, job.draft, edits=edits)
+    # Persist exactly what publish_review posted — including any APPROVE ->
+    # COMMENT downgrade — instead of re-deriving the draft separately (which
+    # could drift from the publish path).
+    job.published_draft = publish_review(cfg, gh, job.draft, edits=edits)
     job.status = "published"
+    job.review_edits = _review_edits_to_dict(edits)
     _store.update_status(job.id, "published")
+    _store.save_published_review(
+        job.id,
+        edits=job.review_edits,
+        published_draft=job.published_draft,
+    )
     return JSONResponse({"status": "published"})
 
 
@@ -2499,6 +2731,15 @@ def _edits_from_payload(payload: dict[str, Any], draft: ReviewDraft) -> ReviewEd
         comment_overrides=overrides,
         discarded_comment_ids=discarded,
     )
+
+
+def _review_edits_to_dict(edits: ReviewEdits) -> dict[str, Any]:
+    return {
+        "summary": edits.summary,
+        "event": edits.event,
+        "comment_overrides": dict(edits.comment_overrides),
+        "discarded_comment_ids": sorted(edits.discarded_comment_ids),
+    }
 
 
 @app.post("/reviews/{owner}/{repo}/{number}/{job_id}/discard")

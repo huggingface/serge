@@ -38,6 +38,7 @@ from .reviewer import (
     _run_agentic_loop,
     _UnparseableLLMOutput,
 )
+from .slack_tool import post_task_pr_created_notification
 
 log = logging.getLogger(__name__)
 
@@ -87,6 +88,9 @@ class TaskRequest:
     pr_number: Optional[int] = None
     title: Optional[str] = None
     branch_prefix: str = "serge/fix"
+    slack_channel: Optional[str] = None
+    slack_notify_pr_created: bool = True
+    slack_notify_task_finished: bool = False
     # Resolved during processing (existing_pr): the PR's head branch.
     head_branch: Optional[str] = None
 
@@ -192,6 +196,21 @@ def build_task_request(
             "(e.g. 'serge/fix')"
         )
 
+    notifications = payload.get("notifications") or {}
+    if not isinstance(notifications, dict):
+        raise TaskError("notifications must be an object")
+    slack_channel = notifications.get("slack_channel")
+    if slack_channel is not None:
+        slack_channel = str(slack_channel).strip() or None
+        if slack_channel and ("\n" in slack_channel or "\r" in slack_channel):
+            raise TaskError("notifications.slack_channel must be a single line")
+    slack_notify_pr_created = _notification_bool(
+        notifications, "pr_created", default=True
+    )
+    slack_notify_task_finished = _notification_bool(
+        notifications, "task_finished", default=False
+    )
+
     pr_number: Optional[int] = None
     if mode == "existing_pr":
         raw = output.get("pr_number")
@@ -209,7 +228,27 @@ def build_task_request(
         pr_number=pr_number,
         title=title,
         branch_prefix=branch_prefix,
+        slack_channel=slack_channel,
+        slack_notify_pr_created=slack_notify_pr_created,
+        slack_notify_task_finished=slack_notify_task_finished,
     )
+
+
+def _notification_bool(
+    notifications: dict[str, Any], name: str, *, default: bool
+) -> bool:
+    raw = notifications.get(name)
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+    raise TaskError(f"notifications.{name} must be a boolean")
 
 
 def resolve_existing_pr(gh: GitHubClient, req: TaskRequest, cfg: Config) -> str:
@@ -515,6 +554,17 @@ def publish_task(
         body=body,
     )
     _emit("log", f"Opened PR #{pr.get('number')}: {pr.get('html_url')}")
+    if req.slack_notify_pr_created:
+        post_task_pr_created_notification(
+            token=cfg.slack_bot_token,
+            channel=req.slack_channel or cfg.slack_report_channel,
+            repo_full_name=req.repo_full_name,
+            pr_number=pr.get("number"),
+            pr_url=pr.get("html_url"),
+            title=plan.title,
+            branch=branch,
+            changed_files=changed_files,
+        )
     return TaskResult(
         mode=req.mode,
         pr_number=pr.get("number"),

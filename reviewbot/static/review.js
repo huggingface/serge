@@ -24,6 +24,8 @@
   const commentsCountEl = document.getElementById("comments-count");
   const publishBtn = document.getElementById("publish-btn");
   const discardBtn = document.getElementById("discard-btn");
+  const auditSection = document.getElementById("audit-section");
+  const auditContent = document.getElementById("audit-content");
 
   let draft = null;
   let infoCache = null;
@@ -234,7 +236,108 @@
       return;
     }
     draft = data.draft;
+    renderAudit(data.audit);
     renderDraftForm();
+  }
+
+  function renderAudit(audit) {
+    if (!audit || !auditContent) return;
+    auditContent.replaceChildren();
+
+    auditContent.appendChild(buildAuditBlock("User prompt", audit.trigger_comment || ""));
+    auditContent.appendChild(buildChangeSummary(audit.changes || {}));
+    if (audit.generated_draft) {
+      auditContent.appendChild(buildDraftAudit("AI generated review", audit.generated_draft));
+    }
+    if (audit.published_draft) {
+      auditContent.appendChild(buildDraftAudit("Published review", audit.published_draft));
+    }
+    if (audit.trace && audit.trace.length) {
+      auditContent.appendChild(buildTraceAudit(audit.trace));
+    }
+    auditSection.style.display = "";
+  }
+
+  function buildAuditBlock(title, text) {
+    const block = document.createElement("div");
+    block.className = "audit-block";
+    const h = document.createElement("h3");
+    h.textContent = title;
+    block.appendChild(h);
+    const pre = document.createElement("pre");
+    pre.textContent = text || "(empty)";
+    block.appendChild(pre);
+    return block;
+  }
+
+  function buildChangeSummary(changes) {
+    const edited = changes.edited_comment_ids || [];
+    const discarded = changes.discarded_comment_ids || [];
+    const parts = [];
+    if (changes.summary) parts.push("summary edited");
+    if (changes.event) parts.push("event changed");
+    if (edited.length) parts.push(`${edited.length} inline edited`);
+    if (discarded.length) parts.push(`${discarded.length} inline discarded`);
+    if (!parts.length) parts.push("no changes");
+
+    const block = document.createElement("div");
+    block.className = "audit-block";
+    const h = document.createElement("h3");
+    h.textContent = "Changes";
+    const p = document.createElement("p");
+    p.className = "audit-summary";
+    p.textContent = parts.join(" · ");
+    block.appendChild(h);
+    block.appendChild(p);
+    return block;
+  }
+
+  function buildDraftAudit(title, review) {
+    const block = document.createElement("div");
+    block.className = "audit-block";
+    const h = document.createElement("h3");
+    h.textContent = title;
+    block.appendChild(h);
+
+    const meta = document.createElement("p");
+    meta.className = "hint";
+    meta.textContent = `${review.event || "COMMENT"} · ${review.comments.length} inline comment(s)`;
+    block.appendChild(meta);
+
+    const summary = document.createElement("pre");
+    summary.textContent = review.summary || "(no summary)";
+    block.appendChild(summary);
+
+    for (const c of review.comments) {
+      const item = document.createElement("details");
+      item.className = "audit-comment";
+      const s = document.createElement("summary");
+      s.textContent = `${c.path}:${c.line} (${c.side})`;
+      const body = document.createElement("pre");
+      body.textContent = c.body || "";
+      item.appendChild(s);
+      item.appendChild(body);
+      block.appendChild(item);
+    }
+    return block;
+  }
+
+  function buildTraceAudit(trace) {
+    const block = document.createElement("div");
+    block.className = "audit-block";
+    const h = document.createElement("h3");
+    h.textContent = "Trace";
+    block.appendChild(h);
+    const pre = document.createElement("pre");
+    pre.textContent = trace
+      .map((e) => {
+        const kind = e.kind || "log";
+        const text = e.text || "";
+        return `[${kind}] ${text}`;
+      })
+      .join("\n");
+    block.appendChild(pre);
+    return block;
   }
 
   function renderDraftForm() {

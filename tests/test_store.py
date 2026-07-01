@@ -110,6 +110,59 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(entries[0]["prompt_tokens"], 999)
             self.assertEqual(entries[0]["completion_tokens"], 222)
 
+    def test_persists_generated_and_published_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = JobStore(os.path.join(tmp, "jobs.db"))
+            store.insert_job(
+                id="j3",
+                user="carol",
+                target_owner="o",
+                target_repo="r",
+                target_number=3,
+                trigger_comment="@askserge review this",
+                llm_provider="hf",
+                llm_api_base="https://router.huggingface.co/v1",
+                llm_model="model",
+                created_at=3.0,
+                status="running",
+            )
+            generated = ReviewDraft(
+                owner="o",
+                repo="r",
+                number=3,
+                head_sha="abc",
+                summary="generated",
+                event="COMMENT",
+            )
+            published = ReviewDraft(
+                owner="o",
+                repo="r",
+                number=3,
+                head_sha="abc",
+                summary="edited",
+                event="REQUEST_CHANGES",
+            )
+            store.save_terminal(
+                "j3",
+                status="done",
+                error=None,
+                raw_llm_output=None,
+                draft=generated,
+                history=[],
+            )
+            store.save_published_review(
+                "j3",
+                edits={"summary": "edited", "event": "REQUEST_CHANGES"},
+                published_draft=published,
+            )
+
+            row = store.load("j3")
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertIn('"summary": "generated"', row["draft_json"])
+            self.assertIn('"summary": "edited"', row["published_draft_json"])
+            self.assertIn('"event": "REQUEST_CHANGES"', row["review_edits_json"])
+
     def test_adds_llm_columns_to_existing_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "jobs.db")

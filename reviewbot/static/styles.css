@@ -241,6 +241,9 @@ pre.console .reasoning {
 .status-badge.done { background: #34d399; color: #064e3b; }
 .status-badge.error { background: var(--danger); color: white; }
 .status-badge.published { background: #34d399; color: #064e3b; }
+/* Task completed cleanly but serge proposed no patch — distinct from the green
+   "published" (a PR/commit landed) and from the red "error". */
+.status-badge.no_fix { background: #fde68a; color: #78350f; }
 .status-badge.discarded { background: var(--muted); color: white; }
 
 /* Inline spinner for the "running" status badge (and anywhere else a
@@ -415,6 +418,45 @@ td .source-tag {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   font-size: 0.7rem;
+}
+
+.audit-block {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  margin-top: 14px;
+}
+.audit-block:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+.audit-block h3 {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+}
+.audit-block pre {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+}
+.audit-summary {
+  margin: 0;
+  color: var(--muted);
+}
+.audit-comment {
+  margin-top: 8px;
+}
+.audit-comment summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
 }
 
 .comment-card {

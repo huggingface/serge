@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
 from . import __version__
@@ -1361,82 +1361,111 @@ def prepare_review(
     )
 
 
-def publish_review(
-    cfg: Config,
-    gh: GitHubClient,
+def effective_draft(
     draft: ReviewDraft,
-    *,
     edits: Optional[ReviewEdits] = None,
-) -> None:
-    """Apply optional user edits to a ReviewDraft and post it via the
-    GitHub reviews API. Mirrors the body-formatting rules previously
-    inlined in run_review (persona header, dropped-comments note,
-    metrics footer)."""
+    *,
+    allow_approve: bool,
+) -> ReviewDraft:
+    """Resolve a generated draft plus optional user edits into the exact
+    review that will be posted to GitHub: summary/event overrides applied,
+    invalid events ignored, ``APPROVE`` downgraded to ``COMMENT`` unless
+    ``allow_approve``, and overridden/discarded comments materialized.
+
+    This is the single source of truth shared by ``publish_review`` (what
+    it posts) and the web app's audit log (what it records as the published
+    draft), so the two cannot drift. In particular the audit log must see
+    the same ``APPROVE`` -> ``COMMENT`` downgrade GitHub actually receives."""
     edits = edits or ReviewEdits()
 
     summary = edits.summary if edits.summary is not None else draft.summary
+
     event = edits.event or draft.event
     if event not in ("COMMENT", "REQUEST_CHANGES", "APPROVE"):
         event = draft.event
-    if event == "APPROVE" and not cfg.allow_approve:
+    if event == "APPROVE" and not allow_approve:
         log.info(
             "Downgrading APPROVE to COMMENT (Actions tokens cannot approve; set ALLOW_APPROVE=1 in App mode to permit)"
         )
         event = "COMMENT"
 
-    comments_payload: list[dict[str, Any]] = []
+    comments: list[DraftComment] = []
     for c in draft.comments:
         if c.id in edits.discarded_comment_ids:
             continue
         body = edits.comment_overrides.get(c.id, c.body)
         if not isinstance(body, str) or not body.strip():
             continue
-        comments_payload.append(
-            {"path": c.path, "side": c.side, "line": c.line, "body": body}
-        )
+        comments.append(replace(c, body=body))
 
-    body = summary or "(no overall summary provided)"
+    return replace(draft, summary=summary, event=event, comments=comments)
+
+
+def publish_review(
+    cfg: Config,
+    gh: GitHubClient,
+    draft: ReviewDraft,
+    *,
+    edits: Optional[ReviewEdits] = None,
+) -> ReviewDraft:
+    """Apply optional user edits to a ReviewDraft and post it via the
+    GitHub reviews API. Mirrors the body-formatting rules previously
+    inlined in run_review (persona header, dropped-comments note,
+    metrics footer).
+
+    Returns the *effective* ReviewDraft that was actually posted (edits
+    applied, event downgraded). Callers persist this so the audit log
+    records exactly what GitHub received rather than the raw draft."""
+    effective = effective_draft(draft, edits, allow_approve=cfg.allow_approve)
+
+    comments_payload: list[dict[str, Any]] = [
+        {"path": c.path, "side": c.side, "line": c.line, "body": c.body}
+        for c in effective.comments
+    ]
+
+    body = effective.summary or "(no overall summary provided)"
     if cfg.persona_header:
         body = f"{cfg.persona_header}\n\n{body}"
-    if draft.rejected_count:
+    if effective.rejected_count:
         body += (
-            f"\n\n_Note: {draft.rejected_count} suggested inline comment(s) "
+            f"\n\n_Note: {effective.rejected_count} suggested inline comment(s) "
             "were dropped because they referenced lines not present in the diff._"
         )
-    if draft.truncated_chunks:
+    if effective.truncated_chunks:
         body += (
             f"\n\n_Note: review finished early after hitting the input-token "
-            f"budget; {draft.truncated_chunks} remaining diff chunk(s) were "
+            f"budget; {effective.truncated_chunks} remaining diff chunk(s) were "
             "not reviewed._"
         )
     if cfg.is_staging:
         body += "\n\n_Note: posted from a staging deployment._"
     footer_parts = [f"serge `v{__version__}`"]
-    if draft.model:
-        footer_parts.append(f"model: `{draft.model}`")
-    if draft.metrics_line:
-        footer_parts.append(draft.metrics_line)
+    if effective.model:
+        footer_parts.append(f"model: `{effective.model}`")
+    if effective.metrics_line:
+        footer_parts.append(effective.metrics_line)
     if footer_parts:
         body += f"\n\n_{' · '.join(footer_parts)}_"
 
     gh.create_review(
-        draft.owner,
-        draft.repo,
-        draft.number,
-        commit_id=draft.head_sha,
+        effective.owner,
+        effective.repo,
+        effective.number,
+        commit_id=effective.head_sha,
         body=body,
         comments=comments_payload,
-        event=event,
+        event=effective.event,
     )
     log.info(
         "Posted review on %s/%s#%d (%d inline, event=%s, %s)",
-        draft.owner,
-        draft.repo,
-        draft.number,
+        effective.owner,
+        effective.repo,
+        effective.number,
         len(comments_payload),
-        event,
-        draft.metrics_line,
+        effective.event,
+        effective.metrics_line,
     )
+    return effective
 
 
 def run_review(

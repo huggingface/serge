@@ -54,6 +54,38 @@ class ConfigTests(unittest.TestCase):
 
         self.assertTrue(cfg.is_staging)
 
+    def test_slack_config_prefers_ci_feedback_env_names(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "LLM_API_KEY": "token",
+                "SLACK_CIFEEDBACK_BOT_TOKEN": "feedback-token",
+                "SLACK_CIFEEDBACK_CHANNEL": "#feedback-ci",
+                "CI_SLACK_BOT_TOKEN": "legacy-token",
+                "SLACK_REPORT_CHANNEL": "#legacy-ci",
+            },
+            clear=True,
+        ):
+            cfg = Config.from_env(require_app=False)
+
+        self.assertEqual(cfg.slack_bot_token, "feedback-token")
+        self.assertEqual(cfg.slack_report_channel, "#feedback-ci")
+
+    def test_slack_config_accepts_transformers_ci_env_fallbacks(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "LLM_API_KEY": "token",
+                "CI_SLACK_BOT_TOKEN": "legacy-token",
+                "SLACK_REPORT_CHANNEL": "#legacy-ci",
+            },
+            clear=True,
+        ):
+            cfg = Config.from_env(require_app=False)
+
+        self.assertEqual(cfg.slack_bot_token, "legacy-token")
+        self.assertEqual(cfg.slack_report_channel, "#legacy-ci")
+
 
 if __name__ == "__main__":
     unittest.main()

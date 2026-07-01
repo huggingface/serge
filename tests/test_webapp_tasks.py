@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -142,7 +143,14 @@ class WebappTasksTests(unittest.TestCase):
             client = TestClient(webapp.app)
             r = client.post(
                 "/tasks",
-                json={"instruction": "fix the failing tests", "context": "trace"},
+                json={
+                    "instruction": "fix the failing tests",
+                    "context": "trace",
+                    "notifications": {
+                        "slack_channel": "#dynamic-ci",
+                        "task_finished": True,
+                    },
+                },
                 headers={"Authorization": "Bearer tok"},
             )
         self.assertEqual(r.status_code, 202)
@@ -152,6 +160,8 @@ class WebappTasksTests(unittest.TestCase):
         self.assertTrue(body["url"].startswith("/tasks/acme/widgets/"))
         self.assertEqual(submitted["job"].kind, "task")
         self.assertEqual(submitted["req"].instruction, "fix the failing tests")
+        self.assertEqual(submitted["req"].slack_channel, "#dynamic-ci")
+        self.assertTrue(submitted["req"].slack_notify_task_finished)
         self.assertEqual(webapp.cfg.llm_max_tokens, 4096)
         self.assertEqual(submitted["worker_cfg"].llm_max_tokens, 16384)
         self.assertEqual(submitted["worker_cfg"].llm_max_input_tokens, 250000)
@@ -160,6 +170,110 @@ class WebappTasksTests(unittest.TestCase):
         # Persisted with task kind.
         row = webapp._store.load(body["id"])
         self.assertEqual(row["kind"], "task")
+
+    def test_task_finished_notification_uses_request_channel(self):
+        webapp = self._import_webapp()
+        worker_cfg = webapp.dataclasses.replace(
+            webapp.cfg,
+            slack_bot_token="tok",
+            slack_report_channel="#default-ci",
+        )
+        req = webapp.TaskRequest(
+            owner="acme",
+            repo="widgets",
+            base_ref="main",
+            instruction="fix",
+            context="trace",
+            slack_channel="#dynamic-ci",
+            slack_notify_task_finished=True,
+        )
+        job = webapp.Job(
+            id="abcdef1234567890",
+            user="octocat",
+            target_owner="acme",
+            target_repo="widgets",
+            target_number=0,
+            trigger_comment="fix",
+            llm_provider="hf",
+            llm_api_base="https://example.com/v1",
+            llm_model="model",
+            created_at=0,
+            status="done",
+            source="task",
+            kind="task",
+            task_result={
+                "message": "Opened PR #99.",
+                "pr_number": 99,
+                "url": "https://github.com/acme/widgets/pull/99",
+            },
+        )
+
+        with patch.object(webapp, "post_task_finished_notification") as notify:
+            webapp._notify_task_finished(worker_cfg, req, job)
+
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.kwargs["token"], "tok")
+        self.assertEqual(notify.call_args.kwargs["channel"], "#dynamic-ci")
+        self.assertEqual(notify.call_args.kwargs["pr_number"], 99)
+
+    def _run_task_worker_with(self, webapp, task_result):
+        """Drive _run_task_worker with the heavy deps stubbed so the only thing
+        under test is how a TaskResult maps to the terminal job.status."""
+        worker_cfg = webapp.dataclasses.replace(
+            webapp.cfg, github_app_id="123", github_private_key="key"
+        )
+        req = webapp.TaskRequest(
+            owner="acme",
+            repo="widgets",
+            base_ref="main",
+            instruction="fix",
+            context="trace",
+        )
+        job = webapp.Job(
+            id="abcdef1234567890",
+            user="octocat",
+            target_owner="acme",
+            target_repo="widgets",
+            target_number=0,
+            trigger_comment="fix",
+            llm_provider="hf",
+            llm_api_base="https://example.com/v1",
+            llm_model="model",
+            created_at=0,
+            status="running",
+            source="task",
+            kind="task",
+        )
+        # prepare_task/publish_task are both stubbed, so the plan value is never
+        # inspected — any sentinel works.
+        with (
+            patch.object(webapp, "installation_id_for_repo", return_value=1),
+            patch.object(webapp, "installation_token", return_value="tok"),
+            patch.object(webapp, "GitHubClient"),
+            patch.object(
+                webapp._clone_cache,
+                "acquire_ref",
+                return_value=types.SimpleNamespace(path="/tmp/co"),
+            ),
+            patch.object(webapp._clone_cache, "release"),
+            patch.object(webapp, "_persist_terminal"),
+            patch.object(webapp, "prepare_task", return_value=object()),
+            patch.object(webapp, "publish_task", return_value=task_result),
+        ):
+            webapp._run_task_worker(job, worker_cfg, req)
+        return job
+
+    def test_published_status_when_pr_opened(self):
+        webapp = self._import_webapp()
+        result = webapp.TaskResult(mode="new_pr", pr_number=99, no_change=False)
+        job = self._run_task_worker_with(webapp, result)
+        self.assertEqual(job.status, "published")
+
+    def test_no_fix_status_when_no_patch(self):
+        webapp = self._import_webapp()
+        result = webapp.TaskResult(mode="new_pr", no_change=True)
+        job = self._run_task_worker_with(webapp, result)
+        self.assertEqual(job.status, "no_fix")
 
 
 if __name__ == "__main__":
