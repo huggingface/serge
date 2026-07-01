@@ -17,21 +17,27 @@ class _ToolsUnsupported(Exception):
     response body preview for logging."""
 
 
-class _TemperatureUnsupported(Exception):
-    """Raised when the upstream endpoint rejects ``temperature`` with a 400
-    (e.g. newer Claude models, which deprecated the parameter), so the
-    caller can retry once without it. Carries the response body preview for
-    logging."""
+class _ParameterUnsupported(Exception):
+    """Raised when the upstream endpoint rejects a specific payload
+    parameter with a 400 (e.g. newer Claude models deprecate
+    ``temperature``), so the caller can strip that one field and retry
+    once. Carries the offending parameter name and the response body
+    preview for logging."""
+
+    def __init__(self, param: str, body_preview: str):
+        self.param = param
+        self.body_preview = body_preview
+        super().__init__(f"{param}: {body_preview}")
 
 
-def _is_temperature_rejection(body_preview: str) -> bool:
-    """True when a 400 body indicates the ``temperature`` parameter itself
-    is not accepted by the model — as opposed to a value-range complaint.
-    Provider-neutral: matches the OpenAI-compat error text emitted by
-    Anthropic's shim ("`temperature` is deprecated for this model.") and
-    similar unsupported-parameter wording from other endpoints."""
+def _is_parameter_rejection(param: str, body_preview: str) -> bool:
+    """True when a 400 body indicates ``param`` itself is not accepted by
+    the model — as opposed to a value-range complaint. Provider-neutral:
+    matches the OpenAI-compat error text emitted by Anthropic's shim
+    ("`temperature` is deprecated for this model.") and similar
+    unsupported-parameter wording from other endpoints."""
     text = body_preview.lower()
-    if "temperature" not in text:
+    if param.lower() not in text:
         return False
     return any(
         signal in text
@@ -182,6 +188,18 @@ class ChatCompletionClient:
             return self.model
         return self._discover_model()
 
+    # Optional sampling parameters a model may reject/deprecate outright.
+    # Each is safe to drop on a 400 — the server falls back to its own
+    # default — so retrying without it keeps the review alive. Ordered
+    # most- to least-commonly rejected.
+    _REMOVABLE_PARAMS = (
+        "temperature",
+        "top_p",
+        "top_k",
+        "frequency_penalty",
+        "presence_penalty",
+    )
+
     def complete(
         self,
         messages: list[dict[str, Any]],
@@ -232,9 +250,10 @@ class ChatCompletionClient:
         est_input_tokens = self._estimate_input_tokens(messages, tools)
         started = time.monotonic()
         # The endpoint may reject specific payload fields with a 400: some
-        # models deprecate `temperature` (e.g. newer Claude), others don't
-        # support function-calling. Strip the offending field and retry,
-        # at most once per removable field, so the review still completes.
+        # models deprecate a sampling parameter (e.g. newer Claude reject
+        # `temperature`), others don't support function-calling. Strip the
+        # offending field and retry, at most once per removable field, so
+        # the review still completes.
         while True:
             try:
                 return self._post_with_retries(
@@ -247,10 +266,10 @@ class ChatCompletionClient:
                     chunk_callback=chunk_callback,
                     est_input_tokens=est_input_tokens,
                 )
-            except _TemperatureUnsupported:
-                if "temperature" not in payload:
+            except _ParameterUnsupported as exc:
+                if exc.param not in payload:
                     raise
-                payload.pop("temperature", None)
+                payload.pop(exc.param, None)
             except _ToolsUnsupported:
                 # Strip the function-calling fields and try once more
                 # (degraded: no browse tools).
@@ -375,17 +394,19 @@ class ChatCompletionClient:
                         body_preview,
                     )
                     if r.status_code == 400:
-                        # Check the temperature rejection first: stripping
-                        # tools wouldn't fix it, and some models (e.g. newer
-                        # Claude) reject `temperature` outright.
-                        if "temperature" in payload and _is_temperature_rejection(
-                            body_preview
-                        ):
-                            log.warning(
-                                "Retrying without `temperature` (the model "
-                                "appears to reject the parameter)"
-                            )
-                            raise _TemperatureUnsupported(body_preview)
+                        # Check for a rejected sampling parameter first:
+                        # stripping tools wouldn't fix it, and some models
+                        # (e.g. newer Claude) reject `temperature` outright.
+                        for param in self._REMOVABLE_PARAMS:
+                            if param in payload and _is_parameter_rejection(
+                                param, body_preview
+                            ):
+                                log.warning(
+                                    "Retrying without `%s` (the model appears "
+                                    "to reject the parameter)",
+                                    param,
+                                )
+                                raise _ParameterUnsupported(param, body_preview)
                         if tools_in_use:
                             log.warning(
                                 "Retrying once without tools (the endpoint may "
