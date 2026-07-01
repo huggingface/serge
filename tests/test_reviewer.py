@@ -360,5 +360,94 @@ class InputTokenBudgetTests(unittest.TestCase):
         self.assertEqual(len(llm.calls), 1)
 
 
+class ValidationGateTests(unittest.TestCase):
+    """The optional `validate` callback turns the final answer into a
+    verification gate: failures are fed back into the same conversation."""
+
+    def _result(self, content: str) -> ChatResult:
+        return ChatResult(
+            content=content,
+            usage={"prompt_tokens": 10, "completion_tokens": 5},
+        )
+
+    def test_feedback_reenters_same_conversation_then_accepts(self) -> None:
+        cfg = _CfgStub()
+        llm = _FakeLLM(
+            [self._result('{"patch": "v1"}'), self._result('{"patch": "v2"}')]
+        )
+        seen: list[str] = []
+
+        def validate(chat: ChatResult) -> str | None:
+            seen.append(chat.content)
+            return (
+                "normalizer failed, fix it"
+                if chat.content == '{"patch": "v1"}'
+                else None
+            )
+
+        chat, metrics = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "go"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=None,
+            validate=validate,
+            max_validation_retries=2,
+        )
+        # Both answers were validated; the corrected one was accepted.
+        self.assertEqual(seen, ['{"patch": "v1"}', '{"patch": "v2"}'])
+        self.assertEqual(chat.content, '{"patch": "v2"}')
+        self.assertEqual(len(llm.calls), 2)
+        # The feedback was injected as a user turn in the same conversation.
+        second_turn = llm.calls[1]["messages"]
+        self.assertTrue(
+            any(
+                m.get("role") == "user"
+                and m.get("content") == "normalizer failed, fix it"
+                for m in second_turn
+            )
+        )
+        # And the rejected answer is in the history as an assistant turn.
+        self.assertTrue(
+            any(
+                m.get("role") == "assistant" and m.get("content") == '{"patch": "v1"}'
+                for m in second_turn
+            )
+        )
+
+    def test_retries_exhausted_returns_last_answer(self) -> None:
+        cfg = _CfgStub()
+        llm = _FakeLLM([self._result('{"patch": "bad"}')])
+        validations = {"n": 0}
+
+        def validate(chat: ChatResult) -> str | None:
+            validations["n"] += 1
+            return "still broken"
+
+        chat, _ = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "go"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=None,
+            validate=validate,
+            max_validation_retries=1,
+        )
+        # Initial validation + 1 retry, then the last answer is returned even
+        # though it never validated.
+        self.assertEqual(validations["n"], 2)
+        self.assertEqual(chat.content, '{"patch": "bad"}')
+
+    def test_no_validator_is_unchanged(self) -> None:
+        cfg = _CfgStub()
+        llm = _FakeLLM([self._result('{"patch": "v1"}')])
+        chat, _ = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "go"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=None,
+        )
+        self.assertEqual(chat.content, '{"patch": "v1"}')
+        self.assertEqual(len(llm.calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

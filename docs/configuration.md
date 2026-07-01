@@ -107,6 +107,34 @@ opt-in flag on the provider config.
 | `TASK_MAX_FOLLOWUPS` | `5` | Max serge-authored commits per fix branch. `0` disables the cap. |
 | `TASK_MAX_WORKERS` | `2` | Concurrent task workers (separate pool from reviews). |
 
+### Normalize validation (in-loop)
+
+Optionally validate each patch against the target repo's own normalizer (e.g.
+`make style && make fix-repo`) *inside the LLM loop*: serge applies the patch
+to the worktree and runs the normalizer; if it fails, the error is fed back to
+the model so it corrects the patch (up to `TASK_NORMALIZE_MAX_RETRIES` times).
+On success the worktree already holds the applied + normalized result, so the
+opened PR is conformant at creation (no red repo-consistency CI, no follow-up
+commit). Opt-in — unset `TASK_NORMALIZE_COMMAND` and serge behaves exactly as
+before. See [normalize validation](tasks-normalize.md) for the full setup.
+
+| Env var | Default | Description |
+| ------- | ------- | ----------- |
+| `TASK_NORMALIZE_COMMAND` | unset | Argv to run (shell-quoted, e.g. `bash -lc 'make style && make fix-repo'`). Unset disables validation. Operator/repo config — never request-supplied. |
+| `TASK_NORMALIZE_IMAGE` | unset | Docker image (repo toolchain baked in) for the `docker` backend. |
+| `TASK_SANDBOX_BACKEND` | `auto` | `bwrap` \| `docker` \| `kubernetes` \| `auto`. `auto` = docker when an image is set and the docker CLI is present, else bwrap. |
+| `TASK_NORMALIZE_TIMEOUT` | `1800` | Per-run timeout (seconds). |
+| `TASK_NORMALIZE_MEMORY` | unset | Optional docker `--memory` cap (e.g. `4g`). |
+| `TASK_NORMALIZE_MAX_RETRIES` | `2` | How many times a normalizer rejection is fed back to the model for correction. `0` = validate once, no corrective re-prompts. |
+| `TASK_NORMALIZE_GUIDANCE` | unset | Free-text policy injected into the task system prompt and the normalize-failure feedback (e.g. "prefer root-cause fixes over `# noqa`"). For anything the command itself can't express. |
+
+Task fixes also read the repo's own conventions file (`REVIEW_RULES_PATH`,
+default `.ai/review-rules.md`) straight from the checked-out branch and inject
+it into the patch-writing prompt — the same file the review flow uses. Point it
+at `AGENTS.md` (or any committed path) if that's where your conventions live.
+The model is told, regardless of config, to fix root causes and use
+suppressions (`# noqa`, `# type: ignore`) only as a last resort.
+
 ## Server
 
 | Env var | Default | Description |

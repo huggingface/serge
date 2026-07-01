@@ -316,6 +316,7 @@ class CloneCache:
         job_id: str,
         depth: int = 50,
         remote_url: Optional[str] = None,
+        standalone: bool = False,
     ) -> Optional[Checkout]:
         """Fetch an arbitrary branch ``ref`` (e.g. ``main`` or a
         ``serge/fix-*`` branch) into the shared bare repo and add a worktree
@@ -326,7 +327,19 @@ class CloneCache:
         ref is the repo's own trusted branch (base or a serge-authored fix
         branch), not an untrusted fork PR head, so the helper-tool / context
         script config can be trusted as-is. Returns the checkout or ``None``
-        on failure."""
+        on failure.
+
+        ``standalone`` selects a self-contained local clone instead of a
+        linked ``git worktree``. Pass it **only** when the task will run its
+        normalizer inside a container sandbox that binds just the worktree
+        (the ``docker``/``kubernetes`` backends): a linked worktree keeps its
+        gitdir in the shared bare repo (outside the bind mount), so every
+        in-sandbox ``git`` invocation fails — and the transformers
+        repo-consistency checkers (``modular_conversion``, ``docstrings``)
+        shell out to git. A standalone clone gives the checkout its own
+        ``.git`` so git works inside the sandbox. It costs a per-task object
+        copy, so reviews, the bwrap/dev backend, and any host-side run keep the
+        cheaper linked worktree (``standalone=False``)."""
         bare = self._bare_path(owner, repo)
         local_branch = f"task-{_slug(ref)}-{_slug(job_id)}"
         wt = os.path.join(
@@ -360,18 +373,52 @@ class CloneCache:
                     redact=redact,
                 )
                 os.utime(bare, None)
-                self._git(
-                    bare,
-                    "-c",
-                    "core.symlinks=false",
-                    "worktree",
-                    "add",
-                    "--quiet",
-                    wt,
-                    local_branch,
-                    timeout=60,
-                    redact=redact,
-                )
+                if standalone:
+                    # Self-contained clone, NOT a linked `git worktree`: the
+                    # task's normalize sandbox binds only the worktree dir, so
+                    # the gitdir must live *inside* it (see the ``standalone``
+                    # docstring). `--no-hardlinks` keeps the clone's object
+                    # store physically separate from the shared bare repo, so a
+                    # task running build commands with the worktree mounted
+                    # read-write cannot corrupt the cache.
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "--quiet",
+                            "--local",
+                            "--no-hardlinks",
+                            "--single-branch",
+                            "--branch",
+                            local_branch,
+                            bare,
+                            wt,
+                        ],
+                        check=True,
+                        capture_output=True,
+                        timeout=180,
+                        env=self._env,
+                    )
+                    # Name the checked-out branch `main`: the transformers
+                    # checkers special-case `git branch --show-current == main`
+                    # to check ALL files (the diff-based fast path needs a fork
+                    # point this single-branch clone has no merge-base for). The
+                    # model's patch is applied on top as uncommitted changes,
+                    # which `collect_changes` still picks up via the staged diff.
+                    self._git(wt, "checkout", "-q", "-B", "main", timeout=30)
+                else:
+                    self._git(
+                        bare,
+                        "-c",
+                        "core.symlinks=false",
+                        "worktree",
+                        "add",
+                        "--quiet",
+                        wt,
+                        local_branch,
+                        timeout=60,
+                        redact=redact,
+                    )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
                 stderr = ""
                 if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
@@ -438,6 +485,29 @@ class CloneCache:
             )
         finally:
             os.unlink(patch_path)
+
+    def reset_worktree(self, checkout: Checkout) -> None:
+        """Discard all worktree changes, restoring it to its HEAD commit.
+
+        Used between patch-validation attempts (see ``tasks._validate_patch``)
+        so each attempt applies the model's patch to a pristine checkout, and
+        as the fallback cleanup when validation is abandoned. ``reset --hard``
+        clears the index + tracked files; ``clean -fd`` removes untracked files
+        the normalizer may have created (honouring ``.gitignore``, so ignored
+        build artifacts are left alone)."""
+        self._git(checkout.path, "reset", "--hard", "HEAD", timeout=60)
+        self._git(checkout.path, "clean", "-fdq", timeout=60)
+
+    def stage_all(self, checkout: Checkout) -> None:
+        """Stage every worktree change (``git add -A``).
+
+        :meth:`apply_patch` stages as it applies (``--index``), but a command
+        task writes the worktree directly (e.g. ``make fix-repo`` rewriting
+        files), leaving the index untouched. Staging first makes those edits
+        visible to :meth:`collect_changes`, which diffs the index against
+        HEAD. ``git add`` honours the repo's ``.gitignore``, so build
+        artifacts the repo already ignores are not picked up."""
+        self._git(checkout.path, "add", "-A", timeout=120)
 
     def collect_changes(self, checkout: Checkout) -> list[FileChange]:
         """Return the set of files changed in the index relative to its HEAD

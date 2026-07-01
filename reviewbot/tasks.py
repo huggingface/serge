@@ -19,17 +19,19 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from . import __version__
-from .clone_cache import Checkout, CloneCache
+from .clone_cache import Checkout, CloneCache, FileChange
 from .compression import MessageCompressor
 from .config import Config
 from .github_client import SERGE_GIT_EMAIL, GitHubClient
 from .llm_client import ChatCompletionClient
+from .normalize import NormalizeError, run_normalize
 from .prompts import build_task_system_prompt, build_task_user_prompt
 from .reviewer import (
     _extract_json,
@@ -110,6 +112,10 @@ class TaskPlan:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     model: Optional[str] = None
+    # True when the patch was validated in-loop (see :func:`_validate_patch`):
+    # the worktree already holds the applied + normalized result, so
+    # :func:`publish_task` commits it directly instead of re-applying.
+    worktree_prepared: bool = False
 
 
 @dataclass
@@ -163,7 +169,10 @@ def task_candidate_requests(req: TaskRequest) -> list[TaskRequest]:
 # Request building / validation
 # ---------------------------------------------------------------------------
 def build_task_request(
-    payload: dict[str, Any], *, owner: str, repo: str
+    payload: dict[str, Any],
+    *,
+    owner: str,
+    repo: str,
 ) -> TaskRequest:
     """Validate an inbound /tasks payload into a TaskRequest.
 
@@ -288,18 +297,152 @@ def resolve_existing_pr(gh: GitHubClient, req: TaskRequest, cfg: Config) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Agentic loop → patch
+# Agentic loop → patch (with in-loop normalize validation)
 # ---------------------------------------------------------------------------
+def _validate_patch(
+    cfg: Config,
+    *,
+    checkout: Checkout,
+    clone_cache: CloneCache,
+    content: Optional[str],
+    emit: Callable[[str, str], None],
+) -> tuple[Optional[str], bool]:
+    """Validate the model's final answer by applying its patch to a clean
+    worktree and running the repo normalizer.
+
+    Returns ``(feedback, prepared)``:
+
+    - ``feedback`` is a non-empty string when the patch should be sent back to
+      the model for correction (it didn't apply, or the normalizer rejected
+      it); ``None`` when the answer is accepted. The worktree is reset to a
+      clean checkout before returning feedback.
+    - ``prepared`` is True when the worktree now holds the applied (and, when
+      the normalizer ran cleanly, normalized) result, ready for
+      :func:`publish_task` to commit directly.
+
+    Only called when ``cfg.task_normalize_command`` is set."""
+    command = cfg.task_normalize_command
+    assert command is not None
+
+    try:
+        result = _extract_json(content)
+    except ValueError:
+        # Unparseable — not something the normalizer can speak to. Accept here
+        # and let prepare_task's own extraction raise the proper error.
+        return None, False
+
+    patch = result.get("patch")
+    if not isinstance(patch, str) or not patch.strip():
+        # No patch to validate (a "no safe fix" answer); accept as-is.
+        return None, False
+
+    clone_cache.reset_worktree(checkout)
+    try:
+        clone_cache.apply_patch(checkout, patch)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:1200]
+        return (
+            "Your patch was rejected — `git apply` could not apply it to a "
+            f"clean checkout:\n\n{stderr}\n\nReturn a corrected unified diff. "
+            "Check the file paths and that the hunk context lines match the "
+            "current code exactly.",
+            False,
+        )
+
+    emit("step", "normalize")
+    emit("log", f"Validating the patch with `{' '.join(command)}`…")
+    try:
+        returncode, tail = run_normalize(
+            command,
+            workdir=checkout.path,
+            write_root=checkout.path,
+            backend=cfg.task_sandbox_backend,
+            image=cfg.task_normalize_image,
+            mode=cfg.helper_sandbox,
+            timeout=cfg.task_normalize_timeout,
+            memory=cfg.task_normalize_memory,
+            # k8s wiring is passed as plain values; run_normalize only uses it
+            # (and imports the optional k8s_sandbox/kubernetes client) when the
+            # kubernetes backend is selected, so non-k8s deploys never touch it.
+            k8s_namespace=cfg.task_k8s_namespace,
+            k8s_worktree_pvc=cfg.task_k8s_worktree_pvc,
+            k8s_worktree_volume_root=(
+                cfg.task_k8s_worktree_volume_root or cfg.web_clone_cache_dir or None
+            ),
+            k8s_service_account=cfg.task_k8s_service_account,
+            k8s_node_selector=cfg.task_k8s_node_selector,
+        )
+    except NormalizeError as exc:
+        # Infrastructure problem (sandbox unavailable, timeout) — not the
+        # model's fault. Accept the applied patch best-effort rather than
+        # blaming the LLM; CI still catches anything the normalizer would have.
+        log.warning("normalizer unavailable during validation: %s", exc)
+        emit(
+            "log", f"Normalizer unavailable ({exc}); accepting the patch un-normalized."
+        )
+        return None, True
+
+    if returncode != 0:
+        clone_cache.reset_worktree(checkout)
+        cmd = " ".join(command)
+        msg = (
+            f"Your patch applied cleanly, but the repository's normalizer "
+            f"(`{cmd}`) then failed (exit {returncode}):\n\n{tail}\n\n"
+            "Revise the patch so the normalizer passes. Fix the ROOT CAUSE — "
+            "suppress a check (`# noqa`, `# type: ignore`, disabling a rule) "
+            "only as a last resort, for a deliberate and justified exception, "
+            "and explain why in a comment. Common causes: editing an "
+            "auto-generated file instead of its modular/source counterpart, "
+            "leaving a copied block out of sync, or a lint/format issue the "
+            "fixer cannot resolve on its own."
+        )
+        if cfg.task_normalize_guidance:
+            msg += f"\n\n{cfg.task_normalize_guidance.strip()}"
+        return msg, False
+
+    emit("log", "Patch validated; normalizer is clean.")
+    return None, True
+
+
+def _read_repo_conventions(cfg: Config, checkout: Checkout) -> str:
+    """Read the repo's own conventions file (``cfg.review_rules_path``, e.g.
+    ``.ai/review-rules.md``) from the task worktree, falling back to the
+    deployment default.
+
+    Safe to read straight from the worktree: a task checks out the repo's own
+    trusted branch (base or a serge fix branch), not an untrusted fork PR head,
+    so there's no need for the default-branch overlay the review flow uses."""
+    rel = (cfg.review_rules_path or "").strip()
+    if rel:
+        try:
+            with open(os.path.join(checkout.path, rel), encoding="utf-8") as fh:
+                content = fh.read().strip()
+        except OSError:
+            content = ""
+        if content:
+            return content
+    return cfg.default_review_rules
+
+
 def prepare_task(
     cfg: Config,
     req: TaskRequest,
     *,
+    checkout: Checkout,
+    clone_cache: CloneCache,
     existing_diff: Optional[str] = None,
     chunk_callback: Optional[Callable[[str, str], None]] = None,
 ) -> TaskPlan:
     """Run the agentic loop (read-only browse tools rooted at the checkout)
     and return the LLM's proposed patch + PR meta. ``cfg.repo_checkout_path``
-    must already point at the worktree."""
+    must already point at ``checkout``.
+
+    When ``cfg.task_normalize_command`` is set, the loop also runs an in-loop
+    verification gate (see :func:`_validate_patch`): each final patch is
+    applied to the worktree and the repo normalizer is run; a failure is fed
+    back to the model (up to ``cfg.task_normalize_max_retries`` times) so it can
+    correct the patch. On success the worktree holds the applied + normalized
+    result and the returned plan has ``worktree_prepared=True``."""
 
     def _emit(kind: str, text: str) -> None:
         if chunk_callback is not None:
@@ -319,7 +462,11 @@ def prepare_task(
         stream=cfg.llm_stream,
         compressor=MessageCompressor.from_env(),
     )
-    system_prompt = build_task_system_prompt(tools_enabled=tool_env is not None)
+    system_prompt = build_task_system_prompt(
+        _read_repo_conventions(cfg, checkout),
+        cfg.task_normalize_guidance,
+        tools_enabled=tool_env is not None,
+    )
     user_prompt = build_task_user_prompt(
         repo_full_name=req.repo_full_name,
         base_ref=req.base_ref,
@@ -327,6 +474,22 @@ def prepare_task(
         context=req.context,
         existing_diff=existing_diff,
     )
+
+    # Wire the normalize verification gate into the loop when configured. The
+    # closure records whether the accepted answer left the worktree prepared.
+    normalize_configured = bool(cfg.task_normalize_command)
+    outcome = {"prepared": False}
+
+    def _validate(chat) -> Optional[str]:
+        feedback, prepared = _validate_patch(
+            cfg,
+            checkout=checkout,
+            clone_cache=clone_cache,
+            content=chat.content,
+            emit=_emit,
+        )
+        outcome["prepared"] = prepared
+        return feedback
 
     _emit("step", "llm")
     _emit("log", "Calling LLM to produce a patch…")
@@ -340,6 +503,8 @@ def prepare_task(
         tool_env=tool_env,
         emit=_emit,
         final_force_message=_TASK_FORCE_FINAL_MESSAGE,
+        validate=_validate if normalize_configured else None,
+        max_validation_retries=cfg.task_normalize_max_retries,
     )
     metrics_line = _format_aggregated_metrics(metrics)
     _emit("log", f"LLM done: {metrics_line}")
@@ -359,6 +524,12 @@ def prepare_task(
     if not isinstance(patch, str):
         patch = ""
 
+    # If validation never accepted a prepared worktree (retries exhausted, or
+    # normalize not configured), make sure the worktree is clean so
+    # publish_task's own apply path starts from a pristine checkout.
+    if normalize_configured and not outcome["prepared"]:
+        clone_cache.reset_worktree(checkout)
+
     return TaskPlan(
         title=req.title or title,
         body=body,
@@ -367,6 +538,7 @@ def prepare_task(
         prompt_tokens=metrics.prompt_tokens,
         completion_tokens=metrics.completion_tokens,
         model=llm.model,
+        worktree_prepared=outcome["prepared"],
     )
 
 
@@ -456,55 +628,28 @@ def _decorate_body(cfg: Config, plan: TaskPlan, req: TaskRequest) -> str:
     return body
 
 
-def publish_task(
+def _commit_changes(
     cfg: Config,
     gh: GitHubClient,
     req: TaskRequest,
-    plan: TaskPlan,
     *,
-    checkout: Checkout,
-    clone_cache: CloneCache,
+    changes: list[FileChange],
+    title: str,
+    body: str,
     job_id: str,
-    emit: Optional[Callable[[str, str], None]] = None,
+    emit_fn: Callable[[str, str], None],
 ) -> TaskResult:
-    """Apply the patch in the worktree and commit it via the Git Data API,
-    opening a new PR (new_pr) or pushing onto the serge fix branch
-    (existing_pr). Never pushes to a non-serge branch."""
-
-    def _emit(kind: str, text: str) -> None:
-        if emit is not None:
-            emit(kind, text)
-
-    if not plan.patch.strip():
-        _emit("log", "LLM proposed no patch; nothing to commit")
-        return TaskResult(
-            mode=req.mode,
-            no_change=True,
-            message=plan.body or "No fix was proposed.",
-        )
-
-    _emit("step", "apply")
-    try:
-        clone_cache.apply_patch(checkout, plan.patch)
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:800]
-        raise TaskError(f"patch did not apply cleanly: {stderr}", status_code=422)
-    changes = clone_cache.collect_changes(checkout)
-    if not changes:
-        return TaskResult(
-            mode=req.mode,
-            no_change=True,
-            message="Patch applied but produced no file changes.",
-        )
+    """Commit a set of worktree changes via the Git Data API and open/update
+    a PR. ``changes`` must be non-empty. Never pushes to a non-serge branch."""
     changed_files = [c.path for c in changes]
-    _emit(
-        "log", f"Patch touches {len(changed_files)} file(s): {', '.join(changed_files)}"
+    emit_fn(
+        "log",
+        f"Change touches {len(changed_files)} file(s): {', '.join(changed_files)}",
     )
 
     owner, repo = req.owner, req.repo
-    _emit("step", "commit")
+    emit_fn("step", "commit")
     entries = _tree_entries(gh, owner, repo, changes)
-    body = _decorate_body(cfg, plan, req)
 
     if req.mode == "existing_pr":
         head_branch = req.head_branch
@@ -515,12 +660,12 @@ def publish_task(
         commit_sha = gh.create_commit(
             owner,
             repo,
-            message=plan.title,
+            message=title,
             tree_sha=tree_sha,
             parents=[parent_sha],
         )
         gh.update_ref(owner, repo, f"heads/{head_branch}", commit_sha)
-        _emit("log", f"Pushed commit {commit_sha[:8]} to {head_branch}")
+        emit_fn("log", f"Pushed commit {commit_sha[:8]} to {head_branch}")
         return TaskResult(
             mode=req.mode,
             pr_number=req.pr_number,
@@ -539,21 +684,21 @@ def publish_task(
     commit_sha = gh.create_commit(
         owner,
         repo,
-        message=plan.title,
+        message=title,
         tree_sha=tree_sha,
         parents=[parent_sha],
     )
     gh.create_ref(owner, repo, f"refs/heads/{branch}", commit_sha)
-    _emit("log", f"Created branch {branch} at {commit_sha[:8]}")
+    emit_fn("log", f"Created branch {branch} at {commit_sha[:8]}")
     pr = gh.create_pull_request(
         owner,
         repo,
-        title=plan.title,
+        title=title,
         head=branch,
         base=req.base_ref,
         body=body,
     )
-    _emit("log", f"Opened PR #{pr.get('number')}: {pr.get('html_url')}")
+    emit_fn("log", f"Opened PR #{pr.get('number')}: {pr.get('html_url')}")
     if req.slack_notify_pr_created:
         post_task_pr_created_notification(
             token=cfg.slack_bot_token,
@@ -561,7 +706,7 @@ def publish_task(
             repo_full_name=req.repo_full_name,
             pr_number=pr.get("number"),
             pr_url=pr.get("html_url"),
-            title=plan.title,
+            title=title,
             branch=branch,
             changed_files=changed_files,
         )
@@ -573,4 +718,68 @@ def publish_task(
         changed_files=changed_files,
         message=f"Opened PR #{pr.get('number')}.",
         url=pr.get("html_url"),
+    )
+
+
+def publish_task(
+    cfg: Config,
+    gh: GitHubClient,
+    req: TaskRequest,
+    plan: TaskPlan,
+    *,
+    checkout: Checkout,
+    clone_cache: CloneCache,
+    job_id: str,
+    emit: Optional[Callable[[str, str], None]] = None,
+) -> TaskResult:
+    """Commit the task's change via the Git Data API, opening a new PR
+    (new_pr) or pushing onto the serge fix branch (existing_pr). Never pushes
+    to a non-serge branch.
+
+    When ``plan.worktree_prepared`` is set, the in-loop validation
+    (:func:`_validate_patch`) already applied + normalized the worktree, so we
+    just stage and commit it. Otherwise we apply ``plan.patch`` here (the path
+    taken when no normalizer is configured, or when validation was abandoned
+    and left a clean checkout)."""
+
+    def _emit(kind: str, text: str) -> None:
+        if emit is not None:
+            emit(kind, text)
+
+    if not plan.worktree_prepared and not plan.patch.strip():
+        _emit("log", "LLM proposed no patch; nothing to commit")
+        return TaskResult(
+            mode=req.mode,
+            no_change=True,
+            message=plan.body or "No fix was proposed.",
+        )
+
+    if plan.worktree_prepared:
+        _emit("log", "Committing the validated, normalized worktree.")
+    else:
+        _emit("step", "apply")
+        try:
+            clone_cache.apply_patch(checkout, plan.patch)
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:800]
+            raise TaskError(f"patch did not apply cleanly: {stderr}", status_code=422)
+
+    clone_cache.stage_all(checkout)
+    changes = clone_cache.collect_changes(checkout)
+    if not changes:
+        return TaskResult(
+            mode=req.mode,
+            no_change=True,
+            message="Patch applied but produced no file changes.",
+        )
+
+    return _commit_changes(
+        cfg,
+        gh,
+        req,
+        changes=changes,
+        title=plan.title,
+        body=_decorate_body(cfg, plan, req),
+        job_id=job_id,
+        emit_fn=_emit,
     )

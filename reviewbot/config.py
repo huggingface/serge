@@ -1,5 +1,6 @@
 import logging
 import os
+import shlex
 import stat
 import tempfile
 from dataclasses import dataclass
@@ -166,11 +167,73 @@ class Config:
     task_tool_max_iterations: Optional[int] = None
     # Cap on serge-authored commits per fix branch (follow-up loop guard).
     task_max_followups: int = 5
+
+    # --- Post-LLM normalize hook --------------------------------------
+    # After the LLM patch is applied to the worktree and before serge
+    # commits, optionally run the target repo's own normalizer (e.g. ``make
+    # style && make fix-repo``) in a sandbox and fold its edits into the same
+    # commit, so the opened PR is already conformant to the repo's standards
+    # (no red repo-consistency CI, no follow-up commit). Opt-in: when
+    # ``task_normalize_command`` is unset, the hook is skipped entirely and
+    # serge stays repo-agnostic.
+    #
+    # ``task_normalize_command`` is the argv to run (operator/repo config,
+    # never request-supplied). ``task_normalize_image`` is the docker image
+    # (the repo's toolchain baked in) used by the ``docker`` backend;
+    # ``task_sandbox_backend`` selects bwrap | docker | kubernetes | auto. The
+    # command always runs network-isolated.
+    task_normalize_command: Optional[list[str]] = None
+    task_normalize_image: Optional[str] = None
+    task_normalize_timeout: int = 1800
+    task_normalize_memory: Optional[str] = None
+    # How many times the LLM may be asked to correct its patch when the
+    # normalizer rejects it (or the patch fails to apply). 0 disables the
+    # feedback loop (validate once, accept whatever the model produced). The
+    # model gets up to ``task_normalize_max_retries + 1`` patch attempts.
+    task_normalize_max_retries: int = 2
+    # Optional free-text guidance injected into the task system prompt and the
+    # normalize-failure feedback, alongside the normalize command. Use it to
+    # encode policy the command itself can't express — e.g. "prefer root-cause
+    # fixes over `# noqa`/`# type: ignore` suppressions", or repo-specific
+    # conventions. Operator config, never request-supplied.
+    task_normalize_guidance: Optional[str] = None
+    task_sandbox_backend: str = sandbox.AUTO_BACKEND
+    # Kubernetes normalize backend (TASK_SANDBOX_BACKEND=kubernetes). The Job
+    # runs the normalizer on the worktree, which serge writes to a shared RWX
+    # PVC. ``task_k8s_namespace`` defaults to the in-cluster namespace at
+    # runtime; ``task_k8s_worktree_pvc`` is the claim the Job mounts;
+    # ``task_k8s_worktree_volume_root`` is where that PVC is mounted in serge
+    # (defaults to the clone-cache dir) — the worktree's path *relative* to it
+    # becomes the Job's volume subPath, so the Job sees only its own worktree.
+    task_k8s_namespace: Optional[str] = None
+    task_k8s_worktree_pvc: Optional[str] = None
+    task_k8s_worktree_volume_root: Optional[str] = None
+    task_k8s_service_account: Optional[str] = None
+    # nodeSelector for the normalize Job pods, as "key=value,key2=value2"
+    # (e.g. "scheduling.cast.ai/node-template=default-by-castai").
+    task_k8s_node_selector: Optional[str] = None
     # Optional Slack notification for PRs created by the /tasks flow.
     # Defaults to the org-level CI feedback Slack secrets; the transformers CI
     # names remain supported as fallbacks.
     slack_bot_token: Optional[str] = None
     slack_report_channel: Optional[str] = None
+
+    @property
+    def needs_isolated_checkout(self) -> bool:
+        """Whether the /tasks checkout must be a self-contained git clone
+        rather than a linked worktree.
+
+        True only when an in-loop normalizer runs inside a container sandbox
+        that binds *just* the worktree (``docker``/``kubernetes``, and
+        ``auto`` which may resolve to docker), so in-sandbox git works. When
+        normalize is unconfigured, or the dev-only ``bwrap`` backend is used,
+        the cheaper linked worktree is kept (see
+        :meth:`CloneCache.acquire_ref`)."""
+        return bool(self.task_normalize_command) and self.task_sandbox_backend in (
+            sandbox.DOCKER_BACKEND,
+            sandbox.KUBERNETES_BACKEND,
+            sandbox.AUTO_BACKEND,
+        )
 
     @classmethod
     def from_env(
@@ -332,6 +395,42 @@ class Config:
             ),
             task_tool_max_iterations=(_int_env("TASK_TOOL_MAX_ITERATIONS", 0) or None),
             task_max_followups=_int_env("TASK_MAX_FOLLOWUPS", 5),
+            task_normalize_command=(
+                shlex.split(os.environ.get("TASK_NORMALIZE_COMMAND") or "") or None
+            ),
+            task_normalize_image=(os.environ.get("TASK_NORMALIZE_IMAGE") or "").strip()
+            or None,
+            task_normalize_timeout=_int_env("TASK_NORMALIZE_TIMEOUT", 1800),
+            task_normalize_memory=(
+                os.environ.get("TASK_NORMALIZE_MEMORY") or ""
+            ).strip()
+            or None,
+            task_normalize_max_retries=_int_env("TASK_NORMALIZE_MAX_RETRIES", 2),
+            task_normalize_guidance=(
+                os.environ.get("TASK_NORMALIZE_GUIDANCE") or ""
+            ).strip()
+            or None,
+            task_sandbox_backend=sandbox.normalize_backend(
+                os.environ.get("TASK_SANDBOX_BACKEND")
+            ),
+            task_k8s_namespace=(os.environ.get("TASK_K8S_NAMESPACE") or "").strip()
+            or None,
+            task_k8s_worktree_pvc=(
+                os.environ.get("TASK_K8S_WORKTREE_PVC") or ""
+            ).strip()
+            or None,
+            task_k8s_worktree_volume_root=(
+                os.environ.get("TASK_K8S_WORKTREE_VOLUME_ROOT") or ""
+            ).strip()
+            or None,
+            task_k8s_service_account=(
+                os.environ.get("TASK_K8S_SERVICE_ACCOUNT") or ""
+            ).strip()
+            or None,
+            task_k8s_node_selector=(
+                os.environ.get("TASK_K8S_NODE_SELECTOR") or ""
+            ).strip()
+            or None,
             slack_bot_token=(
                 os.environ.get("SLACK_CIFEEDBACK_BOT_TOKEN")
                 or os.environ.get("CI_SLACK_BOT_TOKEN")

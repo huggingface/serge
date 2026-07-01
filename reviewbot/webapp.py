@@ -1140,6 +1140,7 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             ref_to_checkout,
             job_id=job.id,
             depth=cfg.web_clone_depth,
+            standalone=cfg.needs_isolated_checkout,
         )
         if checkout is None:
             raise TaskError(
@@ -1161,6 +1162,8 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             plan = prepare_task(
                 worker_cfg,
                 candidate_req,
+                checkout=checkout,
+                clone_cache=_clone_cache,
                 existing_diff=existing_diff,
                 chunk_callback=emit,
             )
