@@ -4,6 +4,7 @@ from reviewbot.llm_client import ChatResult, ToolCall
 from reviewbot.patch import parse_patch
 from reviewbot.tools import ToolEnv
 from reviewbot.reviewer import (
+    _MAX_TRUNCATION_RETRIES,
     _UnparseableLLMOutput,
     _assistant_tool_call_dict,
     _build_annotated_diff_chunks,
@@ -504,6 +505,73 @@ class ValidationGateTests(unittest.TestCase):
                 for m in llm.calls[2]["messages"]
             )
         )
+
+
+class TruncationRecoveryTests(unittest.TestCase):
+    """A final answer truncated at the provider's output-token limit
+    (finish_reason='length') is re-asked as JSON-only with tools off and
+    minimal reasoning, instead of failing the whole task."""
+
+    def test_truncated_final_answer_is_retried_json_only(self) -> None:
+        cfg = _CfgStub()
+        results = [
+            # Turn 1: a final answer cut off at the output limit (reasoning ate
+            # the budget), leaving the JSON incomplete.
+            ChatResult(
+                content='{"patch": "half of a diff th',
+                usage={"prompt_tokens": 10, "completion_tokens": 16384},
+                finish_reason="length",
+            ),
+            # Turn 2 (recovery): the complete JSON.
+            ChatResult(
+                content='{"patch": "v2"}',
+                usage={"prompt_tokens": 20, "completion_tokens": 30},
+                finish_reason="stop",
+            ),
+        ]
+        llm = _FakeLLM(results)
+        chat, _ = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "go"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        # The complete answer from the recovery turn is returned.
+        self.assertEqual(chat.content, '{"patch": "v2"}')
+        self.assertEqual(len(llm.calls), 2)
+        # Turn 1 had tools; the recovery turn disabled them and forced low
+        # reasoning so the whole output budget goes to the JSON.
+        self.assertIsNotNone(llm.calls[0]["tools"])
+        self.assertIsNone(llm.calls[1]["tools"])
+        self.assertEqual(llm.calls[1]["extra"], {"reasoning_effort": "low"})
+        # The recovery instruction re-entered the same conversation.
+        self.assertTrue(
+            any(
+                m.get("role") == "user"
+                and "output-token limit" in str(m.get("content"))
+                for m in llm.calls[1]["messages"]
+            )
+        )
+
+    def test_truncation_recovery_is_bounded(self) -> None:
+        cfg = _CfgStub()
+        # Always truncated: recovery must give up after _MAX_TRUNCATION_RETRIES
+        # and return the last answer rather than loop forever.
+        always_trunc = ChatResult(
+            content='{"patch": "nope',
+            usage={"prompt_tokens": 10, "completion_tokens": 16384},
+            finish_reason="length",
+        )
+        llm = _FakeLLM([always_trunc])
+        chat, _ = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "go"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=None,
+        )
+        # Initial answer + _MAX_TRUNCATION_RETRIES recovery attempts.
+        self.assertEqual(len(llm.calls), 1 + _MAX_TRUNCATION_RETRIES)
+        self.assertEqual(chat.finish_reason, "length")
 
 
 if __name__ == "__main__":

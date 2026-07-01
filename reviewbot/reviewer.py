@@ -643,6 +643,20 @@ _DEFAULT_FORCE_FINAL_MESSAGE = (
     "fences, no extra commentary. Do not request any more tools."
 )
 
+# A final answer that stops with finish_reason="length" ran out of output
+# budget mid-JSON — almost always because reasoning consumed it (the model
+# provider caps completion tokens, so raising max_tokens does not help). Rather
+# than fail the whole task, re-ask for the JSON only with reasoning minimised so
+# the answer fits. Bounded so a pathological model can't loop forever.
+_MAX_TRUNCATION_RETRIES = 2
+_TRUNCATION_RECOVERY_MESSAGE = (
+    "Your previous reply was cut off at the model's output-token limit before "
+    "you produced the complete JSON object — the reasoning used up the budget. "
+    "Reply again with ONLY the final JSON object the task requires: no "
+    "analysis, no explanation, no <think> block, no markdown fences. Keep it "
+    "minimal so the whole answer fits within the output limit."
+)
+
 
 def _run_agentic_loop(
     llm: ChatCompletionClient,
@@ -717,6 +731,10 @@ def _run_agentic_loop(
     iteration = 0
     blind_tool_turns = 0
     validation_retries = 0
+    truncation_retries = 0
+    # Set for one turn to recover a truncated final answer: disable tools and
+    # force minimal reasoning so the whole output budget goes to the JSON.
+    force_json_only = False
     while True:
         iteration += 1
         if iteration > ABSOLUTE_ITER_CEILING:
@@ -770,16 +788,17 @@ def _run_agentic_loop(
         if emit is not None:
             emit("step", f"llm:{label}")
             emit("log", f"LLM turn (blind={label})")
+        turn_tools = None if force_json_only else tools_arg
+        turn_effort = "low" if force_json_only else cfg.llm_reasoning_effort
         chat = llm.complete(
             messages,
             max_tokens=cfg.llm_max_tokens,
-            tools=tools_arg,
-            tool_choice="auto" if tools_arg else None,
+            tools=turn_tools,
+            tool_choice="auto" if turn_tools else None,
             chunk_callback=chunk_cb,
-            extra={"reasoning_effort": cfg.llm_reasoning_effort}
-            if cfg.llm_reasoning_effort
-            else None,
+            extra={"reasoning_effort": turn_effort} if turn_effort else None,
         )
+        force_json_only = False
         metrics.turns += 1
         metrics.latency_seconds += chat.latency_seconds
         if chat.prompt_tokens is not None:
@@ -789,6 +808,28 @@ def _run_agentic_loop(
         _emit_metrics(emit, metrics)
 
         if not chat.tool_calls:
+            # Salvage a truncated final answer before anything else: the model
+            # ran out of output budget mid-JSON (reasoning ate it). Re-ask for
+            # the JSON only, tool-less and low-reasoning, instead of returning
+            # unparseable content that fails the whole task.
+            if (
+                chat.finish_reason == "length"
+                and truncation_retries < _MAX_TRUNCATION_RETRIES
+            ):
+                truncation_retries += 1
+                if emit is not None:
+                    emit(
+                        "log",
+                        "Final answer hit the output-token limit "
+                        f"(recovery {truncation_retries}/{_MAX_TRUNCATION_RETRIES}); "
+                        "re-asking for the JSON only",
+                    )
+                messages.append({"role": "assistant", "content": chat.content or None})
+                messages.append(
+                    {"role": "user", "content": _TRUNCATION_RECOVERY_MESSAGE}
+                )
+                force_json_only = True
+                continue
             if validate is None:
                 return chat, metrics
             # Verification gate: let the caller check the final answer (for
