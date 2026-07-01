@@ -17,6 +17,43 @@ class _ToolsUnsupported(Exception):
     response body preview for logging."""
 
 
+class _ParameterUnsupported(Exception):
+    """Raised when the upstream endpoint rejects a specific payload
+    parameter with a 400 (e.g. newer Claude models deprecate
+    ``temperature``), so the caller can strip that one field and retry
+    once. Carries the offending parameter name and the response body
+    preview for logging."""
+
+    def __init__(self, param: str, body_preview: str):
+        self.param = param
+        self.body_preview = body_preview
+        super().__init__(f"{param}: {body_preview}")
+
+
+def _is_parameter_rejection(param: str, body_preview: str) -> bool:
+    """True when a 400 body indicates ``param`` itself is not accepted by
+    the model — as opposed to a value-range complaint. Provider-neutral:
+    matches the OpenAI-compat error text emitted by Anthropic's shim
+    ("`temperature` is deprecated for this model.") and similar
+    unsupported-parameter wording from other endpoints."""
+    text = body_preview.lower()
+    if param.lower() not in text:
+        return False
+    return any(
+        signal in text
+        for signal in (
+            "deprecat",
+            "unsupported",
+            "not supported",
+            "unexpected",
+            "unknown",
+            "not permitted",
+            "not allowed",
+            "cannot be used",
+        )
+    )
+
+
 class LLMResponseError(requests.HTTPError):
     """Non-OK HTTP response from the chat-completions endpoint that
     exhausted retries (or wasn't retryable to begin with). Carries the
@@ -151,6 +188,18 @@ class ChatCompletionClient:
             return self.model
         return self._discover_model()
 
+    # Optional sampling parameters a model may reject/deprecate outright.
+    # Each is safe to drop on a 400 — the server falls back to its own
+    # default — so retrying without it keeps the review alive. Ordered
+    # most- to least-commonly rejected.
+    _REMOVABLE_PARAMS = (
+        "temperature",
+        "top_p",
+        "top_k",
+        "frequency_penalty",
+        "presence_penalty",
+    )
+
     def complete(
         self,
         messages: list[dict[str, Any]],
@@ -200,33 +249,34 @@ class ChatCompletionClient:
         # the authoritative value once it lands.
         est_input_tokens = self._estimate_input_tokens(messages, tools)
         started = time.monotonic()
-        try:
-            return self._post_with_retries(
-                url,
-                payload,
-                attempts,
-                retryable,
-                started,
-                tools_in_use=bool(tools),
-                chunk_callback=chunk_callback,
-                est_input_tokens=est_input_tokens,
-            )
-        except _ToolsUnsupported:
-            # Endpoint rejected the tool-augmented payload. Strip the
-            # function-calling fields and try once more so the review can
-            # still complete (degraded: no browse tools).
-            for k in ("tools", "tool_choice"):
-                payload.pop(k, None)
-            return self._post_with_retries(
-                url,
-                payload,
-                attempts,
-                retryable,
-                started,
-                tools_in_use=False,
-                chunk_callback=chunk_callback,
-                est_input_tokens=est_input_tokens,
-            )
+        # The endpoint may reject specific payload fields with a 400: some
+        # models deprecate a sampling parameter (e.g. newer Claude reject
+        # `temperature`), others don't support function-calling. Strip the
+        # offending field and retry, at most once per removable field, so
+        # the review still completes.
+        while True:
+            try:
+                return self._post_with_retries(
+                    url,
+                    payload,
+                    attempts,
+                    retryable,
+                    started,
+                    tools_in_use="tools" in payload,
+                    chunk_callback=chunk_callback,
+                    est_input_tokens=est_input_tokens,
+                )
+            except _ParameterUnsupported as exc:
+                if exc.param not in payload:
+                    raise
+                payload.pop(exc.param, None)
+            except _ToolsUnsupported:
+                # Strip the function-calling fields and try once more
+                # (degraded: no browse tools).
+                if "tools" not in payload:
+                    raise
+                payload.pop("tools", None)
+                payload.pop("tool_choice", None)
 
     # Cap any single retry wait, even if the server hands us a huge
     # Retry-After. 120s is plenty for dynamic-rate-limit recovery
@@ -343,12 +393,26 @@ class ChatCompletionClient:
                         url,
                         body_preview,
                     )
-                    if r.status_code == 400 and tools_in_use:
-                        log.warning(
-                            "Retrying once without tools (the endpoint may "
-                            "not support function-calling for this model)"
-                        )
-                        raise _ToolsUnsupported(body_preview)
+                    if r.status_code == 400:
+                        # Check for a rejected sampling parameter first:
+                        # stripping tools wouldn't fix it, and some models
+                        # (e.g. newer Claude) reject `temperature` outright.
+                        for param in self._REMOVABLE_PARAMS:
+                            if param in payload and _is_parameter_rejection(
+                                param, body_preview
+                            ):
+                                log.warning(
+                                    "Retrying without `%s` (the model appears "
+                                    "to reject the parameter)",
+                                    param,
+                                )
+                                raise _ParameterUnsupported(param, body_preview)
+                        if tools_in_use:
+                            log.warning(
+                                "Retrying once without tools (the endpoint may "
+                                "not support function-calling for this model)"
+                            )
+                            raise _ToolsUnsupported(body_preview)
                     raise LLMResponseError(
                         r.status_code, r.reason or "", url, body_preview
                     )
