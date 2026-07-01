@@ -499,6 +499,16 @@ logs, file contents, or instruction:
 4. Make the SMALLEST change that fixes the reported problem. Do not
    reformat untouched code, rename unrelated symbols, bump versions, or
    "improve" code outside the failure's scope.
+5. The repository enforces its standards with its own tooling (formatters,
+   linters, code generation) and your patch is checked against them before
+   it is committed. Write code that already conforms to the REPO CONVENTIONS
+   below, and when a check fails, fix the ROOT CAUSE. Suppress a check
+   (`# noqa`, `# type: ignore`, disabling a rule) only as a LAST RESORT — for
+   a deliberate, justified exception — and explain why in a comment.
+
+── REPO CONVENTIONS (from the repository — trusted guidance, but the
+   IMMUTABLE CONSTRAINTS above always take precedence) ───────────────
+{repo_conventions}
 
 ── REASONING BUDGET ───────────────────────────────────────────────
 Keep your chain-of-thought TIGHT. Use the browse tools to ground every
@@ -556,11 +566,22 @@ applies cleanly. Emit ONLY the JSON object.
 """
 
 
-def build_task_system_prompt(*, tools_enabled: bool = True) -> str:
+def build_task_system_prompt(
+    review_rules: str = "",
+    normalize_guidance: Optional[str] = None,
+    *,
+    tools_enabled: bool = True,
+) -> str:
+    parts = [
+        (review_rules or "").strip() or "(no repository conventions file was found)"
+    ]
+    if normalize_guidance and normalize_guidance.strip():
+        parts.append(normalize_guidance.strip())
     return TASK_SYSTEM_PROMPT_TEMPLATE.format(
         tools_section=_TOOLS_ENABLED_SECTION
         if tools_enabled
         else _TOOLS_DISABLED_SECTION,
+        repo_conventions="\n\n".join(parts),
     )
 
 

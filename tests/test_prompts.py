@@ -4,7 +4,27 @@ from reviewbot.prompts import (
     build_followup_system_prompt,
     build_followup_user_prompt,
     build_system_prompt,
+    build_task_system_prompt,
 )
+
+
+class TaskSystemPromptTests(unittest.TestCase):
+    def test_injects_repo_conventions_and_guidance(self) -> None:
+        prompt = build_task_system_prompt(
+            "Always edit modular_*.py, never the generated modeling file.",
+            "Prefer real fixes over `# noqa`.",
+            tools_enabled=False,
+        )
+        self.assertIn("REPO CONVENTIONS", prompt)
+        self.assertIn("Always edit modular_*.py", prompt)
+        self.assertIn("Prefer real fixes over `# noqa`.", prompt)
+        # The standing root-cause / last-resort guidance is always present.
+        self.assertIn("ROOT CAUSE", prompt)
+        self.assertIn("LAST RESORT", prompt)
+
+    def test_handles_missing_conventions(self) -> None:
+        prompt = build_task_system_prompt("", None, tools_enabled=True)
+        self.assertIn("no repository conventions file was found", prompt)
 
 
 class PromptTests(unittest.TestCase):

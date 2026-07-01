@@ -17,9 +17,12 @@ RUN useradd --create-home --shell /bin/bash app
 
 WORKDIR /opt/app
 COPY . /opt/app
+# The [kubernetes] extra ships the API client for the kubernetes normalize
+# backend (TASK_SANDBOX_BACKEND=kubernetes). It's imported lazily, so it adds
+# no startup cost when the backend is unused (docker/bwrap deployments).
 RUN python -m venv /opt/app/.venv \
     && /opt/app/.venv/bin/pip install --upgrade pip \
-    && /opt/app/.venv/bin/pip install -e '.[web]'
+    && /opt/app/.venv/bin/pip install -e '.[web,kubernetes]'
 
 ENV PATH="/opt/app/.venv/bin:${PATH}"
 ENV PORT=8080

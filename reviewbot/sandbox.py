@@ -37,12 +37,32 @@ import sys
 log = logging.getLogger(__name__)
 
 BWRAP = "bwrap"
+DOCKER = "docker"
 
 # Modes for the HELPER_SANDBOX setting.
 REQUIRE = "require"
 AUTO = "auto"
 OFF = "off"
 _VALID_MODES = frozenset({REQUIRE, AUTO, OFF})
+
+# Backends for the task-command sandbox (TASK_SANDBOX_BACKEND). Distinct
+# from HELPER_SANDBOX's require/auto/off (which selects bwrap-or-nothing for
+# the read-only review subprocesses). A task command — e.g. the post-LLM
+# normalize hook running ``make fix-repo`` — runs arbitrary repo build code
+# that needs the *target repo's* dependency environment, which serge's own
+# venv does not provide. The ``docker`` backend runs it in a throwaway,
+# network-isolated container built from a per-repo image with those deps baked
+# in; ``kubernetes`` runs it as a one-shot Job in an isolated namespace (for
+# k8s deployments); ``bwrap`` reuses serge's venv (only viable when the command
+# needs no extra deps). Docker stays a first-class backend so a non-k8s
+# deployment never needs Kubernetes.
+BWRAP_BACKEND = "bwrap"
+DOCKER_BACKEND = "docker"
+KUBERNETES_BACKEND = "kubernetes"
+AUTO_BACKEND = "auto"
+_VALID_BACKENDS = frozenset(
+    {BWRAP_BACKEND, DOCKER_BACKEND, KUBERNETES_BACKEND, AUTO_BACKEND}
+)
 
 # Read-only /etc files a sandboxed tool plausibly needs (name resolution,
 # user lookup, timezone, TLS roots) — deliberately NOT all of /etc, which
@@ -72,13 +92,27 @@ class SandboxUnavailable(RuntimeError):
     """Raised when sandboxing is required but ``bwrap`` is not usable."""
 
 
+class DockerUnavailable(RuntimeError):
+    """Raised when the docker command-task backend is required but the
+    ``docker`` CLI is not on PATH."""
+
+
 def normalize_mode(raw: str | None) -> str:
     mode = (raw or AUTO).strip().lower()
     return mode if mode in _VALID_MODES else AUTO
 
 
+def normalize_backend(raw: str | None) -> str:
+    backend = (raw or AUTO_BACKEND).strip().lower()
+    return backend if backend in _VALID_BACKENDS else AUTO_BACKEND
+
+
 def sandbox_available() -> bool:
     return shutil.which(BWRAP) is not None
+
+
+def docker_available() -> bool:
+    return shutil.which(DOCKER) is not None
 
 
 def _venv_root() -> str | None:
@@ -142,6 +176,91 @@ def build_bwrap_argv(command: list[str], *, workdir: str, write_root: str) -> li
     return argv
 
 
+def build_docker_argv(
+    command: list[str],
+    *,
+    image: str,
+    workdir: str,
+    write_root: str,
+    network: bool = False,
+    uid: int | None = None,
+    gid: int | None = None,
+    memory: str | None = None,
+    pids_limit: int = 512,
+    extra_env: dict[str, str] | None = None,
+) -> list[str]:
+    """Return the ``docker run ... <image> <command>`` argv for a command task.
+
+    The container is a throwaway sandbox with the same trust properties as
+    the bwrap one, just stronger isolation for running arbitrary repo build
+    commands:
+
+    - ``--network none`` (default): no network. The repo's dependencies must
+      already be baked into ``image`` — serge never pip-installs at command
+      time. Pass ``network=True`` only for trusted, deliberately online tasks.
+    - ``--read-only`` rootfs + a writable ``/tmp`` tmpfs. The image's
+      site-packages live in read-only layers (readable); the only writable
+      host path is the worktree.
+    - The worktree (``write_root``) is bind-mounted **at the same absolute
+      path** read-write, and is the cwd (``workdir`` must be within it). The
+      command's file edits land straight in the host worktree, where
+      ``collect_changes`` picks them up.
+    - ``--cap-drop ALL`` + ``--security-opt no-new-privileges`` + a pids cap.
+    - Run as the host ``uid:gid`` so files the command creates in the
+      worktree are owned by serge, not root.
+    - **No serge secrets are ever passed** — the env is a minimal allowlist,
+      and (unlike the helper install hook) the container has no network to
+      exfiltrate anything regardless.
+
+    ``image`` is operator-controlled (per-repo, via config), never
+    caller-controlled — the OIDC ``repository`` claim authorizes *which* repo,
+    not *what image* runs.
+    """
+    write_root = os.path.realpath(write_root)
+    if uid is None:
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+    if gid is None:
+        gid = os.getgid() if hasattr(os, "getgid") else 0
+
+    argv: list[str] = [
+        DOCKER,
+        "run",
+        "--rm",
+        "--init",
+        "--network",
+        "none" if not network else "bridge",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:rw,exec,nosuid,nodev",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        str(pids_limit),
+        "--user",
+        f"{uid}:{gid}",
+        "--volume",
+        f"{write_root}:{write_root}:rw",
+        "--workdir",
+        workdir,
+        # HOME/TMPDIR point at the writable tmpfs; don't write .pyc into the
+        # read-only site-packages.
+        "--env",
+        "HOME=/tmp",
+        "--env",
+        "TMPDIR=/tmp",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+    ]
+    if memory:
+        argv += ["--memory", memory]
+    for key, value in (extra_env or {}).items():
+        argv += ["--env", f"{key}={value}"]
+    argv += [image, *command]
+    return argv
+
+
 def wrap_command(
     command: list[str],
     *,
@@ -169,3 +288,51 @@ def wrap_command(
         "bubblewrap not found; running subprocess WITHOUT sandbox (HELPER_SANDBOX=auto)"
     )
     return command
+
+
+def wrap_task_command(
+    command: list[str],
+    *,
+    workdir: str,
+    write_root: str,
+    backend: str,
+    image: str | None,
+    mode: str,
+    network: bool = False,
+    memory: str | None = None,
+) -> list[str]:
+    """Resolve a local (subprocess) task-command sandbox backend and return
+    the argv to run.
+
+    ``backend`` is ``bwrap`` | ``docker`` | ``auto``. ``auto`` picks docker
+    when an ``image`` is configured and the docker CLI is present, else falls
+    back to bwrap (which uses serge's own venv and the ``mode`` require/auto/off
+    semantics). Raises :class:`DockerUnavailable` when docker is explicitly
+    required but unusable, or :class:`SandboxUnavailable` when bwrap is required
+    but unusable. The ``kubernetes`` backend is not handled here — it does not
+    run as a local subprocess; see ``reviewbot/normalize.py``."""
+    backend = normalize_backend(backend)
+    if backend == AUTO_BACKEND:
+        backend = DOCKER_BACKEND if (image and docker_available()) else BWRAP_BACKEND
+
+    if backend == DOCKER_BACKEND:
+        if not image:
+            raise DockerUnavailable(
+                "docker task-command backend requires a configured image "
+                "(TASK_NORMALIZE_IMAGE)"
+            )
+        if not docker_available():
+            raise DockerUnavailable(
+                "docker command-task backend selected but the 'docker' CLI is "
+                "not on PATH"
+            )
+        return build_docker_argv(
+            command,
+            image=image,
+            workdir=workdir,
+            write_root=write_root,
+            network=network,
+            memory=memory,
+        )
+
+    return wrap_command(command, workdir=workdir, write_root=write_root, mode=mode)

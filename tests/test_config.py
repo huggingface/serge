@@ -86,6 +86,47 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.slack_bot_token, "legacy-token")
         self.assertEqual(cfg.slack_report_channel, "#legacy-ci")
 
+    def test_needs_isolated_checkout_requires_normalize_and_container_backend(
+        self,
+    ) -> None:
+        import dataclasses
+
+        from reviewbot import sandbox
+
+        with patch.dict(os.environ, {"LLM_API_KEY": "token"}, clear=True):
+            base = Config.from_env(require_app=False)
+
+        # No normalize command configured -> always the cheap worktree.
+        self.assertFalse(
+            dataclasses.replace(
+                base,
+                task_normalize_command=None,
+                task_sandbox_backend=sandbox.DOCKER_BACKEND,
+            ).needs_isolated_checkout
+        )
+        # Normalize + a container backend that binds only the worktree.
+        for backend in (
+            sandbox.DOCKER_BACKEND,
+            sandbox.KUBERNETES_BACKEND,
+            sandbox.AUTO_BACKEND,
+        ):
+            self.assertTrue(
+                dataclasses.replace(
+                    base,
+                    task_normalize_command=["make", "style"],
+                    task_sandbox_backend=backend,
+                ).needs_isolated_checkout,
+                backend,
+            )
+        # bwrap is dev/style-only -> keep the linked worktree even with a command.
+        self.assertFalse(
+            dataclasses.replace(
+                base,
+                task_normalize_command=["make", "style"],
+                task_sandbox_backend=sandbox.BWRAP_BACKEND,
+            ).needs_isolated_checkout
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

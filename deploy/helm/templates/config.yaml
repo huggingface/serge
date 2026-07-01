@@ -8,3 +8,34 @@ data:
   {{- range $key, $value := $.Values.envVars }}
   {{ $key }}: {{ $value | quote }}
   {{- end }}
+  {{- if .Values.normalize.kubernetes.enabled }}
+  {{- $k := .Values.normalize.kubernetes }}
+  TASK_SANDBOX_BACKEND: "kubernetes"
+  TASK_NORMALIZE_IMAGE: {{ $k.image | quote }}
+  TASK_NORMALIZE_COMMAND: {{ $k.command | quote }}
+  TASK_NORMALIZE_TIMEOUT: {{ $k.timeout | quote }}
+  TASK_NORMALIZE_MAX_RETRIES: {{ $k.maxRetries | quote }}
+  {{- with $k.memory }}
+  TASK_NORMALIZE_MEMORY: {{ . | quote }}
+  {{- end }}
+  {{- with $k.guidance }}
+  TASK_NORMALIZE_GUIDANCE: {{ . | quote }}
+  {{- end }}
+  {{- with $k.reviewRulesPath }}
+  REVIEW_RULES_PATH: {{ . | quote }}
+  {{- end }}
+  # Worktree cache lives on the shared RWX volume; the Job mounts the same
+  # claim and computes its subPath relative to this root.
+  WEB_CLONE_CACHE_DIR: {{ $k.worktree.mountPath | quote }}
+  TASK_K8S_WORKTREE_PVC: {{ include "name" . }}-worktrees
+  TASK_K8S_WORKTREE_VOLUME_ROOT: {{ $k.worktree.mountPath | quote }}
+  {{- with $k.namespace }}
+  TASK_K8S_NAMESPACE: {{ . | quote }}
+  {{- end }}
+  {{- with $k.podServiceAccount }}
+  TASK_K8S_SERVICE_ACCOUNT: {{ . | quote }}
+  {{- end }}
+  {{- with $k.nodeSelector }}
+  TASK_K8S_NODE_SELECTOR: {{ . | quote }}
+  {{- end }}
+  {{- end }}

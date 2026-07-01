@@ -18,3 +18,5 @@ dist/
 .jekyll-cache/
 # Filled-in copy of deploy/helm/serge-secrets.example.yaml — never commit real secrets.
 deploy/helm/serge-secrets.yaml
+# Env-specific overlay with internal cluster/infra identifiers — keep local only.
+deploy/helm/env/normalize.example.yaml

@@ -2,20 +2,23 @@
 branch-ownership guard + loop cap, and publish_task's commit/PR flow (real
 worktree via CloneCache, fake GitHub Git Data API)."""
 
+import json
 import os
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from reviewbot.clone_cache import CloneCache
+from reviewbot.clone_cache import Checkout, CloneCache
 from reviewbot.config import Config
 from reviewbot.github_client import SERGE_GIT_EMAIL
 from reviewbot.tasks import (
     TaskError,
     TaskPlan,
     TaskRequest,
+    _read_repo_conventions,
     _selected_failure_context,
+    _validate_patch,
     build_task_request,
     publish_task,
     resolve_existing_pr,
@@ -508,6 +511,269 @@ class PublishTaskTests(unittest.TestCase):
         # Sanity: the email the loop-cap counts by is the one stamped on
         # commits, so follow-ups are countable.
         self.assertTrue(SERGE_GIT_EMAIL)
+
+
+class ValidatePatchTests(unittest.TestCase):
+    """The in-loop verification gate (_validate_patch), against a real
+    worktree. Runs with the bwrap backend + sandbox off so the normalize
+    command runs directly (no docker / bwrap needed in the test environment)."""
+
+    _PATCH = (
+        "diff --git a/hello.txt b/hello.txt\n"
+        "--- a/hello.txt\n"
+        "+++ b/hello.txt\n"
+        "@@ -1 +1 @@\n"
+        "-hi from main\n"
+        "+hi patched\n"
+    )
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = self._tmp.name
+        self.src = os.path.join(root, "src")
+        os.makedirs(self.src)
+        _git(self.src, "init", "--quiet", "-b", "main")
+        with open(os.path.join(self.src, "hello.txt"), "w") as f:
+            f.write("hi from main\n")
+        _git(self.src, "add", "-A")
+        _git(self.src, "commit", "--quiet", "-m", "main commit")
+        self.cache = CloneCache(os.path.join(root, "cache"))
+        self.co = self.cache.acquire_ref(
+            token="",
+            owner="acme",
+            repo="widget",
+            ref="main",
+            job_id="abcd1234",
+            remote_url=self.src,
+        )
+
+    def _cfg(self, **overrides):
+        base = dict(helper_sandbox="off", task_sandbox_backend="bwrap")
+        base.update(overrides)
+        return _make_cfg(**base)
+
+    def _content(self, patch):
+        return json.dumps({"title": "t", "body": "b", "patch": patch})
+
+    def _validate(self, cfg, content):
+        return _validate_patch(
+            cfg,
+            checkout=self.co,
+            clone_cache=self.cache,
+            content=content,
+            emit=lambda *a: None,
+        )
+
+    def _wt(self, name):
+        return os.path.join(self.co.path, name)
+
+    def test_clean_normalize_prepares_combined_worktree(self):
+        # Patch applies + normalizer creates an extra file + exits 0 ->
+        # accepted (no feedback, prepared) with BOTH edits in the worktree.
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", "echo generated > extra.txt"],
+            task_normalize_timeout=30,
+        )
+        feedback, prepared = self._validate(cfg, self._content(self._PATCH))
+        self.assertIsNone(feedback)
+        self.assertTrue(prepared)
+        with open(self._wt("hello.txt")) as f:
+            self.assertEqual(f.read(), "hi patched\n")
+        self.assertTrue(os.path.exists(self._wt("extra.txt")))
+        # The combined change is what publish_task would commit.
+        self.cache.stage_all(self.co)
+        changed = sorted(c.path for c in self.cache.collect_changes(self.co))
+        self.assertEqual(changed, ["extra.txt", "hello.txt"])
+
+    def test_normalizer_failure_feeds_back_and_resets(self):
+        # Non-zero normalizer exit -> feedback to the model, worktree reset
+        # clean (so the next attempt starts pristine).
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", "echo boom >&2; exit 3"],
+            task_normalize_timeout=30,
+        )
+        feedback, prepared = self._validate(cfg, self._content(self._PATCH))
+        self.assertFalse(prepared)
+        self.assertIsNotNone(feedback)
+        self.assertIn("normalizer", feedback.lower())
+        self.assertIn("boom", feedback)
+        # Guides the model toward root-cause fixes over suppressions.
+        self.assertIn("ROOT CAUSE", feedback)
+        self.assertIn("noqa", feedback)
+        # Worktree restored to the pristine checkout.
+        with open(self._wt("hello.txt")) as f:
+            self.assertEqual(f.read(), "hi from main\n")
+        self.assertEqual(self.cache.collect_changes(self.co), [])
+
+    def test_operator_guidance_is_appended_to_feedback(self):
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", "echo boom >&2; exit 3"],
+            task_normalize_timeout=30,
+            task_normalize_guidance="HOUSE RULE: never add new dependencies.",
+        )
+        feedback, prepared = self._validate(cfg, self._content(self._PATCH))
+        self.assertFalse(prepared)
+        self.assertIn("HOUSE RULE: never add new dependencies.", feedback)
+
+    def test_unapplyable_patch_feeds_back(self):
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", "true"], task_normalize_timeout=30
+        )
+        bad = (
+            "diff --git a/hello.txt b/hello.txt\n"
+            "--- a/hello.txt\n"
+            "+++ b/hello.txt\n"
+            "@@ -1 +1 @@\n"
+            "-does not match\n"
+            "+nope\n"
+        )
+        feedback, prepared = self._validate(cfg, self._content(bad))
+        self.assertFalse(prepared)
+        self.assertIsNotNone(feedback)
+        self.assertIn("apply", feedback.lower())
+
+    def test_unavailable_sandbox_accepts_best_effort(self):
+        # docker backend with no image -> NormalizeError; not the model's
+        # fault, so the applied patch is accepted (prepared) un-normalized.
+        cfg = self._cfg(
+            task_sandbox_backend="docker",
+            task_normalize_command=["make", "fix-repo"],
+            task_normalize_timeout=30,
+        )
+        feedback, prepared = self._validate(cfg, self._content(self._PATCH))
+        self.assertIsNone(feedback)
+        self.assertTrue(prepared)
+        with open(self._wt("hello.txt")) as f:
+            self.assertEqual(f.read(), "hi patched\n")
+
+    def test_empty_patch_accepted_not_prepared(self):
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", "true"], task_normalize_timeout=30
+        )
+        feedback, prepared = self._validate(cfg, self._content(""))
+        self.assertIsNone(feedback)
+        self.assertFalse(prepared)
+
+
+class PublishPreparedTests(unittest.TestCase):
+    """publish_task commits a worktree already prepared by validation,
+    without re-applying the patch."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = self._tmp.name
+        self.src = os.path.join(root, "src")
+        os.makedirs(self.src)
+        _git(self.src, "init", "--quiet", "-b", "main")
+        with open(os.path.join(self.src, "hello.txt"), "w") as f:
+            f.write("hi from main\n")
+        _git(self.src, "add", "-A")
+        _git(self.src, "commit", "--quiet", "-m", "main commit")
+        self.cache = CloneCache(os.path.join(root, "cache"))
+        self.cfg = _make_cfg()
+
+    def _checkout(self):
+        return self.cache.acquire_ref(
+            token="",
+            owner="acme",
+            repo="widget",
+            ref="main",
+            job_id="abcd1234",
+            remote_url=self.src,
+        )
+
+    def _req(self):
+        return TaskRequest(
+            owner="acme",
+            repo="widget",
+            base_ref="main",
+            instruction="fix",
+            context="",
+            mode="new_pr",
+        )
+
+    def test_prepared_worktree_is_committed_as_is(self):
+        co = self._checkout()
+        # Simulate what _validate_patch leaves behind: edits already in the
+        # worktree (not staged). publish_task must NOT re-apply plan.patch.
+        with open(os.path.join(co.path, "hello.txt"), "w") as f:
+            f.write("hi patched\n")
+        with open(os.path.join(co.path, "extra.txt"), "w") as f:
+            f.write("generated\n")
+        plan = TaskPlan(
+            title="Fix hello",
+            body="desc",
+            patch="this patch text is never applied",
+            worktree_prepared=True,
+        )
+        gh = _FakeGH()
+        with patch("reviewbot.tasks.post_task_pr_created_notification"):
+            result = publish_task(
+                self.cfg,
+                gh,
+                self._req(),
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+        self.assertFalse(result.no_change)
+        self.assertEqual(sorted(result.changed_files), ["extra.txt", "hello.txt"])
+
+    def test_prepared_but_clean_worktree_is_no_change(self):
+        co = self._checkout()
+        plan = TaskPlan(title="t", body="b", patch="x", worktree_prepared=True)
+        gh = _FakeGH()
+        result = publish_task(
+            self.cfg,
+            gh,
+            self._req(),
+            plan,
+            checkout=co,
+            clone_cache=self.cache,
+            job_id="abcd1234",
+        )
+        self.assertTrue(result.no_change)
+        self.assertIsNone(gh.created_pr)
+
+
+class ReadRepoConventionsTests(unittest.TestCase):
+    """_read_repo_conventions reads the repo's rules file straight from the
+    task worktree, falling back to the deployment default."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.wt = self._tmp.name
+        self.co = Checkout(path=self.wt, branch="main", bare="", owner="a", repo="b")
+
+    def _cfg(self, **overrides):
+        base = dict(
+            review_rules_path=".ai/review-rules.md",
+            default_review_rules="DEFAULT RULES",
+        )
+        base.update(overrides)
+        return _make_cfg(**base)
+
+    def test_reads_rules_file_from_worktree(self):
+        os.makedirs(os.path.join(self.wt, ".ai"))
+        with open(os.path.join(self.wt, ".ai", "review-rules.md"), "w") as f:
+            f.write("Edit modular_*.py, never the generated file.\n")
+        out = _read_repo_conventions(self._cfg(), self.co)
+        self.assertEqual(out, "Edit modular_*.py, never the generated file.")
+
+    def test_falls_back_to_default_when_absent(self):
+        self.assertEqual(_read_repo_conventions(self._cfg(), self.co), "DEFAULT RULES")
+
+    def test_configurable_path_can_point_at_agents_md(self):
+        with open(os.path.join(self.wt, "AGENTS.md"), "w") as f:
+            f.write("House conventions live here.\n")
+        cfg = self._cfg(review_rules_path="AGENTS.md")
+        self.assertEqual(
+            _read_repo_conventions(cfg, self.co), "House conventions live here."
+        )
 
 
 if __name__ == "__main__":
