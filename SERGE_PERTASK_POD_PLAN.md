@@ -1,14 +1,20 @@
 # Plan: one pod per task (whole LLM loop + normalize in-pod)
 
-Status: **All four phases built (2026-07-02).** Phase 1 proven locally; Phases
-2–3 (launcher behind `TASK_EXECUTION`, docker + kubernetes backends, callback
-ingest, `serge-egress` Helm infra) and Phase 4 (deleted the dead normalize-Job
-code + Helm) landed with tests + `helm lint`. The runner-pod config-propagation
-gap found during Phase 4 is **fixed** (see "Closed" below). **Only remaining
-item: live-cluster verification of Phase 3** — deploy with
-`taskExecution.kubernetes.enabled=true` and confirm git clone + LLM succeed, a
-blocked host fails, the callback reaches serge, and the per-job Secret is GC'd.
-Captured 2026-07-02.
+Status: **All four phases built + deployed to prod (2026-07-02, release rev 19,
+image `sha-0f77376`).** Phase 1 proven locally; Phases 2–3 (launcher behind
+`TASK_EXECUTION`, docker + kubernetes backends, callback ingest, `serge-egress`
+Helm infra) and Phase 4 (deleted the dead normalize-Job code + Helm) landed with
+tests + `helm lint`. The runner-pod config-propagation gap found during Phase 4
+is **fixed** (see "Closed" below).
+
+**Phase 3 live-cluster verification — network firewall DONE (2026-07-02).** From
+a real task-labeled pod (`serge.io/task-pod=true`) on prod: DNS resolves; git
+clone + `github.com` + `router.huggingface.co` succeed through the `serge-egress`
+proxy; `example.com` is 403-blocked; **direct egress bypassing the proxy is
+blocked** (the VPC-CNI NetworkPolicy is genuinely enforced); the serge callback
+Service is reachable via the NO_PROXY bypass. **Remaining: a full end-to-end task
+run** (real launcher → per-job Secret + Job → callback event stream → PR publish
+→ owner-referenced Secret GC) — deferred because it opens a real PR + spends LLM.
 **Supersedes** `SERGE_PERTASK_AGENT_POD_PROPOSAL.md`, whose recommendation ("do
 not merge normalize into the agent pod, to preserve the deny-egress isolation")
 is reversed by an explicit operator decision: the per-task pod may reach the
@@ -84,13 +90,20 @@ own isolated Job.
 
 **Remaining (not code — verification / hardening):**
 
-- **Phase 3 live verify.** On-cluster: `helm upgrade` with
-  `taskExecution.kubernetes.enabled=true`, then confirm git clone + LLM succeed
-  and a blocked host fails (`curl https://example.com` must fail) from inside a
-  task pod. Also confirm the callback reaches serge and the per-job Secret is
-  GC'd. Validate on real infra: the tinyproxy image + config, and whether
-  kube-dns egress should be tightened to ClusterIP injection (the stricter
-  no-DNS stance — currently a documented residual risk).
+- **Phase 3 full e2e (task run).** The network firewall is verified (above); what
+  remains is a real `/tasks` submission on prod to exercise the launcher →
+  per-job Secret + Job → callback event stream → PR publish, and confirm the
+  owner-referenced Secret is **GC'd** after the Job finishes. Deferred: it opens
+  a real PR + spends LLM, so it needs a safe target repo/issue + go-ahead.
+- **Wiz image trust (follow-up).** The three ghcr images (`serge`,
+  `serge-task-runner`, `serge-egress`) fail the "Default image trust admission
+  policy (Wiz CI/CD scan)" — currently **AUDIT-only** (non-blocking). Get them
+  into the Wiz scan pipeline before the policy is enforced, or deploys will break.
+- **Config now in git.** The normalize command + `REVIEW_RULES_PATH` etc. that
+  the retired normalize-Job took from an ad-hoc (never-committed) source now live
+  in `deploy/helm/env/prod.yaml` `envVars`, so the deploy is reproducible.
+- Open question still open: whether kube-dns egress should be tightened to
+  ClusterIP injection (the stricter no-DNS stance — documented residual risk).
 - A full-success **container** e2e (opening a real PR) needs either real creds or
   a `GITHUB_API_URL` override on `GitHubClient` (it hardcodes `api.github.com`) —
   see follow-ups.
