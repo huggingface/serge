@@ -123,3 +123,64 @@ normalize:
       mountPath: /var/lib/reviewbot-clones
       storageClass: ""
       size: 20Gi
+
+# Per-task-pod execution (TASK_EXECUTION=kubernetes) — SERGE_PERTASK_POD_PLAN.md.
+# Each /tasks request runs in its own one-shot runner Job that does the whole
+# LLM loop + in-process normalize and streams results back to serge over an HTTP
+# callback. No shared worktree PVC: the pod clones into its own emptyDir. When
+# enabled the chart creates: (1) the task-runner RBAC (serge may manage Jobs +
+# per-job Secrets + read its Service), (2) an allowlist-egress NetworkPolicy for
+# the task pods (egress only to the serge-egress proxy, serge's callback, and
+# kube-dns), and (3) the serge-egress forward proxy (Deployment + Service +
+# NetworkPolicy) that CONNECT-allowlists GitHub + the HF LLM only.
+# Mutually exclusive with normalize.kubernetes (that spawns nested normalize
+# Jobs; here normalize runs in-process in the task pod). Requires
+# serviceAccount.create=true. Kubernetes is never mandatory — leave disabled for
+# docker/inprocess deployments.
+taskExecution:
+  kubernetes:
+    enabled: false
+    # Runner image: reviewbot layered on the repo toolchain
+    # (docker/Dockerfile.task-runner). REQUIRED when enabled.
+    image: ""
+    # Wall-clock cap (seconds) per task Job.
+    timeout: 3600
+    # Optional per-task pod memory limit (e.g. 4Gi).
+    memory: ""
+    # Job namespace; "" = the release namespace.
+    namespace: ""
+    # ServiceAccount for the task *pods* (not serge). "" = namespace default;
+    # the pod gets no API token regardless (automountServiceAccountToken=false).
+    podServiceAccount: ""
+    # nodeSelector for the task pods, as "key=value,key2=value2".
+    nodeSelector: ""
+    # Base URL the runner POSTs events + the terminal result back to. "" =
+    # serge's in-cluster Service DNS (http://<release>.<ns>.svc.cluster.local).
+    # The callback bypasses the egress proxy (see NO_PROXY in the ConfigMap).
+    callbackBaseUrl: ""
+    # serge-egress: the allowlisting forward proxy the task pods must route all
+    # egress through. It performs DNS + CONNECT only to the domains below.
+    egress:
+      # A standard tinyproxy image. REQUIRED when enabled.
+      image: ""
+      replicas: 1
+      port: 3128
+      # Host regexes the proxy permits CONNECT to (tinyproxy FilterExtended).
+      # Everything else is denied (FilterDefaultDeny).
+      allowDomains:
+        - '(^|\.)github\.com$'
+        - '(^|\.)githubusercontent\.com$'
+        - '^router\.huggingface\.co$'
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+    # kube-dns selector so the task pods + proxy may resolve names. Adjust for
+    # clusters where CoreDNS runs under a different label/namespace.
+    kubeDns:
+      namespace: kube-system
+      podLabels:
+        k8s-app: kube-dns

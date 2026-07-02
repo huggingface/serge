@@ -39,3 +39,27 @@ data:
   TASK_K8S_NODE_SELECTOR: {{ . | quote }}
   {{- end }}
   {{- end }}
+  {{- if .Values.taskExecution.kubernetes.enabled }}
+  {{- $t := .Values.taskExecution.kubernetes }}
+  {{- $egress := printf "%s-egress" (include "name" .) }}
+  TASK_EXECUTION: "kubernetes"
+  TASK_RUNNER_IMAGE: {{ $t.image | quote }}
+  TASK_RUNNER_TIMEOUT: {{ $t.timeout | quote }}
+  {{- with $t.memory }}
+  TASK_RUNNER_MEMORY: {{ . | quote }}
+  {{- end }}
+  # All task-pod egress goes through the serge-egress proxy; the in-cluster
+  # callback to serge bypasses it (NO_PROXY).
+  TASK_RUNNER_PROXY: "http://{{ $egress }}.{{ .Release.Namespace }}.svc.cluster.local:{{ $t.egress.port }}"
+  TASK_RUNNER_NO_PROXY: ".svc.cluster.local,.svc,.cluster.local,localhost,127.0.0.1"
+  TASK_CALLBACK_BASE_URL: {{ $t.callbackBaseUrl | default (printf "http://%s.%s.svc.cluster.local" (include "name" .) .Release.Namespace) | quote }}
+  {{- with $t.namespace }}
+  TASK_K8S_NAMESPACE: {{ . | quote }}
+  {{- end }}
+  {{- with $t.podServiceAccount }}
+  TASK_K8S_SERVICE_ACCOUNT: {{ . | quote }}
+  {{- end }}
+  {{- with $t.nodeSelector }}
+  TASK_K8S_NODE_SELECTOR: {{ . | quote }}
+  {{- end }}
+  {{- end }}
