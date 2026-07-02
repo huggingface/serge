@@ -195,6 +195,10 @@ class Config:
     # forward proxy egress is routed through (see launcher.DockerLaunchOptions).
     task_runner_network: Optional[str] = None
     task_runner_proxy: Optional[str] = None
+    # Hosts that bypass the egress proxy — in kubernetes this must include
+    # serge's own callback host (the callback goes straight to the serge pod,
+    # not through the allowlisting gateway). Comma-separated, as NO_PROXY.
+    task_runner_no_proxy: Optional[str] = None
     task_runner_memory: Optional[str] = None
 
     # --- Post-LLM normalize hook --------------------------------------
@@ -444,6 +448,8 @@ class Config:
             task_runner_network=(os.environ.get("TASK_RUNNER_NETWORK") or "").strip()
             or None,
             task_runner_proxy=(os.environ.get("TASK_RUNNER_PROXY") or "").strip()
+            or None,
+            task_runner_no_proxy=(os.environ.get("TASK_RUNNER_NO_PROXY") or "").strip()
             or None,
             task_runner_memory=(os.environ.get("TASK_RUNNER_MEMORY") or "").strip()
             or None,

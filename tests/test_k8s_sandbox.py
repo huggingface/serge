@@ -326,5 +326,163 @@ class RunJobTests(unittest.TestCase):
                 )
 
 
+class TaskJobManifestTests(unittest.TestCase):
+    """The per-task-pod Job + Secret builders (TASK_EXECUTION=kubernetes)."""
+
+    def _job(self, **kw):
+        params = dict(
+            image="serge/runner:latest",
+            job_name="serge-task-abc-1234",
+            secret_name="serge-task-abc-1234",
+            settings=K8sSettings(namespace="serge"),
+            timeout=1800,
+        )
+        params.update(kw)
+        return k8s_sandbox.build_task_job_manifest(**params)
+
+    def test_name_is_dns1123_and_bounded(self):
+        name = k8s_sandbox.make_task_job_name("Job_ID/With..Junk")
+        self.assertTrue(name.startswith("serge-task-"))
+        self.assertLessEqual(len(name), 63)
+        self.assertRegex(name, r"^[a-z0-9-]+$")
+
+    def test_labels_and_no_sa_token(self):
+        m = self._job()
+        pod = m["spec"]["template"]["spec"]
+        self.assertEqual(
+            m["spec"]["template"]["metadata"]["labels"]["serge.io/task-pod"], "true"
+        )
+        self.assertFalse(pod["automountServiceAccountToken"])
+        self.assertEqual(m["spec"]["backoffLimit"], 0)
+        self.assertEqual(m["spec"]["activeDeadlineSeconds"], 1800)
+
+    def test_secret_mounted_at_spec_path(self):
+        m = self._job()
+        pod = m["spec"]["template"]["spec"]
+        vol = next(v for v in pod["volumes"] if v["name"] == "task-spec")
+        self.assertEqual(vol["secret"]["secretName"], "serge-task-abc-1234")
+        mount = next(
+            vm
+            for vm in pod["containers"][0]["volumeMounts"]
+            if vm["name"] == "task-spec"
+        )
+        self.assertEqual(mount["mountPath"], "/etc/serge")
+        self.assertTrue(mount["readOnly"])
+
+    def test_proxy_and_no_proxy_env(self):
+        m = self._job(proxy="http://egress:3128", no_proxy=".svc.cluster.local")
+        env = {
+            e["name"]: e["value"]
+            for e in m["spec"]["template"]["spec"]["containers"][0]["env"]
+        }
+        self.assertEqual(env["HTTPS_PROXY"], "http://egress:3128")
+        self.assertEqual(env["HTTP_PROXY"], "http://egress:3128")
+        self.assertEqual(env["NO_PROXY"], ".svc.cluster.local")
+        self.assertEqual(env["SERGE_TASK_SPEC"], "/etc/serge/task.json")
+        self.assertEqual(env["WEB_CLONE_CACHE_DIR"], "/tmp/serge-clones")
+
+    def test_service_account_and_node_selector(self):
+        m = self._job(
+            settings=K8sSettings(
+                namespace="serge",
+                service_account="serge-task",
+                node_selector={"pool": "tasks"},
+            )
+        )
+        pod = m["spec"]["template"]["spec"]
+        self.assertEqual(pod["serviceAccountName"], "serge-task")
+        self.assertEqual(pod["nodeSelector"], {"pool": "tasks"})
+
+    def test_memory_limit(self):
+        m = self._job(memory="4Gi")
+        res = m["spec"]["template"]["spec"]["containers"][0]["resources"]
+        self.assertEqual(res["limits"]["memory"], "4Gi")
+
+    def test_missing_image_raises(self):
+        with self.assertRaises(K8sSandboxError):
+            self._job(image="")
+
+    def test_secret_manifest_owner_ref_and_data(self):
+        import base64
+        import json
+
+        spec = {"job_id": "j1", "github_token": "tok"}
+        m = k8s_sandbox.build_task_secret_manifest(
+            name="serge-task-j1-abcd",
+            spec_json=json.dumps(spec),
+            job_name="serge-task-j1-abcd",
+            job_uid="uid-123",
+            namespace="serge",
+        )
+        self.assertEqual(m["kind"], "Secret")
+        owner = m["metadata"]["ownerReferences"][0]
+        self.assertEqual(owner["kind"], "Job")
+        self.assertEqual(owner["uid"], "uid-123")
+        self.assertTrue(owner["controller"])
+        decoded = base64.b64decode(m["data"]["task.json"]).decode()
+        self.assertEqual(json.loads(decoded), spec)
+
+
+class RunTaskJobTests(unittest.TestCase):
+    def setUp(self):
+        self.cleanup = _install_fake_kubernetes()
+        self.addCleanup(self.cleanup)
+
+    def _clients(self, *, statuses, pod, log_text="ok"):
+        batch = mock.Mock()
+        batch.create_namespaced_job.return_value = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(uid="job-uid-1")
+        )
+        batch.read_namespaced_job_status.side_effect = [
+            types.SimpleNamespace(status=s) for s in statuses
+        ]
+        core = mock.Mock()
+        core.list_namespaced_pod.return_value = types.SimpleNamespace(items=[pod])
+        core.read_namespaced_pod_log.return_value = log_text
+        return batch, core
+
+    def test_creates_secret_with_job_owner_and_deletes_both(self):
+        running = types.SimpleNamespace(succeeded=None, failed=None, conditions=None)
+        done = types.SimpleNamespace(succeeded=1, failed=None, conditions=None)
+        batch, core = self._clients(statuses=[running, done], pod=_pod_with(0))
+        with mock.patch.object(
+            k8s_sandbox, "_load_clients", return_value=(batch, core)
+        ):
+            rc, tail = k8s_sandbox.run_task_job(
+                {"job_id": "j1", "github_token": "tok"},
+                image="serge/runner:latest",
+                settings=K8sSettings(namespace="serge"),
+                timeout=30,
+                proxy="http://egress:3128",
+                poll_interval=0.0,
+            )
+        self.assertEqual(rc, 0)
+        # Job created before the Secret; Secret carries the Job's uid as owner.
+        self.assertTrue(batch.create_namespaced_job.called)
+        self.assertTrue(core.create_namespaced_secret.called)
+        secret = core.create_namespaced_secret.call_args.args[1]
+        self.assertEqual(secret["metadata"]["ownerReferences"][0]["uid"], "job-uid-1")
+        # Both are cleaned up.
+        self.assertTrue(batch.delete_namespaced_job.called)
+        self.assertTrue(core.delete_namespaced_secret.called)
+
+    def test_secret_create_failure_deletes_job(self):
+        done = types.SimpleNamespace(succeeded=1, failed=None, conditions=None)
+        batch, core = self._clients(statuses=[done], pod=_pod_with(0))
+        core.create_namespaced_secret.side_effect = _FakeApiException("forbidden")
+        with mock.patch.object(
+            k8s_sandbox, "_load_clients", return_value=(batch, core)
+        ):
+            with self.assertRaises(K8sSandboxError):
+                k8s_sandbox.run_task_job(
+                    {"job_id": "j1", "github_token": "tok"},
+                    image="serge/runner:latest",
+                    settings=K8sSettings(namespace="serge"),
+                    timeout=30,
+                    poll_interval=0.0,
+                )
+        self.assertTrue(batch.delete_namespaced_job.called)
+
+
 if __name__ == "__main__":
     unittest.main()

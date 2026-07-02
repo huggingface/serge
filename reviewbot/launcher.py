@@ -159,3 +159,56 @@ def _unlink(path: str) -> None:
         os.unlink(path)
     except OSError:
         pass
+
+
+@dataclass
+class K8sLaunchOptions:
+    """Wiring for the kubernetes backend. ``proxy``/``no_proxy`` set the egress
+    firewall (the allowlisting ``serge-egress`` gateway + the in-cluster hosts
+    that bypass it); ``namespace``/``service_account``/``node_selector`` place
+    the Job. The per-job Secret carries the spec — nothing is shared but that."""
+
+    image: str
+    namespace: Optional[str] = None
+    service_account: Optional[str] = None
+    node_selector: Optional[dict[str, str]] = None
+    proxy: Optional[str] = None  # HTTPS_PROXY → serge-egress gateway ClusterIP
+    no_proxy: Optional[str] = None  # hosts that skip the proxy (serge callback)
+    memory: Optional[str] = None
+    uid: Optional[int] = None
+    gid: Optional[int] = None
+    clone_dir: str = "/tmp/serge-clones"
+
+
+def launch_kubernetes(
+    spec: dict[str, Any],
+    opts: K8sLaunchOptions,
+    *,
+    timeout: int,
+    poll_interval: float = 2.0,
+) -> tuple[int, str]:
+    """Launch the runner as a one-shot Job and block until it terminates,
+    returning ``(exit_code, log_tail)``. The task's outcome is streamed to serge
+    over the HTTP callback; the exit code only reconciles a runner that died
+    without reporting. Delegates to :func:`reviewbot.k8s_sandbox.run_task_job`
+    (kubernetes client imported lazily there)."""
+    from .k8s_sandbox import K8sSettings, run_task_job
+
+    settings = K8sSettings(
+        namespace=opts.namespace,
+        service_account=opts.service_account,
+        node_selector=opts.node_selector,
+    )
+    return run_task_job(
+        spec,
+        image=opts.image,
+        settings=settings,
+        timeout=timeout,
+        proxy=opts.proxy,
+        no_proxy=opts.no_proxy,
+        memory=opts.memory,
+        clone_dir=opts.clone_dir,
+        uid=opts.uid,
+        gid=opts.gid,
+        poll_interval=poll_interval,
+    )

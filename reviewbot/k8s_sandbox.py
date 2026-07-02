@@ -32,18 +32,33 @@ caller (:func:`reviewbot.normalize._run_kubernetes`) turns into a
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
 # Pod label the deny-all-egress NetworkPolicy selects on.
 SANDBOX_LABEL_KEY = "serge.io/sandbox"
 SANDBOX_LABEL_VALUE = "normalize"
+
+# Pod label the per-task-pod allowlist-egress NetworkPolicy selects on
+# (SERGE_PERTASK_POD_PLAN.md). Distinct from the normalize deny-all label so the
+# two policies never overlap while both backends coexist (Phase 3 → 4).
+TASK_POD_LABEL_KEY = "serge.io/task-pod"
+TASK_POD_LABEL_VALUE = "true"
+
+# Where the per-job Secret (task.json) is projected inside the runner pod. The
+# Secret's single ``task.json`` key becomes ``{_SPEC_MOUNT_DIR}/task.json``,
+# which the runner reads via ``SERGE_TASK_SPEC``.
+_SPEC_MOUNT_DIR = "/etc/serge"
+_SPEC_KEY = "task.json"
+_SPEC_MOUNT_PATH = f"{_SPEC_MOUNT_DIR}/{_SPEC_KEY}"
 
 # In-cluster files the kubelet projects for the pod's ServiceAccount.
 _NAMESPACE_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
@@ -427,4 +442,284 @@ def _delete_job(batch, job_name: str, namespace: str) -> None:
     except ApiException as exc:  # pragma: no cover - cleanup is best-effort
         log.warning(
             "could not delete normalize Job %s: %s", job_name, exc.reason or exc
+        )
+
+
+# ---------------------------------------------------------------------------
+# Per-task-pod backend (TASK_EXECUTION=kubernetes) — the whole write-capable
+# task (checkout + agent loop + in-process normalize) runs in one Job pod, which
+# streams results back to serge over the HTTP callback. Unlike the normalize
+# backend there is no shared PVC: the pod does its own checkout into an ephemeral
+# ``emptyDir`` (SERGE_PERTASK_POD_PLAN.md, "the pod checks out its own copy").
+# ---------------------------------------------------------------------------
+def make_task_job_name(job_id: str) -> str:
+    """A unique, DNS-1123-safe name for the task Job (and its per-job Secret,
+    which shares the name — a Job and a Secret can coexist under one name)."""
+    base = _sanitize_dns1123(job_id) or "task"
+    prefix = "serge-task-"
+    suffix = uuid.uuid4().hex[:8]
+    keep = _DNS1123_MAX - len(prefix) - len(suffix) - 1
+    return f"{prefix}{base[:keep]}-{suffix}"
+
+
+def build_task_job_manifest(
+    *,
+    image: str,
+    job_name: str,
+    secret_name: str,
+    settings: K8sSettings,
+    timeout: int,
+    proxy: Optional[str] = None,
+    no_proxy: Optional[str] = None,
+    memory: Optional[str] = None,
+    clone_dir: str = "/tmp/serge-clones",
+    uid: Optional[int] = None,
+    gid: Optional[int] = None,
+    ttl: int = _TTL_AFTER_FINISHED,
+) -> dict:
+    """Build the ``batch/v1`` Job manifest for one task runner pod (pure).
+
+    The per-job Secret is projected read-only at ``/etc/serge/task.json``; the
+    pod clones into an ``emptyDir`` under ``/tmp`` (no shared PVC). ``proxy`` is
+    the allowlisting egress gateway (injected as ``HTTPS_PROXY``/``HTTP_PROXY``);
+    ``no_proxy`` keeps in-cluster traffic (serge's callback) off the proxy. The
+    pod holds no API token (``automountServiceAccountToken: false``) — it creates
+    no sub-Jobs; the network firewall is the isolation boundary."""
+    if not image:
+        raise K8sSandboxError(
+            "kubernetes task backend requires a configured runner image "
+            "(TASK_RUNNER_IMAGE)"
+        )
+
+    env: list[dict] = [
+        {"name": "HOME", "value": "/tmp"},
+        {"name": "TMPDIR", "value": "/tmp"},
+        {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
+        {"name": "SERGE_TASK_SPEC", "value": _SPEC_MOUNT_PATH},
+        {"name": "WEB_CLONE_CACHE_DIR", "value": clone_dir},
+    ]
+    if proxy:
+        for name in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            env.append({"name": name, "value": proxy})
+    if no_proxy:
+        env.append({"name": "NO_PROXY", "value": no_proxy})
+        env.append({"name": "no_proxy", "value": no_proxy})
+
+    container: dict = {
+        "name": "runner",
+        "image": image,
+        "env": env,
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
+            "capabilities": {"drop": ["ALL"]},
+        },
+        "volumeMounts": [
+            {"name": "task-spec", "mountPath": _SPEC_MOUNT_DIR, "readOnly": True},
+            {"name": "tmp", "mountPath": "/tmp"},
+        ],
+    }
+    if memory:
+        container["resources"] = {"limits": {"memory": memory}}
+
+    pod_security: dict = {"seccompProfile": {"type": "RuntimeDefault"}}
+    # The runner runs the repo's own build (``make fix-repo``), so we don't force
+    # readOnlyRootFilesystem or a fixed user — that would fight the toolchain
+    # image. Isolation is the ephemeral pod + the egress firewall, not the FS.
+    if uid is not None:
+        pod_security["runAsUser"] = uid
+        pod_security["runAsGroup"] = gid if gid is not None else uid
+        pod_security["fsGroup"] = gid if gid is not None else uid
+        if uid != 0:
+            pod_security["runAsNonRoot"] = True
+
+    pod_spec: dict = {
+        "restartPolicy": "Never",
+        "automountServiceAccountToken": False,
+        "securityContext": pod_security,
+        "containers": [container],
+        "volumes": [
+            {"name": "task-spec", "secret": {"secretName": secret_name}},
+            {"name": "tmp", "emptyDir": {}},
+        ],
+    }
+    if settings.service_account:
+        pod_spec["serviceAccountName"] = settings.service_account
+    if settings.node_selector:
+        pod_spec["nodeSelector"] = dict(settings.node_selector)
+
+    return {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": job_name,
+            "labels": {
+                "app.kubernetes.io/managed-by": "serge",
+                "app.kubernetes.io/component": "task",
+            },
+        },
+        "spec": {
+            "backoffLimit": 0,
+            "completions": 1,
+            "parallelism": 1,
+            "activeDeadlineSeconds": timeout,
+            "ttlSecondsAfterFinished": ttl,
+            "template": {
+                "metadata": {
+                    "labels": {
+                        "app.kubernetes.io/managed-by": "serge",
+                        "app.kubernetes.io/component": "task",
+                        TASK_POD_LABEL_KEY: TASK_POD_LABEL_VALUE,
+                    }
+                },
+                "spec": pod_spec,
+            },
+        },
+    }
+
+
+def build_task_secret_manifest(
+    *,
+    name: str,
+    spec_json: str,
+    job_name: str,
+    job_uid: str,
+    namespace: str,
+) -> dict:
+    """Build the per-job Secret carrying ``task.json`` (spec + short-lived
+    GitHub token + LLM key + callback token). ``ownerReferences`` points at the
+    Job so the Secret is garbage-collected with it (auto-GC on crash), on top of
+    the launcher's explicit delete."""
+    return {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "Opaque",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/managed-by": "serge",
+                "app.kubernetes.io/component": "task",
+            },
+            "ownerReferences": [
+                {
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "name": job_name,
+                    "uid": job_uid,
+                    "controller": True,
+                    "blockOwnerDeletion": True,
+                }
+            ],
+        },
+        "data": {
+            _SPEC_KEY: base64.b64encode(spec_json.encode("utf-8")).decode("ascii"),
+        },
+    }
+
+
+def run_task_job(
+    spec: dict[str, Any],
+    *,
+    image: str,
+    settings: K8sSettings,
+    timeout: int,
+    proxy: Optional[str] = None,
+    no_proxy: Optional[str] = None,
+    memory: Optional[str] = None,
+    clone_dir: str = "/tmp/serge-clones",
+    uid: Optional[int] = None,
+    gid: Optional[int] = None,
+    poll_interval: float = _DEFAULT_POLL_INTERVAL,
+) -> tuple[int, str]:
+    """Launch one task runner Job for ``spec`` and block until it terminates.
+
+    Creates the Job, then a per-job Secret (ownerReferenced to the Job) holding
+    ``task.json``, polls the Job to a terminal state, and returns
+    ``(exit_code, log_tail)``. The task's real outcome is streamed to serge over
+    the HTTP callback; the exit code is only used to reconcile a runner that died
+    without reporting. The Job (and, via ownerRef, the Secret) is always deleted
+    on the way out. Raises :class:`K8sSandboxError` on infrastructure failure or
+    timeout."""
+    from kubernetes.client.rest import ApiException
+
+    namespace = resolve_namespace(settings)
+    job_name = make_task_job_name(str(spec.get("job_id") or "task"))
+    secret_name = job_name
+    spec_json = json.dumps(spec)
+
+    manifest = build_task_job_manifest(
+        image=image,
+        job_name=job_name,
+        secret_name=secret_name,
+        settings=settings,
+        timeout=timeout,
+        proxy=proxy,
+        no_proxy=no_proxy,
+        memory=memory,
+        clone_dir=clone_dir,
+        uid=uid,
+        gid=gid,
+    )
+    batch, core = _load_clients()
+
+    try:
+        created = batch.create_namespaced_job(namespace, manifest)
+    except ApiException as exc:
+        raise K8sSandboxError(
+            f"could not create task Job {job_name}: {exc.reason or exc}"
+        ) from exc
+
+    job_uid = getattr(getattr(created, "metadata", None), "uid", None) or ""
+    secret_manifest = build_task_secret_manifest(
+        name=secret_name,
+        spec_json=spec_json,
+        job_name=job_name,
+        job_uid=job_uid,
+        namespace=namespace,
+    )
+    try:
+        core.create_namespaced_secret(namespace, secret_manifest)
+    except ApiException as exc:
+        _delete_job(batch, job_name, namespace)
+        raise K8sSandboxError(
+            f"could not create task Secret {secret_name}: {exc.reason or exc}"
+        ) from exc
+
+    try:
+        deadline = time.monotonic() + timeout + poll_interval * 2
+        outcome: Optional[str] = None
+        while time.monotonic() < deadline:
+            try:
+                status = batch.read_namespaced_job_status(job_name, namespace).status
+            except ApiException as exc:
+                raise K8sSandboxError(
+                    f"could not read task Job status: {exc.reason or exc}"
+                ) from exc
+            outcome = _job_terminal(status)
+            if outcome is not None:
+                break
+            time.sleep(poll_interval)
+        if outcome is None:
+            raise K8sSandboxError(
+                f"task Job {job_name} did not finish within {timeout}s"
+            )
+
+        exit_code, tail = _collect_pod_result(core, namespace, job_name)
+        if outcome == "failed" and exit_code == 0:
+            exit_code = 1
+        return exit_code, tail
+    finally:
+        _delete_job(batch, job_name, namespace)
+        _delete_secret(core, secret_name, namespace)
+
+
+def _delete_secret(core, secret_name: str, namespace: str) -> None:
+    """Best-effort Secret deletion (the ownerRef also GCs it with the Job)."""
+    from kubernetes.client.rest import ApiException
+
+    try:
+        core.delete_namespaced_secret(secret_name, namespace)
+    except ApiException as exc:  # pragma: no cover - cleanup is best-effort
+        log.warning(
+            "could not delete task Secret %s: %s", secret_name, exc.reason or exc
         )

@@ -47,7 +47,14 @@ from .github_auth import (
     user_is_org_member,
 )
 from .github_client import GitHubClient
-from .launcher import DockerLaunchOptions, build_spec, launch_docker
+from .k8s_sandbox import K8sSandboxError, parse_node_selector
+from .launcher import (
+    DockerLaunchOptions,
+    K8sLaunchOptions,
+    build_spec,
+    launch_docker,
+    launch_kubernetes,
+)
 from .errors import format_github_http_error as _format_github_http_error
 from .errors import format_llm_error as _format_llm_error
 from .llm_client import LLMResponseError
@@ -1248,10 +1255,9 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         _push_event(job, kind, text)
 
     try:
-        if cfg.task_execution != "docker":
+        if cfg.task_execution not in ("docker", "kubernetes"):
             raise TaskError(
-                f"task_execution={cfg.task_execution!r} is not implemented yet "
-                "(kubernetes backend lands in Phase 3)",
+                f"task_execution={cfg.task_execution!r} is not a launcher backend",
                 status_code=501,
             )
         if not cfg.task_runner_image:
@@ -1285,24 +1291,43 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             ),
             callback_token=callback_token,
         )
-        opts = DockerLaunchOptions(
-            image=cfg.task_runner_image,
-            network=cfg.task_runner_network,
-            proxy=cfg.task_runner_proxy,
-            memory=cfg.task_runner_memory,
-            name=f"serge-task-{job.id[:12]}",
-        )
-
         emit("step", "launch")
-        emit("log", f"Launching task runner ({cfg.task_runner_image})…")
-        # wait=True blocks until the container exits; the runner POSTs its
-        # terminal callback (synchronously) before the process exits, so by the
-        # time this returns the ingest endpoint has already recorded the outcome.
-        code, _out = launch_docker(
-            spec, opts, wait=True, timeout=cfg.task_runner_timeout
+        emit(
+            "log",
+            f"Launching task runner ({cfg.task_execution}: {cfg.task_runner_image})…",
         )
+        # Both backends block until the runner pod/container exits; the runner
+        # POSTs its terminal callback (synchronously) before it exits, so by the
+        # time this returns the ingest endpoint has already recorded the outcome.
+        if cfg.task_execution == "docker":
+            code, _out = launch_docker(
+                spec,
+                DockerLaunchOptions(
+                    image=cfg.task_runner_image,
+                    network=cfg.task_runner_network,
+                    proxy=cfg.task_runner_proxy,
+                    memory=cfg.task_runner_memory,
+                    name=f"serge-task-{job.id[:12]}",
+                ),
+                wait=True,
+                timeout=cfg.task_runner_timeout,
+            )
+        else:  # kubernetes
+            code, _out = launch_kubernetes(
+                spec,
+                K8sLaunchOptions(
+                    image=cfg.task_runner_image,
+                    namespace=cfg.task_k8s_namespace,
+                    service_account=cfg.task_k8s_service_account,
+                    node_selector=parse_node_selector(cfg.task_k8s_node_selector),
+                    proxy=cfg.task_runner_proxy,
+                    no_proxy=cfg.task_runner_no_proxy,
+                    memory=cfg.task_runner_memory,
+                ),
+                timeout=cfg.task_runner_timeout,
+            )
         if job.status == "running":
-            # Container exited without a terminal callback → crashed / OOM /
+            # Runner exited without a terminal callback → crashed / OOM /
             # evicted before it could report. Reconcile to error.
             log.warning(
                 "task %s runner exited (code=%s) with no terminal callback",
@@ -1314,7 +1339,7 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             emit("step", "error")
             emit("error", job.error)
             emit("done", "")
-    except (TaskError, AppNotInstalledError) as exc:
+    except (TaskError, AppNotInstalledError, K8sSandboxError) as exc:
         log.warning("task %s launch failed: %s", job.id, exc)
         job.status = "error"
         job.error = str(exc)

@@ -455,17 +455,65 @@ class TaskLauncherTests(unittest.TestCase):
 
         self.assertEqual(job.status, "published")
 
-    def test_launch_kubernetes_not_implemented(self):
-        webapp = self._import_webapp(TASK_EXECUTION="kubernetes")
+    def test_launch_kubernetes_dispatches_and_reconciles(self):
+        webapp = self._import_webapp(
+            TASK_EXECUTION="kubernetes",
+            TASK_K8S_NAMESPACE="serge",
+            TASK_K8S_SERVICE_ACCOUNT="serge-task",
+            TASK_K8S_NODE_SELECTOR="pool=tasks",
+            TASK_RUNNER_PROXY="http://egress:3128",
+            TASK_RUNNER_NO_PROXY=".svc.cluster.local",
+        )
         job = self._make_job(webapp)
         worker_cfg, req = self._worker_cfg_and_req(webapp)
+        captured = {}
+
+        def fake_launch(spec, opts, *, timeout, poll_interval=2.0):
+            captured["spec"] = spec
+            captured["opts"] = opts
+            return 0, "pod log"
+
         with (
+            patch.object(webapp, "installation_id_for_repo", return_value=1),
+            patch.object(webapp, "installation_token", return_value="gh-token"),
+            patch.object(webapp, "launch_kubernetes", side_effect=fake_launch),
             patch.object(webapp, "_notify_task_finished"),
             patch.object(webapp, "_persist_terminal"),
         ):
             webapp._launch_task_pod(job, worker_cfg, req)
+
+        opts = captured["opts"]
+        self.assertEqual(opts.image, "serge/runner:latest")
+        self.assertEqual(opts.namespace, "serge")
+        self.assertEqual(opts.service_account, "serge-task")
+        self.assertEqual(opts.node_selector, {"pool": "tasks"})
+        self.assertEqual(opts.proxy, "http://egress:3128")
+        self.assertEqual(opts.no_proxy, ".svc.cluster.local")
+        self.assertEqual(captured["spec"]["github_token"], "gh-token")
+        # No terminal callback arrived → reconcile to error.
         self.assertEqual(job.status, "error")
-        self.assertIn("not implemented", job.error)
+        self.assertIsNone(job.callback_token)
+
+    def test_launch_kubernetes_surfaces_sandbox_error(self):
+        webapp = self._import_webapp(TASK_EXECUTION="kubernetes")
+        job = self._make_job(webapp)
+        worker_cfg, req = self._worker_cfg_and_req(webapp)
+
+        with (
+            patch.object(webapp, "installation_id_for_repo", return_value=1),
+            patch.object(webapp, "installation_token", return_value="gh-token"),
+            patch.object(
+                webapp,
+                "launch_kubernetes",
+                side_effect=webapp.K8sSandboxError("no cluster"),
+            ),
+            patch.object(webapp, "_notify_task_finished"),
+            patch.object(webapp, "_persist_terminal"),
+        ):
+            webapp._launch_task_pod(job, worker_cfg, req)
+
+        self.assertEqual(job.status, "error")
+        self.assertEqual(job.error, "no cluster")
 
     # --- POST /internal/tasks/{id}/events --------------------------------
     def test_ingest_rejects_missing_token(self):
