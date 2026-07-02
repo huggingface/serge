@@ -1,0 +1,30 @@
+# serge-egress: a minimal, self-built tinyproxy image for the per-task pod
+# network firewall (SERGE_PERTASK_POD_PLAN.md, "Network firewall").
+#
+# Built from the official Debian base + the distro-maintained `tinyproxy`
+# package so we own the supply chain rather than pulling an unofficial Docker
+# Hub image. Debian's security team ships updates for the package.
+#
+# serge's Helm chart supplies the runtime config (tinyproxy.conf + the allowlist
+# filter) via a read-only ConfigMap mounted at /etc/tinyproxy and runs:
+#   tinyproxy -d -c /etc/tinyproxy/tinyproxy.conf
+# The pod runs non-root with a read-only root filesystem and all capabilities
+# dropped; only /tmp (the PidFile dir) is writable. This image therefore just
+# provides the `tinyproxy` binary and a numeric non-root UID — no baked config.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tinyproxy ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    # Drop the packaged default config: the chart mounts its own at
+    # /etc/tinyproxy, logs go to stdout under `-d`, and the PidFile is /tmp.
+    && rm -f /etc/tinyproxy/tinyproxy.conf
+
+# Numeric non-root UID so the pod's runAsNonRoot admission check passes without
+# the chart pinning runAsUser (65532 = the distroless "nonroot" convention).
+# tinyproxy needs no /etc/passwd entry to run.
+USER 65532:65532
+
+# k8s overrides these via the chart's `command`; kept for plain `docker run`.
+ENTRYPOINT ["tinyproxy"]
+CMD ["-d"]

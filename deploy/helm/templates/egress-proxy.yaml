@@ -36,7 +36,8 @@ data:
     # Allowlist: deny every host except those matching the filter regexes.
     FilterDefaultDeny Yes
     Filter "/etc/tinyproxy/filter"
-    FilterExtended On
+    # ERE (posix extended regex) — the allowDomains use `(^|\.)…$` anchors.
+    FilterType ere
     FilterCaseSensitive Off
     PidFile "/tmp/tinyproxy.pid"
     LogLevel Info
