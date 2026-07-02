@@ -37,6 +37,7 @@ from typing import Any, Optional
 
 import requests
 
+from . import sandbox
 from .clone_cache import Checkout, CloneCache
 from .config import Config
 from .errors import format_github_http_error, format_llm_error
@@ -77,6 +78,10 @@ class RunnerSpec:
     request: dict[str, Any]
     github_token: str
     llm: dict[str, Any] = field(default_factory=dict)
+    # Resolved-worker-Config subset serge sends (see launcher.runner_config): the
+    # per-task LLM caps + strict tool mode and the operator/repo normalize/review
+    # settings, applied over the env-built base Config.
+    config: dict[str, Any] = field(default_factory=dict)
     callback: dict[str, Any] = field(default_factory=dict)
     # Optional clone URL override (GH Enterprise / a mirror / local e2e); when
     # unset the clone uses the public ``https://github.com/owner/repo.git``.
@@ -94,6 +99,7 @@ class RunnerSpec:
             request=dict(data["request"]),
             github_token=str(data["github_token"]),
             llm=dict(data.get("llm") or {}),
+            config=dict(data.get("config") or {}),
             callback=dict(data.get("callback") or {}),
             repo_remote_url=(data.get("repo_remote_url") or None),
         )
@@ -174,10 +180,13 @@ class CallbackEmitter:
 # Config / request assembly
 # ---------------------------------------------------------------------------
 def build_runner_config(spec: RunnerSpec) -> Config:
-    """Deployment config from the environment, with the per-task overrides
-    applied: resolved LLM settings from the spec, a local clone dir, and the
-    in-pod normalize backend (``off`` — the pod firewall is the isolation
-    boundary, so no nested sandbox is needed).
+    """Deployment config from the environment, with the spec overrides applied:
+    the resolved worker-Config subset (``spec.config`` — per-task LLM caps +
+    strict tool mode + operator/repo normalize/review settings), the resolved
+    LLM provider settings (``spec.llm``, which win over ``config``), a local
+    clone dir, and the in-pod sandboxes forced ``off`` — the pod firewall is the
+    isolation boundary, so neither the normalize backend nor the helper-tool
+    subprocesses need a nested sandbox.
 
     Built with ``require_app=False`` (the pod holds no GitHub App private key —
     serge mints the token and passes it in the spec) and ``require_web=False``
@@ -186,6 +195,10 @@ def build_runner_config(spec: RunnerSpec) -> Config:
     spec override below."""
     os.environ.setdefault("LLM_API_KEY", "")
     cfg = Config.from_env(require_app=False, require_web=False)
+    if spec.config:
+        valid = {f.name for f in dataclasses.fields(Config)}
+        overrides = {k: v for k, v in spec.config.items() if k in valid}
+        cfg = dataclasses.replace(cfg, **overrides)
     llm = spec.llm
     clone_dir = (cfg.web_clone_cache_dir or "").strip() or _DEFAULT_CLONE_DIR
     return dataclasses.replace(
@@ -198,6 +211,10 @@ def build_runner_config(spec: RunnerSpec) -> Config:
         web_clone_cache_dir=clone_dir,
         # Normalize runs in-process; there is no docker daemon / nested Job here.
         task_sandbox_backend="off",
+        # The pod itself is the sandbox (ephemeral, allowlisted egress), so the
+        # in-pod repo subprocesses (normalize, helper tools, context script) run
+        # unwrapped — bubblewrap/docker aren't available and aren't needed.
+        helper_sandbox=sandbox.OFF,
     )
 
 

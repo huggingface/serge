@@ -54,6 +54,7 @@ from .launcher import (
     build_spec,
     launch_docker,
     launch_kubernetes,
+    runner_config,
 )
 from .errors import format_github_http_error as _format_github_http_error
 from .errors import format_llm_error as _format_llm_error
@@ -1286,6 +1287,7 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
                 "bill_to": worker_cfg.llm_bill_to,
                 "stream": worker_cfg.llm_stream,
             },
+            config=runner_config(worker_cfg),
             callback_url=(
                 f"{cfg.task_callback_base_url}/internal/tasks/{job.id}/events"
             ),

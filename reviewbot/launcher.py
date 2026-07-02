@@ -38,6 +38,43 @@ log = logging.getLogger(__name__)
 
 _SPEC_MOUNT_PATH = "/etc/serge/task.json"
 
+# Config fields serge resolves per-task (or per-deployment) that the runner
+# cannot recover from its own environment — the runner rebuilds a base Config
+# from env, then applies these overrides from the spec. Covers the per-task LLM
+# caps + strict tool mode resolved by ``_resolve_task_worker_cfg`` and the
+# operator/repo normalize + review settings. LLM provider settings travel
+# separately in ``llm`` (and win); secrets (App key, session secret) are never
+# transmitted — the runner needs none of them.
+RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
+    "task_normalize_command",
+    "task_normalize_guidance",
+    "task_normalize_timeout",
+    "task_normalize_max_retries",
+    "task_normalize_memory",
+    "task_max_followups",
+    "review_rules_path",
+    "helper_tools_path",
+    "default_review_rules",
+    "max_diff_chars",
+    "persona_header",
+    "context_script_path",
+    "context_script_timeout",
+    "allow_approve",
+    "llm_reasoning_effort",
+    "is_staging",
+    "llm_max_tokens",
+    "llm_max_input_tokens",
+    "tool_max_iterations",
+    "tool_max_iterations_strict",
+)
+
+
+def runner_config(cfg: Any) -> dict[str, Any]:
+    """Extract the :data:`RUNNER_CONFIG_FIELDS` subset of a resolved worker
+    ``Config`` for transmission in the spec. Duck-typed on ``cfg`` so this
+    module stays free of a hard :class:`Config` import."""
+    return {field: getattr(cfg, field) for field in RUNNER_CONFIG_FIELDS}
+
 
 def build_spec(
     *,
@@ -47,18 +84,22 @@ def build_spec(
     llm: dict[str, Any],
     callback_url: str,
     callback_token: str,
+    config: Optional[dict[str, Any]] = None,
     repo_remote_url: Optional[str] = None,
 ) -> dict[str, Any]:
     """Assemble the ``task.json`` payload the runner reads. ``request`` is a
     serialized :class:`reviewbot.tasks.TaskRequest`; ``llm`` is the per-repo
     resolved provider settings (``api_base``/``api_key``/``model``/``bill_to``/
-    ``stream``); ``github_token`` is the short-lived installation token serge
-    minted for this task."""
+    ``stream``); ``config`` is the resolved-worker-Config subset (see
+    :func:`runner_config`) the runner applies over its env-built base;
+    ``github_token`` is the short-lived installation token serge minted for this
+    task."""
     spec: dict[str, Any] = {
         "job_id": job_id,
         "request": request,
         "github_token": github_token,
         "llm": llm,
+        "config": config or {},
         "callback": {"url": callback_url, "token": callback_token},
     }
     if repo_remote_url:

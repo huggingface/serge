@@ -219,5 +219,57 @@ class TaskRunnerE2ETests(unittest.TestCase):
         self.assertEqual(sink.terminal["status"], "no_fix")
 
 
+class BuildRunnerConfigTests(unittest.TestCase):
+    """The spec's resolved-config subset (per-task caps + operator normalize/
+    review settings) must reach the in-pod Config; the LLM dict wins for provider
+    settings; and the in-pod sandboxes are forced off (the pod is the sandbox)."""
+
+    def test_applies_config_and_llm_overrides_and_forces_sandboxes_off(self):
+        spec = task_runner.RunnerSpec(
+            job_id="j",
+            request={
+                "owner": "o",
+                "repo": "r",
+                "base_ref": "main",
+                "instruction": "x",
+                "context": "",
+            },
+            github_token="t",
+            llm={
+                "api_base": "https://llm.example/v1",
+                "api_key": "secret-key",
+                "model": "m",
+                "stream": False,
+            },
+            config={
+                "task_normalize_command": ["make", "fix-repo"],
+                "task_normalize_max_retries": 4,
+                "review_rules_path": ".ai/AGENTS.md",
+                "tool_max_iterations": 7,
+                "tool_max_iterations_strict": True,
+                "llm_max_tokens": 12345,
+                "llm_max_input_tokens": 250000,
+            },
+        )
+        with patch.dict(os.environ, {"LLM_API_KEY": ""}, clear=True):
+            cfg = task_runner.build_runner_config(spec)
+
+        # Operator/repo + per-task caps came across.
+        self.assertEqual(cfg.task_normalize_command, ["make", "fix-repo"])
+        self.assertEqual(cfg.task_normalize_max_retries, 4)
+        self.assertEqual(cfg.review_rules_path, ".ai/AGENTS.md")
+        self.assertEqual(cfg.tool_max_iterations, 7)
+        self.assertTrue(cfg.tool_max_iterations_strict)
+        self.assertEqual(cfg.llm_max_tokens, 12345)
+        self.assertEqual(cfg.llm_max_input_tokens, 250000)
+        # LLM provider settings win from the llm dict.
+        self.assertEqual(cfg.llm_api_key, "secret-key")
+        self.assertEqual(cfg.llm_api_base, "https://llm.example/v1")
+        self.assertFalse(cfg.llm_stream)
+        # The pod is the isolation boundary — no nested sandboxes.
+        self.assertEqual(cfg.task_sandbox_backend, "off")
+        self.assertEqual(cfg.helper_sandbox, "off")
+
+
 if __name__ == "__main__":
     unittest.main()

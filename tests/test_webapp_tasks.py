@@ -387,6 +387,10 @@ class TaskLauncherTests(unittest.TestCase):
             llm_api_key="secret-llm-key",
             llm_model="some-model",
             llm_bill_to="acme-org",
+            llm_max_tokens=16384,
+            tool_max_iterations=8,
+            tool_max_iterations_strict=True,
+            task_normalize_command=["make", "fix-repo"],
         )
         req = webapp.TaskRequest(
             owner="acme",
@@ -424,6 +428,12 @@ class TaskLauncherTests(unittest.TestCase):
         self.assertEqual(spec["github_token"], "gh-token")
         self.assertEqual(spec["llm"]["api_key"], "secret-llm-key")
         self.assertEqual(spec["llm"]["bill_to"], "acme-org")
+        # The resolved worker-Config subset (per-task caps + normalize settings)
+        # is transmitted so the runner doesn't fall back to env defaults.
+        self.assertEqual(spec["config"]["llm_max_tokens"], 16384)
+        self.assertEqual(spec["config"]["tool_max_iterations"], 8)
+        self.assertTrue(spec["config"]["tool_max_iterations_strict"])
+        self.assertEqual(spec["config"]["task_normalize_command"], ["make", "fix-repo"])
         self.assertEqual(
             spec["callback"]["url"],
             f"http://serge:8000/internal/tasks/{job.id}/events",
