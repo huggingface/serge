@@ -9,9 +9,15 @@
 
 image:
   # Bump to a newer sha-<commit> (pushed by CI on merge to main) or use latest.
-  tag: sha-eab6420
+  tag: sha-0f77376
 
 replicas: 1
+
+# serge creates the per-task Job + per-job Secret and reads the egress proxy's
+# ClusterIP, so it needs its own ServiceAccount + Role (rendered by the chart
+# when taskExecution.kubernetes is enabled).
+serviceAccount:
+  create: true
 
 # Sensitive env: create this Secret in the target namespace beforehand
 # (GITHUB_APP_ID, GITHUB_PRIVATE_KEY, GITHUB_WEBHOOK_SECRET,
@@ -56,6 +62,14 @@ envVars:
   TOOL_MAX_ITERATIONS: "30"
   TASK_LLM_MAX_TOKENS: "49152"
   TASK_TOOL_MAX_ITERATIONS: "30"
+  # Normalize gate for /tasks. In the pod-per-task model the runner runs this
+  # command in-process (formerly the separate normalize Job). Unset = gate is
+  # skipped entirely, so it MUST be set. Argv is shlex-split; bash -lc runs the
+  # repo's own normalizer. Mirrors the retired normalize.kubernetes settings.
+  TASK_NORMALIZE_COMMAND: "bash -lc 'make style && python utils/checkers.py ruff_check,ruff_format,init_isort,sort_auto_mappings,types,modeling_structure,auto_mappings,imports,import_complexity,copies,modular_conversion,doc_toc,modeling_rules_doc,docstrings,dummies,repo,inits,pipeline_typing,config_docstrings,config_attributes,doctest_list,update_metadata,deps_table --fix --keep-going'"
+  TASK_NORMALIZE_TIMEOUT: "1800"
+  TASK_NORMALIZE_MAX_RETRIES: "2"
+  REVIEW_RULES_PATH: ".ai/AGENTS.md"
   MENTION_TRIGGER: "@askserge"
   REVIEW_EVENT: "COMMENT"
   TASK_API_ENABLED: "1"
@@ -78,3 +92,23 @@ resources:
   limits:
     cpu: "1"
     memory: 1Gi
+
+# Pod-per-task execution (SERGE_PERTASK_POD_PLAN.md). serge launches one runner
+# pod per /tasks request; the pod runs the whole agent loop + in-process
+# normalize and streams results back over an authenticated callback. All pod
+# egress is forced through the serge-egress allowlist proxy (git + HF LLM only).
+taskExecution:
+  kubernetes:
+    enabled: true
+    # transformers toolchain + serge (docker/Dockerfile.task-runner).
+    image: ghcr.io/huggingface/serge-task-runner:sha-0f77376
+    # Wall-clock cap per task (matches the old in-process worker budget).
+    timeout: 3600
+    # The in-pod normalizer (make style / checkers over transformers) is
+    # memory-hungry; mirror the retired normalize Job's 6Gi.
+    memory: "6Gi"
+    # Schedule task pods on the same CastAI node template as serge.
+    nodeSelector: "scheduling.cast.ai/node-template=default-by-castai"
+    egress:
+      # Self-built tinyproxy (docker/Dockerfile.egress-proxy).
+      image: ghcr.io/huggingface/serge-egress:sha-0f77376
