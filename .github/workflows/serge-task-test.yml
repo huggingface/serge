@@ -2,10 +2,11 @@ name: Serge task (test the /tasks flow)
 
 # Manually-triggered exerciser for serge's write-capable /tasks endpoint.
 #
-# It mints a GitHub Actions OIDC token (audience = serge), joins the VPN via
-# Tailscale so the internal https://serge.huggingface.tech is reachable, and
-# POSTs an instruction + context to /tasks. serge then opens a fix PR (new_pr)
-# or pushes a follow-up commit onto an existing serge fix branch (existing_pr).
+# Runs on the in-VPC self-hosted runner (aws-general-8-plus), which can reach
+# the internal https://serge.huggingface.tech ALB directly — no VPN/Tailscale.
+# It mints a GitHub Actions OIDC token (audience = serge) and POSTs an
+# instruction + context to /tasks. serge then opens a fix PR (new_pr) or pushes
+# a follow-up commit onto an existing serge fix branch (existing_pr).
 #
 # Prerequisites (one-time):
 #   - The Serge GitHub App on this repo holds Contents:write + Pull Requests:write.
@@ -46,20 +47,8 @@ permissions:
 
 jobs:
   run-task:
-    runs-on: ubuntu-latest
+    runs-on: aws-general-8-plus
     steps:
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v4.1.2
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID_AI_REVIEW }}
-          oauth-secret: ${{ secrets.TS_AUDIENCE_AI_REVIEW }}
-          tags: tag:ci
-          # --accept-routes installs the VPC subnet route advertised by the
-          # in-cluster subnet router so the runner can reach the internal ALB's
-          # private IP. Single flag: the action's `args` doesn't cleanly split
-          # multiple space-separated flags. DNS already resolves publicly.
-          args: --accept-routes
-
       - name: Mint OIDC token and POST /tasks
         env:
           SERGE_URL: https://serge.huggingface.tech
