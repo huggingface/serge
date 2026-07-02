@@ -1,12 +1,14 @@
 # Plan: one pod per task (whole LLM loop + normalize in-pod)
 
-Status: **Phases 1–4 built (2026-07-02).** Phase 1 proven locally; Phases 2–3
-(launcher behind `TASK_EXECUTION`, docker + kubernetes backends, callback ingest,
-`serge-egress` Helm infra) and Phase 4 (deleted the dead normalize-Job code +
-Helm) landed with tests + `helm lint`. **Remaining:** live-cluster verification
-of Phase 3, and the runner-pod env-propagation gap found in Phase 4 (see "Known
-gap" below) — fix before relying on the in-pod normalize gate. Captured
-2026-07-02.
+Status: **All four phases built (2026-07-02).** Phase 1 proven locally; Phases
+2–3 (launcher behind `TASK_EXECUTION`, docker + kubernetes backends, callback
+ingest, `serge-egress` Helm infra) and Phase 4 (deleted the dead normalize-Job
+code + Helm) landed with tests + `helm lint`. The runner-pod config-propagation
+gap found during Phase 4 is **fixed** (see "Closed" below). **Only remaining
+item: live-cluster verification of Phase 3** — deploy with
+`taskExecution.kubernetes.enabled=true` and confirm git clone + LLM succeed, a
+blocked host fails, the callback reaches serge, and the per-job Secret is GC'd.
+Captured 2026-07-02.
 **Supersedes** `SERGE_PERTASK_AGENT_POD_PROPOSAL.md`, whose recommendation ("do
 not merge normalize into the agent pod, to preserve the deny-egress isolation")
 is reversed by an explicit operator decision: the per-task pod may reach the
@@ -80,16 +82,15 @@ own isolated Job.
 - Tests: task-Job/Secret builders, `run_task_job` orchestration, kubernetes
   dispatch. Full suite: **354 passing**.
 
-**Not yet done:**
+**Remaining (not code — verification / hardening):**
 
-- **Phase 3 — live verify only.** On-cluster: `helm upgrade` with
+- **Phase 3 live verify.** On-cluster: `helm upgrade` with
   `taskExecution.kubernetes.enabled=true`, then confirm git clone + LLM succeed
   and a blocked host fails (`curl https://example.com` must fail) from inside a
   task pod. Also confirm the callback reaches serge and the per-job Secret is
-  GC'd. Open items to validate on real infra: the tinyproxy image + config,
-  and whether kube-dns egress should be tightened to ClusterIP injection (the
-  plan's stricter no-DNS stance — currently a documented residual risk).
-- **Phase 4** — delete dead normalize-Job paths + `task_k8s_worktree_*` config.
+  GC'd. Validate on real infra: the tinyproxy image + config, and whether
+  kube-dns egress should be tightened to ClusterIP injection (the stricter
+  no-DNS stance — currently a documented residual risk).
 - A full-success **container** e2e (opening a real PR) needs either real creds or
   a `GITHUB_API_URL` override on `GitHubClient` (it hardcodes `api.github.com`) —
   see follow-ups.
@@ -255,20 +256,21 @@ the arbitrary-code phase), which this design deliberately trades away.
    `task_k8s_worktree_*` config; dropped the Helm `normalize.yaml` (worktree PVC +
    normalize RBAC + deny-all policy), its values block, and the worktree mount.
 
-## ⚠ Known gap — runner-pod env propagation (found during Phase 4)
+## ✅ Closed — runner-pod config propagation (found + fixed 2026-07-02)
 
-The runner reconstructs its `Config` in-pod via `Config.from_env()`, overriding
-only the **LLM** bits from the spec. So operator/repo config that is *not* in the
-spec — notably `TASK_NORMALIZE_COMMAND`, `TASK_NORMALIZE_GUIDANCE`,
-`REVIEW_RULES_PATH`, `HELPER_SANDBOX` — must be present in the **runner pod's**
-environment, but neither the docker launch (`DockerLaunchOptions.env`) nor the
-k8s Job manifest currently injects it. Result: unless baked into the runner
-image, `task_normalize_command` is empty in the pod and the **normalize gate is
-silently skipped** (PRs open un-normalized). Fix before relying on the pod
-normalize gate: have the k8s task Job `envFrom` serge's ConfigMap (add a
-`TASK_RUNNER_ENV_CONFIGMAP` config + `envFrom` in `build_task_job_manifest`), and
-pass the same env through `DockerLaunchOptions.env` for docker. LLM secrets stay
-in the spec; the App private key is never needed in the pod.
+The runner rebuilt its `Config` in-pod via `Config.from_env()` and overrode only
+the **LLM** bits from the spec, so it silently lost (a) operator/repo normalize +
+review config (`TASK_NORMALIZE_COMMAND`, `REVIEW_RULES_PATH`, …) — the normalize
+gate would be **skipped** — and (b) the per-task caps `_resolve_task_worker_cfg`
+computed (`llm_max_tokens`, `tool_max_iterations`, `tool_max_iterations_strict`).
+Fixed by transmitting the resolved worker-`Config` subset in the spec itself
+(`launcher.runner_config` + `RUNNER_CONFIG_FIELDS` → `spec.config`), which the
+runner applies over its env base (the `llm` dict still wins for provider
+settings). `build_runner_config` also forces `helper_sandbox=off` alongside
+`task_sandbox_backend=off` — the pod is the sandbox, so in-pod repo subprocesses
+run unwrapped. Single source of truth for both docker + kubernetes; no ConfigMap
+or env plumbing. Secrets stay out of `config` (LLM key via `llm`, GitHub token
+via the spec top level; the App private key is never sent).
 
 ## Open questions
 - Launcher watch: block a pool thread on the Job (mirrors today, simplest) vs. a
