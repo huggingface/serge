@@ -168,6 +168,35 @@ class Config:
     # Cap on serge-authored commits per fix branch (follow-up loop guard).
     task_max_followups: int = 5
 
+    # --- Task execution backend (per-task-pod model) ------------------
+    # How the write-capable /tasks flow executes each task
+    # (SERGE_PERTASK_POD_PLAN.md):
+    #   "inprocess" (default) — run the agent loop in a serge thread pool
+    #       (the legacy path);
+    #   "docker"    — launch a per-task runner container
+    #       (``reviewbot-task-runner``) that runs the whole loop + normalize
+    #       and streams results back over the HTTP callback;
+    #   "kubernetes"— launch a per-task runner Job (Phase 3).
+    # The flag keeps the pod-per-task rollout reversible.
+    task_execution: str = "inprocess"
+    # Runner image for the docker/kubernetes backends (reviewbot layered on
+    # the repo toolchain — see docker/Dockerfile.task-runner).
+    task_runner_image: Optional[str] = None
+    # Base URL the runner POSTs events + the terminal result back to
+    # (``{base}/internal/tasks/{job_id}/events``). In k8s this is serge's
+    # in-cluster Service URL; for docker-on-host it points at the serge host
+    # (e.g. http://host.docker.internal:8000, or http://localhost:8000 with
+    # ``--network host``).
+    task_callback_base_url: Optional[str] = None
+    # Wall-clock cap (seconds) on a single runner container/Job.
+    task_runner_timeout: int = 3600
+    # docker backend egress firewall: the network the runner attaches to (an
+    # ``internal`` net in prod, or "host" for local e2e) and the allowlisting
+    # forward proxy egress is routed through (see launcher.DockerLaunchOptions).
+    task_runner_network: Optional[str] = None
+    task_runner_proxy: Optional[str] = None
+    task_runner_memory: Optional[str] = None
+
     # --- Post-LLM normalize hook --------------------------------------
     # After the LLM patch is applied to the worktree and before serge
     # commits, optionally run the target repo's own normalizer (e.g. ``make
@@ -262,6 +291,15 @@ class Config:
                 raise RuntimeError(
                     f"Missing required env vars for {mode}: " + ", ".join(missing)
                 )
+
+        task_execution = (
+            os.environ.get("TASK_EXECUTION") or "inprocess"
+        ).strip().lower() or "inprocess"
+        if task_execution not in ("inprocess", "docker", "kubernetes"):
+            raise RuntimeError(
+                "TASK_EXECUTION must be one of inprocess|docker|kubernetes, "
+                f"got {task_execution!r}"
+            )
 
         oauth_client_id = os.environ.get("GITHUB_OAUTH_CLIENT_ID") or None
         oauth_client_secret = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET") or None
@@ -395,6 +433,20 @@ class Config:
             ),
             task_tool_max_iterations=(_int_env("TASK_TOOL_MAX_ITERATIONS", 0) or None),
             task_max_followups=_int_env("TASK_MAX_FOLLOWUPS", 5),
+            task_execution=task_execution,
+            task_runner_image=(os.environ.get("TASK_RUNNER_IMAGE") or "").strip()
+            or None,
+            task_callback_base_url=(
+                os.environ.get("TASK_CALLBACK_BASE_URL") or ""
+            ).strip().rstrip("/")
+            or None,
+            task_runner_timeout=_int_env("TASK_RUNNER_TIMEOUT", 3600),
+            task_runner_network=(os.environ.get("TASK_RUNNER_NETWORK") or "").strip()
+            or None,
+            task_runner_proxy=(os.environ.get("TASK_RUNNER_PROXY") or "").strip()
+            or None,
+            task_runner_memory=(os.environ.get("TASK_RUNNER_MEMORY") or "").strip()
+            or None,
             task_normalize_command=(
                 shlex.split(os.environ.get("TASK_NORMALIZE_COMMAND") or "") or None
             ),
