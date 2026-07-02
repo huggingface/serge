@@ -436,9 +436,9 @@ class Config:
             task_execution=task_execution,
             task_runner_image=(os.environ.get("TASK_RUNNER_IMAGE") or "").strip()
             or None,
-            task_callback_base_url=(
-                os.environ.get("TASK_CALLBACK_BASE_URL") or ""
-            ).strip().rstrip("/")
+            task_callback_base_url=(os.environ.get("TASK_CALLBACK_BASE_URL") or "")
+            .strip()
+            .rstrip("/")
             or None,
             task_runner_timeout=_int_env("TASK_RUNNER_TIMEOUT", 3600),
             task_runner_network=(os.environ.get("TASK_RUNNER_NETWORK") or "").strip()

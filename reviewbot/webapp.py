@@ -1257,9 +1257,7 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         if not cfg.task_runner_image:
             raise TaskError("TASK_RUNNER_IMAGE is not configured", status_code=500)
         if not cfg.task_callback_base_url:
-            raise TaskError(
-                "TASK_CALLBACK_BASE_URL is not configured", status_code=500
-            )
+            raise TaskError("TASK_CALLBACK_BASE_URL is not configured", status_code=500)
 
         assert cfg.github_app_id and cfg.github_private_key
         installation_id = installation_id_for_repo(
@@ -1324,7 +1322,9 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         emit("error", job.error)
         emit("done", "")
     except subprocess.TimeoutExpired:
-        log.warning("task %s runner timed out after %ss", job.id, cfg.task_runner_timeout)
+        log.warning(
+            "task %s runner timed out after %ss", job.id, cfg.task_runner_timeout
+        )
         job.status = "error"
         job.error = f"task runner timed out after {cfg.task_runner_timeout}s"
         emit("step", "error")
@@ -2309,9 +2309,7 @@ async def submit_task(request: Request) -> JSONResponse:
     # inprocess: run the loop in a serge thread (legacy). docker/kubernetes:
     # launch a per-task runner and stream results back via the callback
     # (SERGE_PERTASK_POD_PLAN.md). The flag makes rollout reversible.
-    worker = (
-        _run_task_worker if cfg.task_execution == "inprocess" else _launch_task_pod
-    )
+    worker = _run_task_worker if cfg.task_execution == "inprocess" else _launch_task_pod
     _TASK_POOL.submit(worker, job, worker_cfg, req)
     log.info(
         "queued task %s for %s/%s (mode=%s pr=%s) by actor=%s using %s model=%s "
