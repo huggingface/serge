@@ -1,8 +1,10 @@
 # Plan: one pod per task (whole LLM loop + normalize in-pod)
 
-Status: **Phases 1–2 built (2026-07-02).** Phase 1 proven locally; Phase 2
+Status: **Phases 1–3 built (2026-07-02).** Phase 1 proven locally; Phase 2
 (launcher wired into serge behind `TASK_EXECUTION`, docker backend + callback
-ingest) landed with tests. Captured 2026-07-02.
+ingest) and Phase 3 (kubernetes backend + `serge-egress` Helm infra) landed with
+tests + `helm lint`. Phase 3 still needs live-cluster verification. Phase 4
+(delete dead normalize-Job code) is next. Captured 2026-07-02.
 **Supersedes** `SERGE_PERTASK_AGENT_POD_PROPOSAL.md`, whose recommendation ("do
 not merge normalize into the agent pod, to preserve the deny-egress isolation")
 is reversed by an explicit operator decision: the per-task pod may reach the
@@ -59,11 +61,32 @@ own isolated Job.
   endpoint (auth rejects, event append, terminal published/error). Full
   suite: **343 passing**.
 
+**Done — Phase 3 (k8s backend + Helm), built 2026-07-02 (pending cluster verify):**
+
+- `k8s_sandbox.build_task_job_manifest` / `build_task_secret_manifest` /
+  `run_task_job` — one Job pod runs the whole task; a per-job Secret (task.json)
+  is mounted at `/etc/serge`, `ownerReferenced` to the Job for auto-GC; the pod
+  clones into an ephemeral `emptyDir` (no PVC); egress proxy injected as
+  `HTTPS_PROXY` with `NO_PROXY` for the callback. New `serge.io/task-pod` label.
+- `launcher.launch_kubernetes` + `K8sLaunchOptions`; `_launch_task_pod`
+  dispatches docker vs kubernetes; `K8sSandboxError` surfaces its safe message.
+- Helm: `egress-proxy.yaml` (tinyproxy Deployment/Service/ConfigMap + its
+  NetworkPolicy), `task-runner.yaml` (task RBAC — jobs/secrets/services — +
+  allowlist-egress NetworkPolicy), `config.yaml`/`values.yaml` wiring under
+  `taskExecution.kubernetes` (mutually exclusive with `normalize.kubernetes`).
+  Validated with `helm template` + `helm lint`.
+- Tests: task-Job/Secret builders, `run_task_job` orchestration, kubernetes
+  dispatch. Full suite: **354 passing**.
+
 **Not yet done:**
 
-- **Phase 3** — k8s Job launcher backend; the `serge-egress` proxy + allowlist
-  NetworkPolicy (the docker firewall equivalent is `network`+`proxy` on
-  `DockerLaunchOptions`, not yet exercised).
+- **Phase 3 — live verify only.** On-cluster: `helm upgrade` with
+  `taskExecution.kubernetes.enabled=true`, then confirm git clone + LLM succeed
+  and a blocked host fails (`curl https://example.com` must fail) from inside a
+  task pod. Also confirm the callback reaches serge and the per-job Secret is
+  GC'd. Open items to validate on real infra: the tinyproxy image + config,
+  and whether kube-dns egress should be tightened to ClusterIP injection (the
+  plan's stricter no-DNS stance — currently a documented residual risk).
 - **Phase 4** — delete dead normalize-Job paths + `task_k8s_worktree_*` config.
 - A full-success **container** e2e (opening a real PR) needs either real creds or
   a `GITHUB_API_URL` override on `GitHubClient` (it hardcodes `api.github.com`) —
@@ -218,10 +241,12 @@ the arbitrary-code phase), which this design deliberately trades away.
    (docker) + `POST /internal/tasks/{id}/events` callback ingest; feature-flagged
    (`TASK_EXECUTION` = `inprocess` | `docker` | `kubernetes`, in-process the
    default) so rollout is reversible. Per-job Secret (k8s) lands with Phase 3.
-3. ⏳ k8s Job backend; Helm: `serge-egress` proxy + allowlist config, task RBAC +
-   secret perms, the allowlist-egress NetworkPolicy; remove the EFS PVC + old
-   deny-all policy once verified. Verify git clone + LLM succeed and a blocked
-   host fails (`curl https://example.com` must fail) from inside the pod.
+3. ✅ **BUILT** (pending cluster verify) — k8s Job backend (`run_task_job`) +
+   Helm: `serge-egress` proxy + allowlist config, task RBAC + secret perms, the
+   allowlist-egress NetworkPolicy, all under `taskExecution.kubernetes`. Still to
+   do on a live cluster: verify git clone + LLM succeed and a blocked host fails
+   (`curl https://example.com` must fail) from inside the pod; then remove the
+   EFS PVC + old deny-all policy (folds into Phase 4).
 4. ⏳ Delete the dead normalize-Job code paths and `task_k8s_worktree_*` config.
 
 ## Open questions
