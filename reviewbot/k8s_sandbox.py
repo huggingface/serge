@@ -1,33 +1,29 @@
-"""Kubernetes normalize backend: run the repo normalizer as a one-shot Job.
+"""Kubernetes per-task-pod backend: run a whole /tasks request as one Job.
 
-This is the proper-isolation backend for the /tasks normalize gate (Backend B
-in ``SERGE_NORMALIZE_PLAN.md`` §5), the alternative to a privileged
-docker-in-docker sidecar. For each patch-validation attempt serge creates a
-locked-down ``batch/v1`` Job that runs the normalizer command against the
-task's worktree, waits for it, reads the pod logs, and deletes the Job.
+For ``TASK_EXECUTION=kubernetes`` serge launches one locked-down ``batch/v1``
+Job per task; the pod runs the full write-capable loop — checkout, agentic loop,
+**in-process** normalize, PR publish — and streams events + the terminal result
+back to serge over the HTTP callback (see ``SERGE_PERTASK_POD_PLAN.md``). serge
+watches the Job to a terminal state only to reconcile a runner that died without
+reporting; it then deletes the Job (and, via ``ownerReferences``, the per-job
+Secret carrying ``task.json``).
 
-Isolation contract (mirrors the docker backend, stronger where k8s allows):
+Isolation contract:
 
-- **Worktree on a shared RWX PVC.** serge writes the *self-contained* clone
-  (``clone_cache.acquire_ref(standalone=True)``) to the PVC; the Job mounts the
-  same claim with a ``subPath`` so the pod sees **only** that worktree, at the
-  same absolute path serge used. Because the checkout is self-contained, no
-  bare-repo mount is needed and in-pod ``git`` works.
-- **No network.** Egress is denied by a cluster ``NetworkPolicy`` selecting the
-  ``serge.io/sandbox: normalize`` pod label (the ``--network none`` equivalent;
-  see ``deploy/helm``). The image must already carry the repo toolchain.
-- **Least privilege.** Non-root, ``readOnlyRootFilesystem`` + a writable
-  ``/tmp`` ``emptyDir``, all capabilities dropped, no privilege escalation,
-  ``RuntimeDefault`` seccomp, and ``automountServiceAccountToken: false`` so the
-  normalize container has no API credentials.
+- **Nothing shared but the spec.** The pod does its own checkout into an
+  ephemeral ``emptyDir`` (no shared PVC); the only thing serge injects is the
+  small per-job Secret at ``/etc/serge/task.json``.
+- **Allowlist egress.** The pod's ``NetworkPolicy`` permits egress only to the
+  ``serge-egress`` proxy (git + LLM), serge's callback, and kube-dns; the proxy
+  CONNECT-allows GitHub + the HF LLM only (see ``deploy/helm``).
+- **Least privilege.** No API token (``automountServiceAccountToken: false`` —
+  the pod spawns no sub-Jobs), all capabilities dropped, no privilege
+  escalation, ``RuntimeDefault`` seccomp.
 
-The Job is created by serge's own ServiceAccount (which needs RBAC to manage
-Jobs/pods/logs — see ``deploy/helm``), never by the sandboxed pod.
-
-The kubernetes client is imported lazily so non-k8s installs never need it;
-:class:`K8sSandboxError` is raised for any infrastructure failure, which the
-caller (:func:`reviewbot.normalize._run_kubernetes`) turns into a
-``NormalizeError`` (best-effort accept, not the model's fault).
+The Job is created by serge's own ServiceAccount (RBAC to manage Jobs/pods/logs
++ per-job Secrets — see ``deploy/helm``). The kubernetes client is imported
+lazily so non-k8s installs never need it; :class:`K8sSandboxError` is raised for
+any infrastructure failure.
 """
 
 from __future__ import annotations
@@ -35,17 +31,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
-
-# Pod label the deny-all-egress NetworkPolicy selects on.
-SANDBOX_LABEL_KEY = "serge.io/sandbox"
-SANDBOX_LABEL_VALUE = "normalize"
 
 # Pod label the per-task-pod allowlist-egress NetworkPolicy selects on
 # (SERGE_PERTASK_POD_PLAN.md). Distinct from the normalize deny-all label so the
@@ -70,20 +61,18 @@ _LOG_TAIL_LINES = 200
 
 
 class K8sSandboxError(RuntimeError):
-    """The normalize Job could not be run to completion (client unavailable,
+    """The task Job could not be run to completion (client unavailable,
     misconfiguration, API error, or timeout). The message is safe to log."""
 
 
 @dataclass(frozen=True)
 class K8sSettings:
-    """Deployment-supplied wiring for the kubernetes normalize backend.
+    """Deployment-supplied placement for the per-task runner Job.
 
-    ``worktree_volume_root`` is where the worktree PVC is mounted *in serge*;
-    the worktree's path relative to it becomes the Job's volume ``subPath``.
-    ``namespace`` defaults to the in-cluster namespace when unset."""
+    ``namespace`` defaults to the in-cluster namespace when unset;
+    ``service_account`` is the task *pod's* SA (it holds no API token
+    regardless); ``node_selector`` pins the pods to a node pool."""
 
-    worktree_pvc: Optional[str] = None
-    worktree_volume_root: Optional[str] = None
     namespace: Optional[str] = None
     service_account: Optional[str] = None
     node_selector: Optional[dict] = None
@@ -122,15 +111,6 @@ def _sanitize_dns1123(text: str) -> str:
     return "".join(out).strip("-")
 
 
-def make_job_name(write_root: str) -> str:
-    """A unique, DNS-1123-safe Job name derived from the worktree dir."""
-    base = _sanitize_dns1123(os.path.basename(write_root.rstrip("/"))) or "task"
-    suffix = uuid.uuid4().hex[:8]
-    prefix = "serge-nrm-"
-    keep = _DNS1123_MAX - len(prefix) - len(suffix) - 1
-    return f"{prefix}{base[:keep]}-{suffix}"
-
-
 def resolve_namespace(settings: K8sSettings) -> str:
     """Explicit namespace, else the in-cluster ServiceAccount namespace."""
     if settings.namespace:
@@ -146,137 +126,6 @@ def resolve_namespace(settings: K8sSettings) -> str:
         "kubernetes namespace not configured (set TASK_K8S_NAMESPACE) and the "
         "in-cluster namespace file is unavailable"
     )
-
-
-def _worktree_subpath(write_root: str, volume_root: str) -> str:
-    """The worktree's path relative to the PVC mount root, for the volume
-    ``subPath``. Refuses paths outside the volume root."""
-    write_root = os.path.realpath(write_root)
-    volume_root = os.path.realpath(volume_root)
-    rel = os.path.relpath(write_root, volume_root)
-    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
-        raise K8sSandboxError(
-            f"worktree {write_root!r} is not under the configured worktree "
-            f"volume root {volume_root!r}; cannot mount it by subPath"
-        )
-    return rel
-
-
-def build_job_manifest(
-    command: list[str],
-    *,
-    image: str,
-    workdir: str,
-    write_root: str,
-    job_name: str,
-    settings: K8sSettings,
-    uid: int,
-    gid: int,
-    timeout: int,
-    memory: Optional[str] = None,
-) -> dict:
-    """Build the ``batch/v1`` Job manifest (pure; no API calls).
-
-    The worktree PVC is mounted at ``write_root`` via ``subPath`` so the pod
-    sees only its own checkout at the same absolute path serge wrote it to."""
-    if not image:
-        raise K8sSandboxError(
-            "kubernetes normalize backend requires a configured image "
-            "(TASK_NORMALIZE_IMAGE)"
-        )
-    if not settings.worktree_pvc:
-        raise K8sSandboxError(
-            "kubernetes normalize backend requires a worktree PVC "
-            "(TASK_K8S_WORKTREE_PVC)"
-        )
-    if not settings.worktree_volume_root:
-        raise K8sSandboxError(
-            "kubernetes normalize backend requires the worktree volume root "
-            "(TASK_K8S_WORKTREE_VOLUME_ROOT, or WEB_CLONE_CACHE_DIR)"
-        )
-
-    sub_path = _worktree_subpath(write_root, settings.worktree_volume_root)
-
-    pod_security: dict = {
-        "runAsUser": uid,
-        "runAsGroup": gid,
-        "fsGroup": gid,
-        "seccompProfile": {"type": "RuntimeDefault"},
-    }
-    # runAsNonRoot must not be asserted when serge itself runs as uid 0, or the
-    # kubelet rejects the pod for contradicting the explicit runAsUser.
-    if uid != 0:
-        pod_security["runAsNonRoot"] = True
-
-    container: dict = {
-        "name": "normalize",
-        "image": image,
-        "command": list(command),
-        "workingDir": workdir,
-        "env": [
-            {"name": "HOME", "value": "/tmp"},
-            {"name": "TMPDIR", "value": "/tmp"},
-            {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
-        ],
-        "securityContext": {
-            "allowPrivilegeEscalation": False,
-            "readOnlyRootFilesystem": True,
-            "capabilities": {"drop": ["ALL"]},
-        },
-        "volumeMounts": [
-            {"name": "worktree", "mountPath": write_root, "subPath": sub_path},
-            {"name": "tmp", "mountPath": "/tmp"},
-        ],
-    }
-    if memory:
-        container["resources"] = {"limits": {"memory": memory}}
-
-    pod_spec: dict = {
-        "restartPolicy": "Never",
-        "automountServiceAccountToken": False,
-        "securityContext": pod_security,
-        "containers": [container],
-        "volumes": [
-            {
-                "name": "worktree",
-                "persistentVolumeClaim": {"claimName": settings.worktree_pvc},
-            },
-            {"name": "tmp", "emptyDir": {}},
-        ],
-    }
-    if settings.service_account:
-        pod_spec["serviceAccountName"] = settings.service_account
-    if settings.node_selector:
-        pod_spec["nodeSelector"] = dict(settings.node_selector)
-
-    return {
-        "apiVersion": "batch/v1",
-        "kind": "Job",
-        "metadata": {
-            "name": job_name,
-            "labels": {
-                "app.kubernetes.io/managed-by": "serge",
-                "app.kubernetes.io/component": "normalize",
-            },
-        },
-        "spec": {
-            "backoffLimit": 0,
-            "completions": 1,
-            "parallelism": 1,
-            "activeDeadlineSeconds": timeout,
-            "ttlSecondsAfterFinished": _TTL_AFTER_FINISHED,
-            "template": {
-                "metadata": {
-                    "labels": {
-                        "app.kubernetes.io/managed-by": "serge",
-                        "app.kubernetes.io/component": "normalize",
-                        SANDBOX_LABEL_KEY: SANDBOX_LABEL_VALUE,
-                    }
-                },
-                "spec": pod_spec,
-            },
-        },
-    }
 
 
 def _load_clients():
@@ -315,80 +164,6 @@ def _job_terminal(status) -> Optional[str]:
         if cond.status == "True" and cond.type in ("Complete", "Failed"):
             return "succeeded" if cond.type == "Complete" else "failed"
     return None
-
-
-def run_job(
-    command: list[str],
-    *,
-    image: str,
-    workdir: str,
-    write_root: str,
-    settings: K8sSettings,
-    uid: int,
-    gid: int,
-    timeout: int,
-    memory: Optional[str] = None,
-    poll_interval: float = _DEFAULT_POLL_INTERVAL,
-) -> tuple[int, str]:
-    """Create the normalize Job, wait for it, return ``(exit_code, log_tail)``.
-
-    Raises :class:`K8sSandboxError` on any infrastructure failure or if the Job
-    does not finish within ``timeout``. The Job is always deleted on the way
-    out (a leftover would also be reaped by ``ttlSecondsAfterFinished``)."""
-    from kubernetes.client.rest import ApiException
-
-    namespace = resolve_namespace(settings)
-    job_name = make_job_name(write_root)
-    manifest = build_job_manifest(
-        command,
-        image=image,
-        workdir=workdir,
-        write_root=write_root,
-        job_name=job_name,
-        settings=settings,
-        uid=uid,
-        gid=gid,
-        timeout=timeout,
-        memory=memory,
-    )
-    batch, core = _load_clients()
-
-    try:
-        batch.create_namespaced_job(namespace, manifest)
-    except ApiException as exc:
-        raise K8sSandboxError(
-            f"could not create normalize Job {job_name}: {exc.reason or exc}"
-        ) from exc
-
-    try:
-        # Give the Job its full deadline plus a grace margin to be observed
-        # terminal; activeDeadlineSeconds caps the pod itself.
-        deadline = time.monotonic() + timeout + poll_interval * 2
-        outcome: Optional[str] = None
-        while time.monotonic() < deadline:
-            try:
-                status = batch.read_namespaced_job_status(job_name, namespace).status
-            except ApiException as exc:
-                raise K8sSandboxError(
-                    f"could not read normalize Job status: {exc.reason or exc}"
-                ) from exc
-            outcome = _job_terminal(status)
-            if outcome is not None:
-                break
-            time.sleep(poll_interval)
-        if outcome is None:
-            raise K8sSandboxError(
-                f"normalize Job {job_name} did not finish within {timeout}s"
-            )
-
-        exit_code, tail = _collect_pod_result(core, namespace, job_name)
-        # A Job can fail without a container exit code (e.g. deadline exceeded);
-        # surface a non-zero so the caller treats it as a rejected patch.
-        if outcome == "failed" and exit_code == 0:
-            exit_code = 1
-        return exit_code, tail
-    finally:
-        _delete_job(batch, job_name, namespace)
 
 
 def _collect_pod_result(core, namespace: str, job_name: str) -> tuple[int, str]:

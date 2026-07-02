@@ -231,18 +231,13 @@ class Config:
     # conventions. Operator config, never request-supplied.
     task_normalize_guidance: Optional[str] = None
     task_sandbox_backend: str = sandbox.AUTO_BACKEND
-    # Kubernetes normalize backend (TASK_SANDBOX_BACKEND=kubernetes). The Job
-    # runs the normalizer on the worktree, which serge writes to a shared RWX
-    # PVC. ``task_k8s_namespace`` defaults to the in-cluster namespace at
-    # runtime; ``task_k8s_worktree_pvc`` is the claim the Job mounts;
-    # ``task_k8s_worktree_volume_root`` is where that PVC is mounted in serge
-    # (defaults to the clone-cache dir) — the worktree's path *relative* to it
-    # becomes the Job's volume subPath, so the Job sees only its own worktree.
+    # Kubernetes placement for the per-task runner Jobs (TASK_EXECUTION=
+    # kubernetes; see SERGE_PERTASK_POD_PLAN.md). ``task_k8s_namespace`` defaults
+    # to the in-cluster namespace at runtime; ``task_k8s_service_account`` is the
+    # task *pods'* SA (they hold no API token regardless).
     task_k8s_namespace: Optional[str] = None
-    task_k8s_worktree_pvc: Optional[str] = None
-    task_k8s_worktree_volume_root: Optional[str] = None
     task_k8s_service_account: Optional[str] = None
-    # nodeSelector for the normalize Job pods, as "key=value,key2=value2"
+    # nodeSelector for the task Job pods, as "key=value,key2=value2"
     # (e.g. "scheduling.cast.ai/node-template=default-by-castai").
     task_k8s_node_selector: Optional[str] = None
     # Optional Slack notification for PRs created by the /tasks flow.
@@ -257,14 +252,12 @@ class Config:
         rather than a linked worktree.
 
         True only when an in-loop normalizer runs inside a container sandbox
-        that binds *just* the worktree (``docker``/``kubernetes``, and
-        ``auto`` which may resolve to docker), so in-sandbox git works. When
-        normalize is unconfigured, or the dev-only ``bwrap`` backend is used,
-        the cheaper linked worktree is kept (see
-        :meth:`CloneCache.acquire_ref`)."""
+        that binds *just* the worktree (``docker``, and ``auto`` which may
+        resolve to docker), so in-sandbox git works. When normalize is
+        unconfigured, or the dev-only ``bwrap`` backend is used, the cheaper
+        linked worktree is kept (see :meth:`CloneCache.acquire_ref`)."""
         return bool(self.task_normalize_command) and self.task_sandbox_backend in (
             sandbox.DOCKER_BACKEND,
-            sandbox.KUBERNETES_BACKEND,
             sandbox.AUTO_BACKEND,
         )
 
@@ -472,14 +465,6 @@ class Config:
                 os.environ.get("TASK_SANDBOX_BACKEND")
             ),
             task_k8s_namespace=(os.environ.get("TASK_K8S_NAMESPACE") or "").strip()
-            or None,
-            task_k8s_worktree_pvc=(
-                os.environ.get("TASK_K8S_WORKTREE_PVC") or ""
-            ).strip()
-            or None,
-            task_k8s_worktree_volume_root=(
-                os.environ.get("TASK_K8S_WORKTREE_VOLUME_ROOT") or ""
-            ).strip()
             or None,
             task_k8s_service_account=(
                 os.environ.get("TASK_K8S_SERVICE_ACCOUNT") or ""

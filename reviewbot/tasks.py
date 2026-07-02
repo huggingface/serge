@@ -378,16 +378,6 @@ def _validate_patch(
             mode=cfg.helper_sandbox,
             timeout=cfg.task_normalize_timeout,
             memory=cfg.task_normalize_memory,
-            # k8s wiring is passed as plain values; run_normalize only uses it
-            # (and imports the optional k8s_sandbox/kubernetes client) when the
-            # kubernetes backend is selected, so non-k8s deploys never touch it.
-            k8s_namespace=cfg.task_k8s_namespace,
-            k8s_worktree_pvc=cfg.task_k8s_worktree_pvc,
-            k8s_worktree_volume_root=(
-                cfg.task_k8s_worktree_volume_root or cfg.web_clone_cache_dir or None
-            ),
-            k8s_service_account=cfg.task_k8s_service_account,
-            k8s_node_selector=cfg.task_k8s_node_selector,
         )
     except NormalizeError as exc:
         # Infrastructure problem (sandbox unavailable, timeout) — not the

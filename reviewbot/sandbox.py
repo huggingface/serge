@@ -58,11 +58,8 @@ _VALID_MODES = frozenset({REQUIRE, AUTO, OFF})
 # deployment never needs Kubernetes.
 BWRAP_BACKEND = "bwrap"
 DOCKER_BACKEND = "docker"
-KUBERNETES_BACKEND = "kubernetes"
 AUTO_BACKEND = "auto"
-_VALID_BACKENDS = frozenset(
-    {BWRAP_BACKEND, DOCKER_BACKEND, KUBERNETES_BACKEND, AUTO_BACKEND}
-)
+_VALID_BACKENDS = frozenset({BWRAP_BACKEND, DOCKER_BACKEND, AUTO_BACKEND})
 
 # Read-only /etc files a sandboxed tool plausibly needs (name resolution,
 # user lookup, timezone, TLS roots) — deliberately NOT all of /etc, which
