@@ -296,6 +296,23 @@ def resolve_existing_pr(gh: GitHubClient, req: TaskRequest, cfg: Config) -> str:
     return head_branch
 
 
+def format_pr_files_diff(files: list[dict[str, Any]], *, limit: int = 30000) -> str:
+    """Concatenate a PR's per-file patches into a single blob used as the
+    "prior attempt" context on an existing_pr follow-up. Best-effort and
+    purely informational — not meant to be re-applied."""
+    parts: list[str] = []
+    total = 0
+    for f in files:
+        patch = f.get("patch") or ""
+        chunk = f"--- {f.get('filename')} ---\n{patch}\n"
+        parts.append(chunk)
+        total += len(chunk)
+        if total >= limit:
+            parts.append("[... prior attempt truncated ...]")
+            break
+    return "\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Agentic loop → patch (with in-loop normalize validation)
 # ---------------------------------------------------------------------------

@@ -44,6 +44,7 @@ kubernetes = [
 [project.scripts]
 reviewbot-action = "reviewbot.action_runner:main"
 reviewbot-app = "reviewbot.app:main"
+reviewbot-task-runner = "reviewbot.task_runner:main"
 reviewbot-web = "reviewbot.webapp:main"
 
 [tool.setuptools.packages.find]

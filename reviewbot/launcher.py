@@ -1,0 +1,161 @@
+"""Launch a per-task runner (:mod:`reviewbot.task_runner`) out-of-process.
+
+serge stays a thin orchestrator: instead of running the write-capable task in a
+thread, it launches a **runner pod/container** that runs the whole loop and
+streams back over the HTTP callback (see ``SERGE_PERTASK_POD_PLAN.md``). This
+module builds the per-task spec and starts the runner. Two backends:
+
+- ``docker``: ``docker run`` the runner image. Works on any Docker host — no
+  Kubernetes needed. When serge itself is containerized this is
+  "docker-in-docker" via a mounted ``/var/run/docker.sock`` (docker-out-of-docker,
+  really). This is also the local-dev / self-hosted path.
+- ``kubernetes``: a one-shot Job (implemented in a later phase; the k8s Job
+  helpers in :mod:`reviewbot.k8s_sandbox` are reused there).
+
+The spec carries secrets (a short-lived GitHub token, the LLM key) + the callback
+coordinates. For docker it is written to a ``0600`` temp file bind-mounted at
+``/etc/serge/task.json``; for kubernetes it becomes a per-job Secret.
+
+**Network firewall.** The runner runs arbitrary repo build code alongside the
+secrets, so its egress must be allowlisted (git + the LLM only). Pass ``proxy``
+to route egress through an allowlisting forward proxy and attach the container to
+an ``internal`` docker network (``network``) that has no route out except the
+proxy — the docker analogue of the k8s egress-proxy + NetworkPolicy. For local
+e2e against host mocks, use ``network="host"`` and no proxy.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import tempfile
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+log = logging.getLogger(__name__)
+
+_SPEC_MOUNT_PATH = "/etc/serge/task.json"
+
+
+def build_spec(
+    *,
+    job_id: str,
+    request: dict[str, Any],
+    github_token: str,
+    llm: dict[str, Any],
+    callback_url: str,
+    callback_token: str,
+    repo_remote_url: Optional[str] = None,
+) -> dict[str, Any]:
+    """Assemble the ``task.json`` payload the runner reads. ``request`` is a
+    serialized :class:`reviewbot.tasks.TaskRequest`; ``llm`` is the per-repo
+    resolved provider settings (``api_base``/``api_key``/``model``/``bill_to``/
+    ``stream``); ``github_token`` is the short-lived installation token serge
+    minted for this task."""
+    spec: dict[str, Any] = {
+        "job_id": job_id,
+        "request": request,
+        "github_token": github_token,
+        "llm": llm,
+        "callback": {"url": callback_url, "token": callback_token},
+    }
+    if repo_remote_url:
+        spec["repo_remote_url"] = repo_remote_url
+    return spec
+
+
+@dataclass
+class DockerLaunchOptions:
+    """Wiring for the docker backend. ``network``/``proxy`` set the egress
+    firewall; the rest are escape hatches for dev/e2e (extra mounts, host
+    resolution, keeping the container for inspection)."""
+
+    image: str
+    network: Optional[str] = None  # e.g. an `internal` net, or "host" for e2e
+    proxy: Optional[str] = None  # HTTPS_PROXY/HTTP_PROXY for allowlisted egress
+    add_hosts: dict[str, str] = field(default_factory=dict)  # name -> ip/host-gateway
+    volumes: dict[str, str] = field(default_factory=dict)  # host_path -> ctr_path[:ro]
+    env: dict[str, str] = field(default_factory=dict)
+    memory: Optional[str] = None
+    name: Optional[str] = None
+    remove: bool = True
+
+
+def _docker_run_argv(spec_path: str, opts: DockerLaunchOptions) -> list[str]:
+    argv = ["docker", "run"]
+    if opts.remove:
+        argv.append("--rm")
+    if opts.name:
+        argv += ["--name", opts.name]
+    if opts.network:
+        argv += ["--network", opts.network]
+    for host, ip in opts.add_hosts.items():
+        argv += ["--add-host", f"{host}:{ip}"]
+    if opts.memory:
+        argv += ["--memory", opts.memory]
+    # The spec (secrets + callback) is mounted read-only at the well-known path.
+    argv += ["-v", f"{spec_path}:{_SPEC_MOUNT_PATH}:ro"]
+    for host_path, ctr_path in opts.volumes.items():
+        argv += ["-v", f"{host_path}:{ctr_path}"]
+    env = dict(opts.env)
+    env.setdefault("SERGE_TASK_SPEC", _SPEC_MOUNT_PATH)
+    if opts.proxy:
+        # Allowlisted egress: everything the runner does (git, LLM) goes via the
+        # proxy; the container's own network is otherwise cut off (internal net).
+        env.setdefault("HTTPS_PROXY", opts.proxy)
+        env.setdefault("HTTP_PROXY", opts.proxy)
+    for key, value in env.items():
+        argv += ["-e", f"{key}={value}"]
+    argv.append(opts.image)
+    return argv
+
+
+def launch_docker(
+    spec: dict[str, Any],
+    opts: DockerLaunchOptions,
+    *,
+    wait: bool = False,
+    timeout: Optional[int] = None,
+) -> tuple[int, str]:
+    """Start the runner container for ``spec``.
+
+    With ``wait=False`` the container is detached and this returns immediately
+    ``(0, container_id)`` — the runner reports its outcome over the callback.
+    The bind-mounted spec temp file is **left in place**: unlinking it before the
+    detached container has read it would break the mount. The caller (or a
+    reaper keyed on container exit) removes ``serge-task-*.json`` afterwards.
+    With ``wait=True`` it blocks up to ``timeout`` seconds, removes the spec on
+    the way out, and returns ``(exit_code, combined_output)`` (tests /
+    synchronous callers)."""
+    fd, spec_path = tempfile.mkstemp(prefix="serge-task-", suffix=".json")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(spec, fh)
+    os.chmod(spec_path, 0o600)
+
+    argv = _docker_run_argv(spec_path, opts)
+    if not wait:
+        argv.insert(2, "-d")  # `docker run -d ...`
+    log.info("launching task runner container (wait=%s): %s", wait, opts.image)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except BaseException:
+        _unlink(spec_path)
+        raise
+
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if not wait:
+        if proc.returncode != 0:
+            _unlink(spec_path)
+            raise RuntimeError(f"docker run failed: {out.strip()}")
+        return 0, out.strip()  # container id; spec file left for the reaper
+    _unlink(spec_path)
+    return proc.returncode, out
+
+
+def _unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass

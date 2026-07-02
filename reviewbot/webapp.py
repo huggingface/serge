@@ -46,6 +46,8 @@ from .github_auth import (
     user_is_org_member,
 )
 from .github_client import GitHubClient
+from .errors import format_github_http_error as _format_github_http_error
+from .errors import format_llm_error as _format_llm_error
 from .llm_client import LLMResponseError
 from .oidc import OIDCError, verify_token
 from .reviewer import (
@@ -65,6 +67,7 @@ from .tasks import (
     TaskResult,
     TaskRequest,
     build_task_request,
+    format_pr_files_diff,
     prepare_task,
     publish_task,
     resolve_existing_pr,
@@ -811,21 +814,6 @@ def _persist_terminal(job: Job) -> None:
         log.exception("failed to persist terminal state for job %s", job.id)
 
 
-def _format_llm_error(exc: LLMResponseError) -> str:
-    """Render an LLMResponseError for the SSE client. Surfaces the status
-    code + a body excerpt so the UI shows whether it was a 429 (rate
-    limit), 400 (bad schema), auth, etc. instead of a generic "review
-    crashed". The body comes from the LLM provider's own error response —
-    no auth tokens of ours are echoed there."""
-    excerpt = exc.body_preview.strip()
-    if len(excerpt) > 600:
-        excerpt = excerpt[:600] + "…"
-    reason_part = f" {exc.reason}" if exc.reason else ""
-    if excerpt:
-        return f"LLM endpoint returned {exc.status_code}{reason_part}: {excerpt}"
-    return f"LLM endpoint returned {exc.status_code}{reason_part}"
-
-
 def _post_webhook_failure_comment(
     gh: GitHubClient,
     req: ReviewRequest,
@@ -851,24 +839,6 @@ def _post_webhook_failure_comment(
             req.number,
             exc,
         )
-
-
-def _format_github_http_error(exc: requests.HTTPError) -> str:
-    """Render a GitHub REST error for the task SSE client. The message comes
-    from GitHub's own response (no serge tokens), so it's safe to surface and
-    far more actionable than a generic "task crashed". Adds a hint for the
-    common write-permission failure on the /tasks flow."""
-    msg = str(exc) or "GitHub API request failed"
-    status_code = getattr(getattr(exc, "response", None), "status_code", None)
-    lowered = msg.lower()
-    if status_code == 403 or "resource not accessible by integration" in lowered:
-        msg += (
-            "\n\nHint: the GitHub App installation lacks write access. The "
-            "/tasks flow needs Contents: write + Pull requests: write — grant "
-            "those in the App settings and re-accept the installation on the "
-            "org/repo."
-        )
-    return msg
 
 
 def _execute_review(
@@ -1075,23 +1045,6 @@ def _run_review_worker(job: Job) -> None:
     _execute_review(job, worker_cfg, gh, token, req, auto_publish=False)
 
 
-def _format_pr_files_diff(files: list[dict[str, Any]], *, limit: int = 30000) -> str:
-    """Concatenate a PR's per-file patches into a single blob used as the
-    "prior attempt" context on an existing_pr follow-up. Best-effort and
-    purely informational — not meant to be re-applied."""
-    parts: list[str] = []
-    total = 0
-    for f in files:
-        patch = f.get("patch") or ""
-        chunk = f"--- {f.get('filename')} ---\n{patch}\n"
-        parts.append(chunk)
-        total += len(chunk)
-        if total >= limit:
-            parts.append("[... prior attempt truncated ...]")
-            break
-    return "\n".join(parts)
-
-
 def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
     """Run a write-capable task on the dedicated task pool: check out the
     base (or serge fix branch), run the agentic loop to produce a patch,
@@ -1124,7 +1077,7 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             ref_to_checkout = head_branch
             try:
                 pr_files = gh.get_pr_files(req.owner, req.repo, req.pr_number or 0)
-                existing_diff = _format_pr_files_diff(pr_files)
+                existing_diff = format_pr_files_diff(pr_files)
             except Exception:  # noqa: BLE001
                 log.debug("could not fetch prior-attempt diff", exc_info=True)
         else:

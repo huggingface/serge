@@ -1,45 +1,55 @@
-# Example normalize-validation runner image.
+# Per-task runner image for the pod-per-task execution model.
 #
-# serge's in-loop normalize validation runs the target repo's own normalizer —
-# e.g. `make style && make fix-repo` — against a task worktree inside a
-# throwaway, network-isolated container to validate (and normalize) each LLM
-# patch before committing it. This image is that container: it must carry the
-# target repo's toolchain so the normalizer runs WITHOUT network at run time
-# (serge runs it with `docker --network none`).
+# serge launches one of these pods per /tasks request; the pod runs the FULL
+# task loop — checkout, agentic loop, in-process normalize, PR publish — via the
+# `reviewbot-task-runner` entrypoint, streaming events back to serge over an
+# authenticated callback. See SERGE_PERTASK_POD_PLAN.md.
 #
-# This example targets huggingface/transformers `make fix-repo`, which only
-# needs the `[quality]` extra (ruff, ty, libcst, GitPython, datasets, rich,
-# tomli, transformers-mlinter) plus setuptools — NOT torch or any model deps.
-# See the transformers analysis: fix-repo's fix-mode checkers are all
-# source/AST based and run fine on `.[quality]` alone.
+# The image is the target repo's toolchain image with serge layered on top, so
+# the in-process normalizer (e.g. `make fix-repo`) has everything it needs in
+# the same container — no nested sandbox Job. The pod's network firewall
+# (allowlist egress) is the isolation boundary, not a separate deny-egress pod.
 #
-# Build (pin the ref so the toolchain versions match the PRs you fix):
+# BASE_IMAGE defaults to the public transformers-quality image transformers CI
+# builds. Operators who already publish their own toolchain image just point
+# BASE_IMAGE at it — serge is added on top:
+#
 #   docker build -f docker/Dockerfile.task-runner \
-#     --build-arg TRANSFORMERS_REF=main \
-#     -t serge/transformers-quality:latest .
+#     --build-arg BASE_IMAGE=huggingface/transformers-quality:latest \
+#     -t serge/task-runner:latest .
 #
-# Then point serge at it:  TASK_NORMALIZE_IMAGE=serge/transformers-quality:latest
-FROM python:3.10-slim
+# Then point serge's launcher at it: TASK_RUNNER_IMAGE=serge/task-runner:latest
+ARG BASE_IMAGE=huggingface/transformers-quality:latest
+FROM ${BASE_IMAGE}
 
-# git + make are needed by `make fix-repo`; build-essential is not (the
-# quality toolchain is pure-python wheels). ca-certificates only matters at
-# build time (run time has no network).
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git make ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# git + make drive the checkout and the in-process normalizer. A toolchain base
+# normally already ships them; install defensively (a no-op if present). Assumes
+# a Debian/Ubuntu base — override the base or edit this if yours differs.
+USER root
+RUN if ! (command -v git >/dev/null && command -v make >/dev/null); then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends git make ca-certificates \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
 
-# Install the quality toolchain. Installing the extra from a pinned ref keeps
-# the tool versions (ruff==…, ty==…) in lockstep with the repo's setup.py, so
-# `make fix-repo` produces the same output the repo's own CI would.
-# setuptools is required by `python setup.py deps_table_update` and is not in
-# slim images by default.
-ARG TRANSFORMERS_REF=main
-RUN pip install --no-cache-dir setuptools \
-    && pip install --no-cache-dir \
-       "transformers[quality] @ git+https://github.com/huggingface/transformers.git@${TRANSFORMERS_REF}"
+# Layer serge on top of the toolchain, into the base image's Python environment
+# so `reviewbot-task-runner` is on PATH and its imports resolve. Only the base
+# deps are needed (requests/pyjwt/flask) — not the [web] server extras.
+COPY . /opt/serge
+RUN pip install --no-cache-dir /opt/serge
 
-# serge runs the container as the host uid:gid (so files written into the
-# bind-mounted worktree are owned by serge, not root) and overrides the
-# workdir to the checkout path, so no USER / WORKDIR / ENTRYPOINT is needed
-# here. The normalize command (e.g. `make fix-repo`) is supplied by serge at
-# run time via TASK_NORMALIZE_COMMAND.
+# Defaults for the in-pod run. serge overrides / augments these via the pod env
+# and the mounted spec; the pod firewall enforces egress, so the normalizer runs
+# directly (TASK_SANDBOX_BACKEND=off) with no nested sandbox.
+#   - SERGE_TASK_SPEC: the mounted per-job Secret (request + token + callback).
+#   - WEB_CLONE_CACHE_DIR: local scratch (an emptyDir in-cluster) for the clone.
+ENV SERGE_TASK_SPEC=/etc/serge/task.json \
+    WEB_CLONE_CACHE_DIR=/tmp/serge-clones \
+    TASK_SANDBOX_BACKEND=off \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/tmp \
+    TMPDIR=/tmp
+
+# serge sets runAsUser/runAsGroup on the pod; no USER pinned here so the image
+# works both under `docker run` (dev) and the pod's securityContext.
+CMD ["reviewbot-task-runner"]
