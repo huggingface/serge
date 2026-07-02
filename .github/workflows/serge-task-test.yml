@@ -47,7 +47,9 @@ permissions:
 
 jobs:
   run-task:
-    runs-on: aws-general-8-plus
+    # In-VPC self-hosted runner group; reaches the internal ALB directly.
+    runs-on:
+      group: aws-general-8-plus
     steps:
       - name: Mint OIDC token and POST /tasks
         env:
