@@ -107,7 +107,6 @@ class ConfigTests(unittest.TestCase):
         # Normalize + a container backend that binds only the worktree.
         for backend in (
             sandbox.DOCKER_BACKEND,
-            sandbox.KUBERNETES_BACKEND,
             sandbox.AUTO_BACKEND,
         ):
             self.assertTrue(

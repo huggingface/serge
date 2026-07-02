@@ -478,7 +478,11 @@ class ValidationGateTests(unittest.TestCase):
 
         def validate(chat: ChatResult) -> str | None:
             seen.append(chat.content)
-            return "normalizer failed, fix it" if chat.content == '{"patch": "v1"}' else None
+            return (
+                "normalizer failed, fix it"
+                if chat.content == '{"patch": "v1"}'
+                else None
+            )
 
         chat, metrics = _run_agentic_loop(
             llm,  # type: ignore[arg-type]
@@ -501,7 +505,8 @@ class ValidationGateTests(unittest.TestCase):
         # The normalizer feedback re-entered the same conversation.
         self.assertTrue(
             any(
-                m.get("role") == "user" and m.get("content") == "normalizer failed, fix it"
+                m.get("role") == "user"
+                and m.get("content") == "normalizer failed, fix it"
                 for m in llm.calls[2]["messages"]
             )
         )

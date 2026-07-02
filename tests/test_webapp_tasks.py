@@ -33,7 +33,7 @@ class WebappTasksTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
         sys.modules.pop("reviewbot.webapp", None)
 
-    def _import_webapp(self, *, task_api_enabled=True):
+    def _import_webapp(self, *, task_api_enabled=True, **extra_env):
         env = {
             "DEV_NO_AUTH": "1",
             "GITHUB_APP_ID": "123",
@@ -49,6 +49,7 @@ class WebappTasksTests(unittest.TestCase):
             "TASK_LLM_MAX_INPUT_TOKENS": "250000",
             "TASK_TOOL_MAX_ITERATIONS": "8",
         }
+        env.update({k: v for k, v in extra_env.items() if v is not None})
         with patch.dict(os.environ, env, clear=True):
             return importlib.import_module("reviewbot.webapp")
 
@@ -171,6 +172,59 @@ class WebappTasksTests(unittest.TestCase):
         row = webapp._store.load(body["id"])
         self.assertEqual(row["kind"], "task")
 
+    def test_inprocess_execution_dispatches_to_worker(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()  # TASK_EXECUTION defaults to inprocess
+        self._seed_write_config(webapp)
+        submitted = {}
+
+        with (
+            patch.object(webapp, "verify_token", return_value=_Claims()),
+            patch.object(
+                webapp._TASK_POOL,
+                "submit",
+                side_effect=lambda fn, *a: submitted.setdefault("fn", fn),
+            ),
+        ):
+            client = TestClient(webapp.app)
+            r = client.post(
+                "/tasks",
+                json={"instruction": "fix", "context": "trace"},
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertEqual(r.status_code, 202)
+        self.assertIs(submitted["fn"], webapp._run_task_worker)
+
+    def test_docker_execution_dispatches_to_launcher(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp(
+            TASK_EXECUTION="docker",
+            TASK_RUNNER_IMAGE="serge/runner:latest",
+            TASK_CALLBACK_BASE_URL="http://serge:8000",
+        )
+        self.assertEqual(webapp.cfg.task_execution, "docker")
+        self._seed_write_config(webapp)
+        submitted = {}
+
+        with (
+            patch.object(webapp, "verify_token", return_value=_Claims()),
+            patch.object(
+                webapp._TASK_POOL,
+                "submit",
+                side_effect=lambda fn, *a: submitted.setdefault("fn", fn),
+            ),
+        ):
+            client = TestClient(webapp.app)
+            r = client.post(
+                "/tasks",
+                json={"instruction": "fix", "context": "trace"},
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertEqual(r.status_code, 202)
+        self.assertIs(submitted["fn"], webapp._launch_task_pod)
+
     def test_task_finished_notification_uses_request_channel(self):
         webapp = self._import_webapp()
         worker_cfg = webapp.dataclasses.replace(
@@ -274,6 +328,290 @@ class WebappTasksTests(unittest.TestCase):
         result = webapp.TaskResult(mode="new_pr", no_change=True)
         job = self._run_task_worker_with(webapp, result)
         self.assertEqual(job.status, "no_fix")
+
+
+class TaskLauncherTests(unittest.TestCase):
+    """The docker launcher (_launch_task_pod) and the callback-ingest endpoint
+    (POST /internal/tasks/{id}/events) added in Phase 2."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        sys.modules.pop("reviewbot.webapp", None)
+
+    def _import_webapp(self, **extra_env):
+        env = {
+            "DEV_NO_AUTH": "1",
+            "GITHUB_APP_ID": "123",
+            "GITHUB_PRIVATE_KEY": "dummy-private-key",
+            "GITHUB_WEBHOOK_SECRET": "webhook-secret",
+            "LLM_API_KEY": "llm-token",
+            "WEB_STORE_PATH": os.path.join(self.tmpdir, "jobs.db"),
+            "WEB_CLONE_CACHE_DIR": os.path.join(self.tmpdir, "clones"),
+            "TASK_API_ENABLED": "1",
+            "TASK_EXECUTION": "docker",
+            "TASK_RUNNER_IMAGE": "serge/runner:latest",
+            "TASK_CALLBACK_BASE_URL": "http://serge:8000",
+        }
+        env.update(extra_env)
+        with patch.dict(os.environ, env, clear=True):
+            return importlib.import_module("reviewbot.webapp")
+
+    def _make_job(self, webapp, *, status="running", callback_token="cbtok"):
+        job = webapp.Job(
+            id="job123abc456",
+            user="octocat",
+            target_owner="acme",
+            target_repo="widgets",
+            target_number=0,
+            trigger_comment="fix",
+            llm_provider="hf",
+            llm_api_base="https://example.com/v1",
+            llm_model="model",
+            created_at=0,
+            status=status,
+            source="task",
+            kind="task",
+            callback_token=callback_token,
+        )
+        job.loop = None  # _push_event tolerates a None loop (no live SSE)
+        with webapp._jobs_lock:
+            webapp._jobs[job.id] = job
+        return job
+
+    # --- _launch_task_pod ------------------------------------------------
+    def _worker_cfg_and_req(self, webapp):
+        worker_cfg = webapp.dataclasses.replace(
+            webapp.cfg,
+            llm_api_base="https://llm.example/v1",
+            llm_api_key="secret-llm-key",
+            llm_model="some-model",
+            llm_bill_to="acme-org",
+            llm_max_tokens=16384,
+            tool_max_iterations=8,
+            tool_max_iterations_strict=True,
+            task_normalize_command=["make", "fix-repo"],
+        )
+        req = webapp.TaskRequest(
+            owner="acme",
+            repo="widgets",
+            base_ref="main",
+            instruction="fix",
+            context="trace",
+        )
+        return worker_cfg, req
+
+    def test_launch_builds_spec_and_reconciles_on_no_callback(self):
+        webapp = self._import_webapp()
+        job = self._make_job(webapp)
+        worker_cfg, req = self._worker_cfg_and_req(webapp)
+        captured = {}
+
+        def fake_launch(spec, opts, *, wait, timeout):
+            captured["spec"] = spec
+            captured["opts"] = opts
+            captured["wait"] = wait
+            return 0, "container-id"
+
+        with (
+            patch.object(webapp, "installation_id_for_repo", return_value=1),
+            patch.object(webapp, "installation_token", return_value="gh-token"),
+            patch.object(webapp, "launch_docker", side_effect=fake_launch),
+            patch.object(webapp, "_notify_task_finished"),
+            patch.object(webapp, "_persist_terminal"),
+        ):
+            webapp._launch_task_pod(job, worker_cfg, req)
+
+        spec = captured["spec"]
+        self.assertTrue(captured["wait"])
+        self.assertEqual(spec["job_id"], job.id)
+        self.assertEqual(spec["github_token"], "gh-token")
+        self.assertEqual(spec["llm"]["api_key"], "secret-llm-key")
+        self.assertEqual(spec["llm"]["bill_to"], "acme-org")
+        # The resolved worker-Config subset (per-task caps + normalize settings)
+        # is transmitted so the runner doesn't fall back to env defaults.
+        self.assertEqual(spec["config"]["llm_max_tokens"], 16384)
+        self.assertEqual(spec["config"]["tool_max_iterations"], 8)
+        self.assertTrue(spec["config"]["tool_max_iterations_strict"])
+        self.assertEqual(spec["config"]["task_normalize_command"], ["make", "fix-repo"])
+        self.assertEqual(
+            spec["callback"]["url"],
+            f"http://serge:8000/internal/tasks/{job.id}/events",
+        )
+        self.assertTrue(spec["callback"]["token"])
+        self.assertEqual(captured["opts"].image, "serge/runner:latest")
+        # No terminal callback arrived → reconcile to error; token is cleared.
+        self.assertEqual(job.status, "error")
+        self.assertIsNone(job.callback_token)
+
+    def test_launch_leaves_terminal_status_from_callback(self):
+        webapp = self._import_webapp()
+        job = self._make_job(webapp)
+        worker_cfg, req = self._worker_cfg_and_req(webapp)
+
+        def fake_launch(spec, opts, *, wait, timeout):
+            # Simulate the runner's terminal callback landing before exit.
+            job.status = "published"
+            return 0, "cid"
+
+        with (
+            patch.object(webapp, "installation_id_for_repo", return_value=1),
+            patch.object(webapp, "installation_token", return_value="gh-token"),
+            patch.object(webapp, "launch_docker", side_effect=fake_launch),
+            patch.object(webapp, "_notify_task_finished"),
+            patch.object(webapp, "_persist_terminal"),
+        ):
+            webapp._launch_task_pod(job, worker_cfg, req)
+
+        self.assertEqual(job.status, "published")
+
+    def test_launch_kubernetes_dispatches_and_reconciles(self):
+        webapp = self._import_webapp(
+            TASK_EXECUTION="kubernetes",
+            TASK_K8S_NAMESPACE="serge",
+            TASK_K8S_SERVICE_ACCOUNT="serge-task",
+            TASK_K8S_NODE_SELECTOR="pool=tasks",
+            TASK_RUNNER_PROXY="http://egress:3128",
+            TASK_RUNNER_NO_PROXY=".svc.cluster.local",
+        )
+        job = self._make_job(webapp)
+        worker_cfg, req = self._worker_cfg_and_req(webapp)
+        captured = {}
+
+        def fake_launch(spec, opts, *, timeout, poll_interval=2.0):
+            captured["spec"] = spec
+            captured["opts"] = opts
+            return 0, "pod log"
+
+        with (
+            patch.object(webapp, "installation_id_for_repo", return_value=1),
+            patch.object(webapp, "installation_token", return_value="gh-token"),
+            patch.object(webapp, "launch_kubernetes", side_effect=fake_launch),
+            patch.object(webapp, "_notify_task_finished"),
+            patch.object(webapp, "_persist_terminal"),
+        ):
+            webapp._launch_task_pod(job, worker_cfg, req)
+
+        opts = captured["opts"]
+        self.assertEqual(opts.image, "serge/runner:latest")
+        self.assertEqual(opts.namespace, "serge")
+        self.assertEqual(opts.service_account, "serge-task")
+        self.assertEqual(opts.node_selector, {"pool": "tasks"})
+        self.assertEqual(opts.proxy, "http://egress:3128")
+        self.assertEqual(opts.no_proxy, ".svc.cluster.local")
+        self.assertEqual(captured["spec"]["github_token"], "gh-token")
+        # No terminal callback arrived → reconcile to error.
+        self.assertEqual(job.status, "error")
+        self.assertIsNone(job.callback_token)
+
+    def test_launch_kubernetes_surfaces_sandbox_error(self):
+        webapp = self._import_webapp(TASK_EXECUTION="kubernetes")
+        job = self._make_job(webapp)
+        worker_cfg, req = self._worker_cfg_and_req(webapp)
+
+        with (
+            patch.object(webapp, "installation_id_for_repo", return_value=1),
+            patch.object(webapp, "installation_token", return_value="gh-token"),
+            patch.object(
+                webapp,
+                "launch_kubernetes",
+                side_effect=webapp.K8sSandboxError("no cluster"),
+            ),
+            patch.object(webapp, "_notify_task_finished"),
+            patch.object(webapp, "_persist_terminal"),
+        ):
+            webapp._launch_task_pod(job, worker_cfg, req)
+
+        self.assertEqual(job.status, "error")
+        self.assertEqual(job.error, "no cluster")
+
+    # --- POST /internal/tasks/{id}/events --------------------------------
+    def test_ingest_rejects_missing_token(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._make_job(webapp)
+        client = TestClient(webapp.app)
+        r = client.post("/internal/tasks/job123abc456/events", json={"kind": "log"})
+        self.assertEqual(r.status_code, 401)
+
+    def test_ingest_rejects_bad_token(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._make_job(webapp, callback_token="right")
+        client = TestClient(webapp.app)
+        r = client.post(
+            "/internal/tasks/job123abc456/events",
+            json={"kind": "log", "text": "hi"},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_ingest_rejects_unknown_job(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        client = TestClient(webapp.app)
+        r = client.post(
+            "/internal/tasks/does-not-exist/events",
+            json={"kind": "log"},
+            headers={"Authorization": "Bearer whatever"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_ingest_event_appends_to_history(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        job = self._make_job(webapp, callback_token="tok")
+        client = TestClient(webapp.app)
+        r = client.post(
+            "/internal/tasks/job123abc456/events",
+            json={"kind": "log", "text": "checking out…"},
+            headers={"Authorization": "Bearer tok"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(
+            any(e["text"] == "checking out…" for e in job.history),
+        )
+        self.assertEqual(job.status, "running")  # non-terminal
+
+    def test_ingest_terminal_records_outcome(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        job = self._make_job(webapp, callback_token="tok")
+        client = TestClient(webapp.app)
+        r = client.post(
+            "/internal/tasks/job123abc456/events",
+            json={
+                "terminal": {
+                    "status": "published",
+                    "result": {"mode": "new_pr", "pr_number": 42},
+                    "error": None,
+                }
+            },
+            headers={"Authorization": "Bearer tok"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(job.status, "published")
+        self.assertEqual(job.task_result["pr_number"], 42)
+
+    def test_ingest_terminal_records_error(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        job = self._make_job(webapp, callback_token="tok")
+        client = TestClient(webapp.app)
+        r = client.post(
+            "/internal/tasks/job123abc456/events",
+            json={"terminal": {"status": "error", "error": "boom"}},
+            headers={"Authorization": "Bearer tok"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(job.status, "error")
+        self.assertEqual(job.error, "boom")
 
 
 if __name__ == "__main__":

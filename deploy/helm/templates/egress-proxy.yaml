@@ -1,0 +1,153 @@
+{{- if .Values.taskExecution.kubernetes.enabled }}
+{{- $t := .Values.taskExecution.kubernetes }}
+{{- $egress := $t.egress }}
+{{- $name := printf "%s-egress" (include "name" .) }}
+# ---------------------------------------------------------------------------
+# serge-egress: the allowlisting forward proxy for per-task runner pods
+# (SERGE_PERTASK_POD_PLAN.md, "Network firewall"). Task pods have no direct
+# egress; they route git + LLM traffic through this proxy, which CONNECT-allows
+# only GitHub + the HF LLM. A *separate* Deployment (not a sidecar): sidecars
+# share the pod netns, so a NetworkPolicy could not grant the proxy egress
+# without also granting the arbitrary repo code the same egress.
+# ---------------------------------------------------------------------------
+{{- if not $egress.image }}
+{{- fail "taskExecution.kubernetes.enabled requires taskExecution.kubernetes.egress.image (a tinyproxy image)" }}
+{{- end }}
+{{- if not .Values.serviceAccount.create }}
+{{- fail "taskExecution.kubernetes.enabled requires serviceAccount.create=true" }}
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "labels.standard" . | nindent 4 }}
+data:
+  tinyproxy.conf: |
+    Port {{ $egress.port }}
+    Listen 0.0.0.0
+    Timeout 600
+    # Client ACL: allow any source — the NetworkPolicy below is what restricts
+    # *who* can reach the proxy (only the task pods).
+    Allow 0.0.0.0/0
+    # Only CONNECT to 443 (HTTPS git + LLM). No plaintext ports.
+    ConnectPort 443
+    # Allowlist: deny every host except those matching the filter regexes.
+    FilterDefaultDeny Yes
+    Filter "/etc/tinyproxy/filter"
+    FilterExtended On
+    FilterCaseSensitive Off
+    PidFile "/tmp/tinyproxy.pid"
+    LogLevel Info
+  filter: |
+    {{- range $egress.allowDomains }}
+    {{ . }}
+    {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "labels.standard" . | nindent 4 }}
+spec:
+  replicas: {{ $egress.replicas }}
+  selector:
+    matchLabels:
+      app: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app: {{ $name }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: tinyproxy
+          image: {{ $egress.image | quote }}
+          command: ["tinyproxy", "-d", "-c", "/etc/tinyproxy/tinyproxy.conf"]
+          ports:
+            - containerPort: {{ $egress.port }}
+              name: proxy
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources: {{ toYaml $egress.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tinyproxy
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "labels.standard" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ $name }}
+  ports:
+    - name: proxy
+      port: {{ $egress.port }}
+      targetPort: proxy
+      protocol: TCP
+---
+# The proxy itself may reach the internet on :443 (it does the allowlisted
+# CONNECTs) and resolve names via kube-dns. Nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "labels.standard" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ $name }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only the task pods may reach the proxy, on the proxy port.
+    - from:
+        - podSelector:
+            matchLabels:
+              serge.io/task-pod: "true"
+      ports:
+        - protocol: TCP
+          port: {{ $egress.port }}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $t.kubeDns.namespace }}
+          podSelector:
+            matchLabels: {{ toYaml $t.kubeDns.podLabels | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}

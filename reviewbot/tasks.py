@@ -296,6 +296,23 @@ def resolve_existing_pr(gh: GitHubClient, req: TaskRequest, cfg: Config) -> str:
     return head_branch
 
 
+def format_pr_files_diff(files: list[dict[str, Any]], *, limit: int = 30000) -> str:
+    """Concatenate a PR's per-file patches into a single blob used as the
+    "prior attempt" context on an existing_pr follow-up. Best-effort and
+    purely informational — not meant to be re-applied."""
+    parts: list[str] = []
+    total = 0
+    for f in files:
+        patch = f.get("patch") or ""
+        chunk = f"--- {f.get('filename')} ---\n{patch}\n"
+        parts.append(chunk)
+        total += len(chunk)
+        if total >= limit:
+            parts.append("[... prior attempt truncated ...]")
+            break
+    return "\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Agentic loop → patch (with in-loop normalize validation)
 # ---------------------------------------------------------------------------
@@ -361,16 +378,6 @@ def _validate_patch(
             mode=cfg.helper_sandbox,
             timeout=cfg.task_normalize_timeout,
             memory=cfg.task_normalize_memory,
-            # k8s wiring is passed as plain values; run_normalize only uses it
-            # (and imports the optional k8s_sandbox/kubernetes client) when the
-            # kubernetes backend is selected, so non-k8s deploys never touch it.
-            k8s_namespace=cfg.task_k8s_namespace,
-            k8s_worktree_pvc=cfg.task_k8s_worktree_pvc,
-            k8s_worktree_volume_root=(
-                cfg.task_k8s_worktree_volume_root or cfg.web_clone_cache_dir or None
-            ),
-            k8s_service_account=cfg.task_k8s_service_account,
-            k8s_node_selector=cfg.task_k8s_node_selector,
         )
     except NormalizeError as exc:
         # Infrastructure problem (sandbox unavailable, timeout) — not the

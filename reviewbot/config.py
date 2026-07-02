@@ -168,6 +168,39 @@ class Config:
     # Cap on serge-authored commits per fix branch (follow-up loop guard).
     task_max_followups: int = 5
 
+    # --- Task execution backend (per-task-pod model) ------------------
+    # How the write-capable /tasks flow executes each task
+    # (SERGE_PERTASK_POD_PLAN.md):
+    #   "inprocess" (default) — run the agent loop in a serge thread pool
+    #       (the legacy path);
+    #   "docker"    — launch a per-task runner container
+    #       (``reviewbot-task-runner``) that runs the whole loop + normalize
+    #       and streams results back over the HTTP callback;
+    #   "kubernetes"— launch a per-task runner Job (Phase 3).
+    # The flag keeps the pod-per-task rollout reversible.
+    task_execution: str = "inprocess"
+    # Runner image for the docker/kubernetes backends (reviewbot layered on
+    # the repo toolchain — see docker/Dockerfile.task-runner).
+    task_runner_image: Optional[str] = None
+    # Base URL the runner POSTs events + the terminal result back to
+    # (``{base}/internal/tasks/{job_id}/events``). In k8s this is serge's
+    # in-cluster Service URL; for docker-on-host it points at the serge host
+    # (e.g. http://host.docker.internal:8000, or http://localhost:8000 with
+    # ``--network host``).
+    task_callback_base_url: Optional[str] = None
+    # Wall-clock cap (seconds) on a single runner container/Job.
+    task_runner_timeout: int = 3600
+    # docker backend egress firewall: the network the runner attaches to (an
+    # ``internal`` net in prod, or "host" for local e2e) and the allowlisting
+    # forward proxy egress is routed through (see launcher.DockerLaunchOptions).
+    task_runner_network: Optional[str] = None
+    task_runner_proxy: Optional[str] = None
+    # Hosts that bypass the egress proxy — in kubernetes this must include
+    # serge's own callback host (the callback goes straight to the serge pod,
+    # not through the allowlisting gateway). Comma-separated, as NO_PROXY.
+    task_runner_no_proxy: Optional[str] = None
+    task_runner_memory: Optional[str] = None
+
     # --- Post-LLM normalize hook --------------------------------------
     # After the LLM patch is applied to the worktree and before serge
     # commits, optionally run the target repo's own normalizer (e.g. ``make
@@ -198,18 +231,13 @@ class Config:
     # conventions. Operator config, never request-supplied.
     task_normalize_guidance: Optional[str] = None
     task_sandbox_backend: str = sandbox.AUTO_BACKEND
-    # Kubernetes normalize backend (TASK_SANDBOX_BACKEND=kubernetes). The Job
-    # runs the normalizer on the worktree, which serge writes to a shared RWX
-    # PVC. ``task_k8s_namespace`` defaults to the in-cluster namespace at
-    # runtime; ``task_k8s_worktree_pvc`` is the claim the Job mounts;
-    # ``task_k8s_worktree_volume_root`` is where that PVC is mounted in serge
-    # (defaults to the clone-cache dir) — the worktree's path *relative* to it
-    # becomes the Job's volume subPath, so the Job sees only its own worktree.
+    # Kubernetes placement for the per-task runner Jobs (TASK_EXECUTION=
+    # kubernetes; see SERGE_PERTASK_POD_PLAN.md). ``task_k8s_namespace`` defaults
+    # to the in-cluster namespace at runtime; ``task_k8s_service_account`` is the
+    # task *pods'* SA (they hold no API token regardless).
     task_k8s_namespace: Optional[str] = None
-    task_k8s_worktree_pvc: Optional[str] = None
-    task_k8s_worktree_volume_root: Optional[str] = None
     task_k8s_service_account: Optional[str] = None
-    # nodeSelector for the normalize Job pods, as "key=value,key2=value2"
+    # nodeSelector for the task Job pods, as "key=value,key2=value2"
     # (e.g. "scheduling.cast.ai/node-template=default-by-castai").
     task_k8s_node_selector: Optional[str] = None
     # Optional Slack notification for PRs created by the /tasks flow.
@@ -224,14 +252,12 @@ class Config:
         rather than a linked worktree.
 
         True only when an in-loop normalizer runs inside a container sandbox
-        that binds *just* the worktree (``docker``/``kubernetes``, and
-        ``auto`` which may resolve to docker), so in-sandbox git works. When
-        normalize is unconfigured, or the dev-only ``bwrap`` backend is used,
-        the cheaper linked worktree is kept (see
-        :meth:`CloneCache.acquire_ref`)."""
+        that binds *just* the worktree (``docker``, and ``auto`` which may
+        resolve to docker), so in-sandbox git works. When normalize is
+        unconfigured, or the dev-only ``bwrap`` backend is used, the cheaper
+        linked worktree is kept (see :meth:`CloneCache.acquire_ref`)."""
         return bool(self.task_normalize_command) and self.task_sandbox_backend in (
             sandbox.DOCKER_BACKEND,
-            sandbox.KUBERNETES_BACKEND,
             sandbox.AUTO_BACKEND,
         )
 
@@ -262,6 +288,15 @@ class Config:
                 raise RuntimeError(
                     f"Missing required env vars for {mode}: " + ", ".join(missing)
                 )
+
+        task_execution = (
+            os.environ.get("TASK_EXECUTION") or "inprocess"
+        ).strip().lower() or "inprocess"
+        if task_execution not in ("inprocess", "docker", "kubernetes"):
+            raise RuntimeError(
+                "TASK_EXECUTION must be one of inprocess|docker|kubernetes, "
+                f"got {task_execution!r}"
+            )
 
         oauth_client_id = os.environ.get("GITHUB_OAUTH_CLIENT_ID") or None
         oauth_client_secret = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET") or None
@@ -395,6 +430,22 @@ class Config:
             ),
             task_tool_max_iterations=(_int_env("TASK_TOOL_MAX_ITERATIONS", 0) or None),
             task_max_followups=_int_env("TASK_MAX_FOLLOWUPS", 5),
+            task_execution=task_execution,
+            task_runner_image=(os.environ.get("TASK_RUNNER_IMAGE") or "").strip()
+            or None,
+            task_callback_base_url=(os.environ.get("TASK_CALLBACK_BASE_URL") or "")
+            .strip()
+            .rstrip("/")
+            or None,
+            task_runner_timeout=_int_env("TASK_RUNNER_TIMEOUT", 3600),
+            task_runner_network=(os.environ.get("TASK_RUNNER_NETWORK") or "").strip()
+            or None,
+            task_runner_proxy=(os.environ.get("TASK_RUNNER_PROXY") or "").strip()
+            or None,
+            task_runner_no_proxy=(os.environ.get("TASK_RUNNER_NO_PROXY") or "").strip()
+            or None,
+            task_runner_memory=(os.environ.get("TASK_RUNNER_MEMORY") or "").strip()
+            or None,
             task_normalize_command=(
                 shlex.split(os.environ.get("TASK_NORMALIZE_COMMAND") or "") or None
             ),
@@ -414,14 +465,6 @@ class Config:
                 os.environ.get("TASK_SANDBOX_BACKEND")
             ),
             task_k8s_namespace=(os.environ.get("TASK_K8S_NAMESPACE") or "").strip()
-            or None,
-            task_k8s_worktree_pvc=(
-                os.environ.get("TASK_K8S_WORKTREE_PVC") or ""
-            ).strip()
-            or None,
-            task_k8s_worktree_volume_root=(
-                os.environ.get("TASK_K8S_WORKTREE_VOLUME_ROOT") or ""
-            ).strip()
             or None,
             task_k8s_service_account=(
                 os.environ.get("TASK_K8S_SERVICE_ACCOUNT") or ""

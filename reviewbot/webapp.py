@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -46,6 +47,17 @@ from .github_auth import (
     user_is_org_member,
 )
 from .github_client import GitHubClient
+from .k8s_sandbox import K8sSandboxError, parse_node_selector
+from .launcher import (
+    DockerLaunchOptions,
+    K8sLaunchOptions,
+    build_spec,
+    launch_docker,
+    launch_kubernetes,
+    runner_config,
+)
+from .errors import format_github_http_error as _format_github_http_error
+from .errors import format_llm_error as _format_llm_error
 from .llm_client import LLMResponseError
 from .oidc import OIDCError, verify_token
 from .reviewer import (
@@ -65,6 +77,7 @@ from .tasks import (
     TaskResult,
     TaskRequest,
     build_task_request,
+    format_pr_files_diff,
     prepare_task,
     publish_task,
     resolve_existing_pr,
@@ -290,6 +303,10 @@ class Job:
     # "use the deployment default" (cfg.llm_max_input_tokens); 0 disables
     # the cap. In-memory only — consumed by the worker, never persisted.
     llm_max_input_tokens: Optional[int] = None
+    # Per-job bearer token authenticating the runner's callback POSTs
+    # (docker/kubernetes execution backends). Minted at launch, cleared when
+    # the launcher thread returns. In-memory only — never persisted or returned.
+    callback_token: Optional[str] = None
     # "web" for jobs the logged-in user submitted through the UI; "webhook"
     # for reviews kicked off by a GitHub comment. Webhook jobs have no
     # owning UI user, so any authenticated viewer may follow them.
@@ -811,21 +828,6 @@ def _persist_terminal(job: Job) -> None:
         log.exception("failed to persist terminal state for job %s", job.id)
 
 
-def _format_llm_error(exc: LLMResponseError) -> str:
-    """Render an LLMResponseError for the SSE client. Surfaces the status
-    code + a body excerpt so the UI shows whether it was a 429 (rate
-    limit), 400 (bad schema), auth, etc. instead of a generic "review
-    crashed". The body comes from the LLM provider's own error response —
-    no auth tokens of ours are echoed there."""
-    excerpt = exc.body_preview.strip()
-    if len(excerpt) > 600:
-        excerpt = excerpt[:600] + "…"
-    reason_part = f" {exc.reason}" if exc.reason else ""
-    if excerpt:
-        return f"LLM endpoint returned {exc.status_code}{reason_part}: {excerpt}"
-    return f"LLM endpoint returned {exc.status_code}{reason_part}"
-
-
 def _post_webhook_failure_comment(
     gh: GitHubClient,
     req: ReviewRequest,
@@ -851,24 +853,6 @@ def _post_webhook_failure_comment(
             req.number,
             exc,
         )
-
-
-def _format_github_http_error(exc: requests.HTTPError) -> str:
-    """Render a GitHub REST error for the task SSE client. The message comes
-    from GitHub's own response (no serge tokens), so it's safe to surface and
-    far more actionable than a generic "task crashed". Adds a hint for the
-    common write-permission failure on the /tasks flow."""
-    msg = str(exc) or "GitHub API request failed"
-    status_code = getattr(getattr(exc, "response", None), "status_code", None)
-    lowered = msg.lower()
-    if status_code == 403 or "resource not accessible by integration" in lowered:
-        msg += (
-            "\n\nHint: the GitHub App installation lacks write access. The "
-            "/tasks flow needs Contents: write + Pull requests: write — grant "
-            "those in the App settings and re-accept the installation on the "
-            "org/repo."
-        )
-    return msg
 
 
 def _execute_review(
@@ -1075,23 +1059,6 @@ def _run_review_worker(job: Job) -> None:
     _execute_review(job, worker_cfg, gh, token, req, auto_publish=False)
 
 
-def _format_pr_files_diff(files: list[dict[str, Any]], *, limit: int = 30000) -> str:
-    """Concatenate a PR's per-file patches into a single blob used as the
-    "prior attempt" context on an existing_pr follow-up. Best-effort and
-    purely informational — not meant to be re-applied."""
-    parts: list[str] = []
-    total = 0
-    for f in files:
-        patch = f.get("patch") or ""
-        chunk = f"--- {f.get('filename')} ---\n{patch}\n"
-        parts.append(chunk)
-        total += len(chunk)
-        if total >= limit:
-            parts.append("[... prior attempt truncated ...]")
-            break
-    return "\n".join(parts)
-
-
 def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
     """Run a write-capable task on the dedicated task pool: check out the
     base (or serge fix branch), run the agentic loop to produce a patch,
@@ -1124,7 +1091,7 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             ref_to_checkout = head_branch
             try:
                 pr_files = gh.get_pr_files(req.owner, req.repo, req.pr_number or 0)
-                existing_diff = _format_pr_files_diff(pr_files)
+                existing_diff = format_pr_files_diff(pr_files)
             except Exception:  # noqa: BLE001
                 log.debug("could not fetch prior-attempt diff", exc_info=True)
         else:
@@ -1264,6 +1231,142 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
     finally:
         _notify_task_finished(worker_cfg, req, job)
         _clone_cache.release(checkout)
+        _persist_terminal(job)
+
+
+def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
+    """Out-of-process launcher for the write-capable /tasks flow (Phase 2 of
+    SERGE_PERTASK_POD_PLAN.md).
+
+    Instead of running the agent loop in a serge thread (``_run_task_worker``),
+    serge mints the short-lived GitHub installation token + a per-job callback
+    token, builds the task spec, and starts a per-task runner container. The
+    runner runs the whole loop + in-process normalize and streams every event
+    and the terminal outcome back to ``POST /internal/tasks/{id}/events``.
+
+    This thread blocks on the container (block-in-pool, mirroring the in-process
+    pool — see the plan's "Launcher watch" open question) so a runner that dies
+    without ever reporting a terminal callback still reconciles to ``error``.
+    Terminal ``status``/``result`` for the happy path are set by the callback
+    ingest endpoint; this thread only handles launch failures + the crash sweep,
+    then notifies Slack and persists the terminal snapshot exactly like the
+    in-process worker."""
+
+    def emit(kind: str, text: str) -> None:
+        _push_event(job, kind, text)
+
+    try:
+        if cfg.task_execution not in ("docker", "kubernetes"):
+            raise TaskError(
+                f"task_execution={cfg.task_execution!r} is not a launcher backend",
+                status_code=501,
+            )
+        if not cfg.task_runner_image:
+            raise TaskError("TASK_RUNNER_IMAGE is not configured", status_code=500)
+        if not cfg.task_callback_base_url:
+            raise TaskError("TASK_CALLBACK_BASE_URL is not configured", status_code=500)
+
+        assert cfg.github_app_id and cfg.github_private_key
+        installation_id = installation_id_for_repo(
+            cfg.github_app_id, cfg.github_private_key, req.owner, req.repo
+        )
+        token = installation_token(
+            cfg.github_app_id, cfg.github_private_key, installation_id
+        )
+        callback_token = secrets.token_urlsafe(32)
+        job.callback_token = callback_token
+
+        spec = build_spec(
+            job_id=job.id,
+            request=dataclasses.asdict(req),
+            github_token=token,
+            llm={
+                "api_base": worker_cfg.llm_api_base,
+                "api_key": worker_cfg.llm_api_key,
+                "model": worker_cfg.llm_model,
+                "bill_to": worker_cfg.llm_bill_to,
+                "stream": worker_cfg.llm_stream,
+            },
+            config=runner_config(worker_cfg),
+            callback_url=(
+                f"{cfg.task_callback_base_url}/internal/tasks/{job.id}/events"
+            ),
+            callback_token=callback_token,
+        )
+        emit("step", "launch")
+        emit(
+            "log",
+            f"Launching task runner ({cfg.task_execution}: {cfg.task_runner_image})…",
+        )
+        # Both backends block until the runner pod/container exits; the runner
+        # POSTs its terminal callback (synchronously) before it exits, so by the
+        # time this returns the ingest endpoint has already recorded the outcome.
+        if cfg.task_execution == "docker":
+            code, _out = launch_docker(
+                spec,
+                DockerLaunchOptions(
+                    image=cfg.task_runner_image,
+                    network=cfg.task_runner_network,
+                    proxy=cfg.task_runner_proxy,
+                    memory=cfg.task_runner_memory,
+                    name=f"serge-task-{job.id[:12]}",
+                ),
+                wait=True,
+                timeout=cfg.task_runner_timeout,
+            )
+        else:  # kubernetes
+            code, _out = launch_kubernetes(
+                spec,
+                K8sLaunchOptions(
+                    image=cfg.task_runner_image,
+                    namespace=cfg.task_k8s_namespace,
+                    service_account=cfg.task_k8s_service_account,
+                    node_selector=parse_node_selector(cfg.task_k8s_node_selector),
+                    proxy=cfg.task_runner_proxy,
+                    no_proxy=cfg.task_runner_no_proxy,
+                    memory=cfg.task_runner_memory,
+                ),
+                timeout=cfg.task_runner_timeout,
+            )
+        if job.status == "running":
+            # Runner exited without a terminal callback → crashed / OOM /
+            # evicted before it could report. Reconcile to error.
+            log.warning(
+                "task %s runner exited (code=%s) with no terminal callback",
+                job.id,
+                code,
+            )
+            job.status = "error"
+            job.error = f"task runner exited without reporting (exit code {code})"
+            emit("step", "error")
+            emit("error", job.error)
+            emit("done", "")
+    except (TaskError, AppNotInstalledError, K8sSandboxError) as exc:
+        log.warning("task %s launch failed: %s", job.id, exc)
+        job.status = "error"
+        job.error = str(exc)
+        emit("step", "error")
+        emit("error", job.error)
+        emit("done", "")
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "task %s runner timed out after %ss", job.id, cfg.task_runner_timeout
+        )
+        job.status = "error"
+        job.error = f"task runner timed out after {cfg.task_runner_timeout}s"
+        emit("step", "error")
+        emit("error", job.error)
+        emit("done", "")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("task launcher crashed for job %s", job.id)
+        job.status = "error"
+        job.error = f"{type(exc).__name__}: task launch crashed (see server log)"
+        emit("step", "error")
+        emit("error", job.error)
+        emit("done", "")
+    finally:
+        job.callback_token = None
+        _notify_task_finished(worker_cfg, req, job)
         _persist_terminal(job)
 
 
@@ -2230,9 +2333,14 @@ async def submit_task(request: Request) -> JSONResponse:
         task_spec_json=_json.dumps(spec_summary),
     )
     _prune_store()
-    _TASK_POOL.submit(_run_task_worker, job, worker_cfg, req)
+    # inprocess: run the loop in a serge thread (legacy). docker/kubernetes:
+    # launch a per-task runner and stream results back via the callback
+    # (SERGE_PERTASK_POD_PLAN.md). The flag makes rollout reversible.
+    worker = _run_task_worker if cfg.task_execution == "inprocess" else _launch_task_pod
+    _TASK_POOL.submit(worker, job, worker_cfg, req)
     log.info(
-        "queued task %s for %s/%s (mode=%s pr=%s) by actor=%s using %s model=%s",
+        "queued task %s for %s/%s (mode=%s pr=%s) by actor=%s using %s model=%s "
+        "(execution=%s)",
         job.id,
         owner,
         repo,
@@ -2241,6 +2349,7 @@ async def submit_task(request: Request) -> JSONResponse:
         claims.actor,
         provider,
         llm_model or "<auto>",
+        cfg.task_execution,
     )
     return JSONResponse(
         status_code=202,
@@ -2251,6 +2360,59 @@ async def submit_task(request: Request) -> JSONResponse:
             "url": f"/tasks/{owner}/{repo}/{job.id}",
         },
     )
+
+
+@app.post("/internal/tasks/{job_id}/events")
+async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
+    """Callback sink for the per-task runner (docker/kubernetes backends).
+
+    The runner POSTs each streaming event and one terminal outcome here (see
+    ``task_runner.CallbackEmitter``), authenticated by the unguessable per-job
+    bearer token serge minted at launch. Internal only — not part of the public
+    API: the sole authorization is the per-job token plus a live task job, so a
+    finished job (token cleared) or a wrong token is rejected. An *event* is
+    pushed onto the job's SSE stream; a *terminal* payload records the final
+    ``status``/``result``/``error`` (the launcher thread then persists +
+    notifies, exactly as for the in-process worker)."""
+    token = _bearer_token(request)
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if (
+        job is None
+        or job.kind != "task"
+        or not job.callback_token
+        or not hmac.compare_digest(token, job.callback_token)
+    ):
+        raise HTTPException(status_code=401, detail="invalid_callback_token")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_json_body")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid_json_body")
+
+    terminal = payload.get("terminal")
+    if isinstance(terminal, dict):
+        result = terminal.get("result")
+        if isinstance(result, dict):
+            job.task_result = result
+            try:
+                _store.save_task_result(job.id, _json.dumps(result))
+            except Exception:  # noqa: BLE001
+                log.exception("failed to persist task result for %s", job.id)
+        if terminal.get("error"):
+            job.error = str(terminal["error"])
+        if terminal.get("raw_llm_output"):
+            job.raw_llm_output = str(terminal["raw_llm_output"])
+        job.status = (terminal.get("status") or "error").strip() or "error"
+    else:
+        _push_event(
+            job,
+            str(payload.get("kind") or "log"),
+            str(payload.get("text") or ""),
+        )
+    return JSONResponse({"ok": True})
 
 
 @app.post("/reviews")

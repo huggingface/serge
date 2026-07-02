@@ -355,6 +355,14 @@ class CloneCache:
             auth_args = ["-c", f"http.extraHeader=Authorization: Basic {basic}"]
         redact = (token or "", basic)
 
+        # A standalone checkout is a physical ``git clone --no-hardlinks`` copy
+        # onto the (network) worktree volume; for a large repo on EFS that copy
+        # dominates and, under concurrent load, times out. Fetch only the branch
+        # tip so far fewer objects are copied — the normalizer runs on the
+        # worktree contents, not on history (single-branch already has no
+        # merge-base, so the checkers check all files regardless).
+        fetch_depth = 1 if standalone else depth
+
         lock = self._lock_for(bare)
         with lock:
             try:
@@ -366,10 +374,10 @@ class CloneCache:
                     "core.symlinks=false",
                     "fetch",
                     "--depth",
-                    str(depth),
+                    str(fetch_depth),
                     url,
                     f"+refs/heads/{ref}:{local_branch}",
-                    timeout=180,
+                    timeout=300,
                     redact=redact,
                 )
                 os.utime(bare, None)
@@ -396,7 +404,9 @@ class CloneCache:
                         ],
                         check=True,
                         capture_output=True,
-                        timeout=180,
+                        # Physical object copy onto EFS for a large repo; needs
+                        # generous headroom over the network filesystem.
+                        timeout=600,
                         env=self._env,
                     )
                     # Name the checked-out branch `main`: the transformers

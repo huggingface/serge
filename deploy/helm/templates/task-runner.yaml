@@ -1,0 +1,107 @@
+{{- if .Values.taskExecution.kubernetes.enabled }}
+{{- $t := .Values.taskExecution.kubernetes }}
+{{- $sa := .Values.serviceAccount.name | default (include "name" .) }}
+{{- $egress := printf "%s-egress" (include "name" .) }}
+# ---------------------------------------------------------------------------
+# Per-task-pod backend (TASK_EXECUTION=kubernetes): RBAC for serge to launch
+# task runner Jobs + per-job Secrets, and the allowlist-egress NetworkPolicy
+# the task pods run under. The serge-egress proxy lives in egress-proxy.yaml.
+# ---------------------------------------------------------------------------
+---
+# serge manages one-shot task Jobs, their per-job Secrets, and reads pod logs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "name" . }}-task-runner
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "labels.standard" . | nindent 4 }}
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # run_task_job polls read_namespaced_job_status (the jobs/status subresource),
+  # which RBAC treats separately from "jobs".
+  - apiGroups: ["batch"]
+    resources: ["jobs/status"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Per-job Secret carrying task.json (spec + short-lived GitHub token + LLM key
+  # + callback token), created/deleted per task.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "delete"]
+  # Read the egress proxy / serge Service ClusterIPs (callback + proxy wiring).
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "name" . }}-task-runner
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "labels.standard" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "name" . }}-task-runner
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+---
+# Allowlist egress for the task pods. They run arbitrary repo build code beside
+# the GitHub token + LLM key, so egress is locked to: (1) the serge-egress proxy
+# (all git + LLM traffic), (2) serge's callback port, (3) kube-dns (to resolve
+# the proxy + serge Service names). No other destination — no direct internet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "name" . }}-task-pod
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "labels.standard" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      serge.io/task-pod: "true"
+  policyTypes:
+    - Ingress
+    - Egress
+  # Task pods serve nothing; deny all ingress.
+  ingress: []
+  egress:
+    # DNS (proxy + serge Service name resolution).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $t.kubeDns.namespace }}
+          podSelector:
+            matchLabels: {{ toYaml $t.kubeDns.podLabels | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The allowlisting egress proxy (git + LLM go through here).
+    - to:
+        - podSelector:
+            matchLabels:
+              app: {{ $egress }}
+      ports:
+        - protocol: TCP
+          port: {{ $t.egress.port }}
+    # serge's HTTP callback (event stream + terminal result).
+    - to:
+        - podSelector:
+            matchLabels:
+              app: {{ include "app.name" . }}
+              release: {{ .Release.Name | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.containerPort }}
+{{- end }}

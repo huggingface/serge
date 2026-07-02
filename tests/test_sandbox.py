@@ -7,7 +7,6 @@ from reviewbot.sandbox import (
     AUTO_BACKEND,
     BWRAP_BACKEND,
     DOCKER_BACKEND,
-    KUBERNETES_BACKEND,
     OFF,
     REQUIRE,
     DockerUnavailable,
@@ -96,12 +95,13 @@ class NormalizeBackendTests(unittest.TestCase):
         self.assertEqual(normalize_backend("docker"), DOCKER_BACKEND)
         self.assertEqual(normalize_backend(" BWRAP "), BWRAP_BACKEND)
         self.assertEqual(normalize_backend("auto"), AUTO_BACKEND)
-        self.assertEqual(normalize_backend("KUBERNETES"), KUBERNETES_BACKEND)
 
     def test_unknown_and_blank_default_to_auto(self):
         self.assertEqual(normalize_backend(None), AUTO_BACKEND)
         self.assertEqual(normalize_backend(""), AUTO_BACKEND)
         self.assertEqual(normalize_backend("podman"), AUTO_BACKEND)
+        # kubernetes is no longer a normalize backend (per-task-pod model).
+        self.assertEqual(normalize_backend("kubernetes"), AUTO_BACKEND)
 
 
 class BuildDockerArgvTests(unittest.TestCase):
