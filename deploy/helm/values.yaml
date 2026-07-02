@@ -85,44 +85,11 @@ existingSecret: ""
 extraEnv: []
 extraEnvFrom: []
 
-# In-loop normalize gate (TASK_SANDBOX_BACKEND=kubernetes): run each task's
-# normalizer in a one-shot, locked-down Kubernetes Job. When enabled, the chart
-# creates the RBAC (serge's SA may manage Jobs/pods/logs), a shared RWX worktree
-# PVC, and a deny-all-egress NetworkPolicy for the Job pods, and wires the TASK_*
-# env. Leave disabled for docker/bwrap deployments — Kubernetes is never
-# mandatory. Requires serviceAccount.create=true (the RoleBinding targets it).
-normalize:
-  kubernetes:
-    enabled: false
-    # Image with the repo toolchain baked in (TASK_NORMALIZE_IMAGE). The Job
-    # has no network, so everything must already be in the image.
-    image: ""
-    # Shell-style command for TASK_NORMALIZE_COMMAND (parsed with shlex). Curate
-    # it to exclude network/git-history-only checkers such as add_dates, e.g.
-    #   bash -lc 'make style && python utils/checkers.py <checkers> --fix --keep-going'
-    command: ""
-    timeout: 1800
-    memory: ""          # optional Job memory limit (e.g. 4Gi)
-    maxRetries: 2
-    guidance: ""        # optional TASK_NORMALIZE_GUIDANCE
-    reviewRulesPath: "" # optional REVIEW_RULES_PATH (e.g. .ai/AGENTS.md)
-    namespace: ""       # Job namespace; "" = the release namespace
-    # ServiceAccount for the Job *pods* (not serge). "" uses the namespace
-    # default; the pod gets no API token regardless (automountServiceAccountToken
-    # is false), so it needs no permissions.
-    podServiceAccount: ""
-    # nodeSelector for the Job pods, as "key=value,key2=value2". On CASTAI
-    # clusters, target a node template, e.g.
-    # "scheduling.cast.ai/node-template=default-by-castai".
-    nodeSelector: ""
-    # Shared ReadWriteMany volume for task worktrees: serge writes the
-    # self-contained clone here and the Job mounts the same claim (by subPath).
-    # REQUIRES a storage class that supports ReadWriteMany (EFS, Filestore, ...).
-    # WEB_CLONE_CACHE_DIR is set to mountPath so the cache lives on this volume.
-    worktree:
-      mountPath: /var/lib/reviewbot-clones
-      storageClass: ""
-      size: 20Gi
+# In-loop normalize for the /tasks flow runs in-process. For docker/inprocess
+# deployments, configure it directly via envVars (TASK_NORMALIZE_COMMAND,
+# TASK_NORMALIZE_IMAGE, TASK_SANDBOX_BACKEND=docker|bwrap, ...). For the
+# kubernetes backend below, normalize runs in-process inside the task pod, so no
+# separate normalize Job / worktree PVC is needed.
 
 # Per-task-pod execution (TASK_EXECUTION=kubernetes) — SERGE_PERTASK_POD_PLAN.md.
 # Each /tasks request runs in its own one-shot runner Job that does the whole
@@ -133,10 +100,9 @@ normalize:
 # the task pods (egress only to the serge-egress proxy, serge's callback, and
 # kube-dns), and (3) the serge-egress forward proxy (Deployment + Service +
 # NetworkPolicy) that CONNECT-allowlists GitHub + the HF LLM only.
-# Mutually exclusive with normalize.kubernetes (that spawns nested normalize
-# Jobs; here normalize runs in-process in the task pod). Requires
-# serviceAccount.create=true. Kubernetes is never mandatory — leave disabled for
-# docker/inprocess deployments.
+# Normalize runs in-process inside the task pod (no separate normalize Job).
+# Requires serviceAccount.create=true. Kubernetes is never mandatory — leave
+# disabled for docker/inprocess deployments.
 taskExecution:
   kubernetes:
     enabled: false

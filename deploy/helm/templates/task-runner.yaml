@@ -7,9 +7,6 @@
 # task runner Jobs + per-job Secrets, and the allowlist-egress NetworkPolicy
 # the task pods run under. The serge-egress proxy lives in egress-proxy.yaml.
 # ---------------------------------------------------------------------------
-{{- if .Values.normalize.kubernetes.enabled }}
-{{- fail "taskExecution.kubernetes and normalize.kubernetes are mutually exclusive (the task pod runs normalize in-process; it does not spawn nested normalize Jobs)" }}
-{{- end }}
 ---
 # serge manages one-shot task Jobs, their per-job Secrets, and reads pod logs.
 apiVersion: rbac.authorization.k8s.io/v1
