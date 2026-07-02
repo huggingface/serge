@@ -54,7 +54,10 @@ jobs:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID_AI_REVIEW }}
           oauth-secret: ${{ secrets.TS_AUDIENCE_AI_REVIEW }}
           tags: tag:ci
-          args: --accept-dns=false
+          # --accept-routes is required so the runner installs the subnet route
+          # advertised for the VPC and can reach the internal ALB's private IP.
+          # (DNS stays public: serge.huggingface.tech resolves fine already.)
+          args: --accept-dns=false --accept-routes
 
       - name: Mint OIDC token and POST /tasks
         env:
