@@ -155,6 +155,64 @@ class CloneCacheTests(unittest.TestCase):
         # dropped rather than trusted.
         self.assertFalse(os.path.exists(os.path.join(co.path, ".ai")))
 
+    def _acquire_standalone(self, number=1, job_id="job-sa"):
+        return self.cache.acquire(
+            token="",
+            owner="acme",
+            repo="widget",
+            number=number,
+            job_id=job_id,
+            remote_url=self.src,
+            standalone=True,
+        )
+
+    def test_standalone_checkout_is_self_contained(self):
+        # A per-review pod binds only the checkout dir, so its .git must be a
+        # real directory (not a linked-worktree pointer file) and git must work
+        # after the shared cache is gone.
+        co = self._acquire_standalone()
+        self.assertIsNotNone(co)
+        self.assertTrue(os.path.isdir(os.path.join(co.path, ".git")))
+        with open(os.path.join(co.path, "hello.txt")) as f:
+            self.assertEqual(f.read(), "hi from the PR\n")
+        import shutil as _shutil
+
+        _shutil.rmtree(os.path.join(self.cache.root, "repos"))
+        proc = subprocess.run(
+            ["git", "-C", co.path, "rev-parse", "--is-inside-work-tree"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", ""), "HOME": "/nonexistent"},
+        )
+        self.assertEqual(proc.stdout.strip(), "true")
+
+    def test_standalone_ai_overlay_uses_default_branch(self):
+        # The security-critical property must hold for the pod checkout too:
+        # .ai/ comes from the trusted default branch, never the fork PR head.
+        self._commit(".ai/rules.md", "UPSTREAM RULES\n")
+        _git(self.src, "checkout", "--quiet", "-b", "attacker-sa")
+        self._commit(".ai/rules.md", "MALICIOUS RULES\n")
+        self._commit("evil.sh", "#!/bin/sh\necho pwned\n")
+        _git(self.src, "update-ref", "refs/pull/4/head", "HEAD")
+        _git(self.src, "checkout", "--quiet", "main")
+
+        co = self._acquire_standalone(number=4, job_id="job-sa-overlay")
+        self.assertIsNotNone(co)
+        with open(os.path.join(co.path, ".ai", "rules.md")) as f:
+            self.assertEqual(f.read(), "UPSTREAM RULES\n")
+        self.assertTrue(os.path.isfile(os.path.join(co.path, "evil.sh")))
+
+    def test_standalone_ai_overlay_drops_pr_ai_when_default_has_none(self):
+        _git(self.src, "checkout", "--quiet", "-b", "attacker-sa2")
+        self._commit(".ai/context-script", "#!/bin/sh\necho pwned\n")
+        _git(self.src, "update-ref", "refs/pull/5/head", "HEAD")
+        _git(self.src, "checkout", "--quiet", "main")
+
+        co = self._acquire_standalone(number=5, job_id="job-sa-noai")
+        self.assertIsNotNone(co)
+        self.assertFalse(os.path.exists(os.path.join(co.path, ".ai")))
+
 
 class CloneCacheProxyEnvTests(unittest.TestCase):
     """The git subprocess env must carry the egress-proxy vars, or in-pod

@@ -225,6 +225,45 @@ class CloneCache:
             redact=redact,
         )
 
+    def _overlay_base_ai_standalone(
+        self,
+        wt: str,
+        url: str,
+        auth_args: list[str],
+        redact: tuple[str, ...],
+    ) -> None:
+        """Same fail-closed ``.ai/`` overlay as :meth:`_overlay_base_ai`, but for
+        a self-contained clone: the default branch is fetched straight into the
+        clone (which has its own object store, unlike a linked worktree)."""
+        ai_path = os.path.join(wt, _AI_DIR)
+        try:
+            self._git(
+                wt,
+                *auth_args,
+                "fetch",
+                "--depth",
+                "1",
+                url,
+                f"+HEAD:{_BASE_REF}",
+                timeout=120,
+                redact=redact,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            log.warning(
+                "could not fetch default branch for .ai overlay (%s); "
+                "dropping the PR's .ai/ to stay fail-closed",
+                type(exc).__name__,
+            )
+            shutil.rmtree(ai_path, ignore_errors=True)
+            return
+        shutil.rmtree(ai_path, ignore_errors=True)
+        exists = self._git(
+            wt, "cat-file", "-e", f"{_BASE_REF}:{_AI_DIR}", check=False, timeout=30
+        )
+        if exists.returncode != 0:
+            return
+        self._git(wt, "checkout", _BASE_REF, "--", _AI_DIR, timeout=60, redact=redact)
+
     # -- public API --------------------------------------------------------
 
     def acquire(
@@ -237,6 +276,7 @@ class CloneCache:
         job_id: str,
         depth: int = 50,
         remote_url: Optional[str] = None,
+        standalone: bool = False,
     ) -> Optional[Checkout]:
         """Fetch ``pull/<number>/head`` into the shared bare repo and add a
         worktree for this job. Returns the checkout, or ``None`` if anything
@@ -244,7 +284,13 @@ class CloneCache:
 
         ``remote_url`` defaults to the public GitHub HTTPS URL; it exists so
         tests can point at a local repo. When ``token`` is falsy no auth
-        header is attached (public repos / tests)."""
+        header is attached (public repos / tests).
+
+        ``standalone`` (see :meth:`acquire_ref`) makes a self-contained
+        ``git clone`` instead of a linked worktree, for a per-review pod whose
+        sandbox binds only the checkout dir (SERGE_ORCHESTRATOR_PODS_PLAN.md
+        Phase 3). The ``.ai/`` overlay still forces the config dir to the repo's
+        trusted default branch — fetched directly into the standalone clone."""
         bare = self._bare_path(owner, repo)
         branch = f"pr-{number}-{_slug(job_id)}"
         wt = os.path.join(
@@ -262,6 +308,10 @@ class CloneCache:
             auth_args = ["-c", f"http.extraHeader=Authorization: Basic {basic}"]
         redact = (token or "", basic)
 
+        # A pod copies the checkout onto ephemeral local scratch, so fetch only
+        # the PR tip (matches acquire_ref's standalone depth).
+        fetch_depth = 1 if standalone else depth
+
         lock = self._lock_for(bare)
         with lock:
             try:
@@ -273,7 +323,7 @@ class CloneCache:
                     "core.symlinks=false",
                     "fetch",
                     "--depth",
-                    str(depth),
+                    str(fetch_depth),
                     url,
                     f"pull/{number}/head:{branch}",
                     timeout=180,
@@ -281,24 +331,51 @@ class CloneCache:
                 )
                 # Mark the repo as recently used so GC keeps it alive.
                 os.utime(bare, None)
-                self._git(
-                    bare,
-                    "-c",
-                    "core.symlinks=false",
-                    "worktree",
-                    "add",
-                    "--quiet",
-                    wt,
-                    branch,
-                    timeout=60,
-                    redact=redact,
-                )
-                # Configuration under .ai/ must come from the repo's own
-                # default branch (upstream), never the PR head — a fork PR
-                # could otherwise ship a malicious .ai/context-script or
-                # helper-tool script that we'd execute. Replace the PR's
-                # .ai/ with the default branch's.
-                self._overlay_base_ai(bare, wt, url, auth_args, redact)
+                if standalone:
+                    # Self-contained clone (see acquire_ref's ``standalone``): the
+                    # per-review pod binds only the worktree, so the gitdir must
+                    # live inside it. ``--no-hardlinks`` keeps its objects
+                    # physically separate from the shared bare.
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "--quiet",
+                            "--local",
+                            "--no-hardlinks",
+                            "--single-branch",
+                            "--branch",
+                            branch,
+                            bare,
+                            wt,
+                        ],
+                        check=True,
+                        capture_output=True,
+                        timeout=600,
+                        env=self._env,
+                    )
+                    # Overlay the trusted default-branch .ai/ (fetched straight
+                    # into the standalone clone, which has its own object store).
+                    self._overlay_base_ai_standalone(wt, url, auth_args, redact)
+                else:
+                    self._git(
+                        bare,
+                        "-c",
+                        "core.symlinks=false",
+                        "worktree",
+                        "add",
+                        "--quiet",
+                        wt,
+                        branch,
+                        timeout=60,
+                        redact=redact,
+                    )
+                    # Configuration under .ai/ must come from the repo's own
+                    # default branch (upstream), never the PR head — a fork PR
+                    # could otherwise ship a malicious .ai/context-script or
+                    # helper-tool script that we'd execute. Replace the PR's
+                    # .ai/ with the default branch's.
+                    self._overlay_base_ai(bare, wt, url, auth_args, redact)
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
                 stderr = ""
                 if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:

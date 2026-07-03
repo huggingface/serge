@@ -179,9 +179,19 @@ class Config:
     #   "kubernetes"— launch a per-task runner Job (Phase 3).
     # The flag keeps the pod-per-task rollout reversible.
     task_execution: str = "inprocess"
+    # How PR reviews execute — same backends as ``task_execution``
+    # (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 3). "inprocess" runs the review loop
+    # in a serge thread (today's behaviour, no kube needed); "docker"/"kubernetes"
+    # run it in a per-review pod that streams the draft back over the callback.
+    # Defaults to "inprocess" so serge reviews without a cluster; podding is opt-in
+    # and reversible.
+    review_execution: str = "inprocess"
     # Runner image for the docker/kubernetes backends (reviewbot layered on
     # the repo toolchain — see docker/Dockerfile.task-runner).
     task_runner_image: Optional[str] = None
+    # Runner image for review pods. Reviews don't run ``make fix-repo``, so this
+    # can be a slimmer serge-base image; falls back to task_runner_image when unset.
+    review_runner_image: Optional[str] = None
     # Base URL the runner POSTs events + the terminal result back to
     # (``{base}/internal/tasks/{job_id}/events``). In k8s this is serge's
     # in-cluster Service URL; for docker-on-host it points at the serge host
@@ -296,6 +306,15 @@ class Config:
             raise RuntimeError(
                 "TASK_EXECUTION must be one of inprocess|docker|kubernetes, "
                 f"got {task_execution!r}"
+            )
+
+        review_execution = (
+            os.environ.get("REVIEW_EXECUTION") or "inprocess"
+        ).strip().lower() or "inprocess"
+        if review_execution not in ("inprocess", "docker", "kubernetes"):
+            raise RuntimeError(
+                "REVIEW_EXECUTION must be one of inprocess|docker|kubernetes, "
+                f"got {review_execution!r}"
             )
 
         oauth_client_id = os.environ.get("GITHUB_OAUTH_CLIENT_ID") or None
@@ -431,7 +450,10 @@ class Config:
             task_tool_max_iterations=(_int_env("TASK_TOOL_MAX_ITERATIONS", 0) or None),
             task_max_followups=_int_env("TASK_MAX_FOLLOWUPS", 5),
             task_execution=task_execution,
+            review_execution=review_execution,
             task_runner_image=(os.environ.get("TASK_RUNNER_IMAGE") or "").strip()
+            or None,
+            review_runner_image=(os.environ.get("REVIEW_RUNNER_IMAGE") or "").strip()
             or None,
             task_callback_base_url=(os.environ.get("TASK_CALLBACK_BASE_URL") or "")
             .strip()

@@ -722,6 +722,14 @@ def _encode_draft(draft: Optional[ReviewDraft]) -> Optional[str]:
     )
 
 
+def encode_draft(draft: Optional[ReviewDraft]) -> Optional[str]:
+    """Public wrapper over :func:`_encode_draft` — the review pod serializes its
+    draft with this and serge reconstructs it via :func:`decode_draft`
+    (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 3). Note: token counts are NOT in this
+    payload (they travel separately in the terminal callback)."""
+    return _encode_draft(draft)
+
+
 def decode_draft(s: Optional[str]) -> Optional[ReviewDraft]:
     if not s:
         return None
