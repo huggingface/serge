@@ -593,6 +593,15 @@ table.jobs-list td {
   text-align: left;
   padding: 8px 6px;
   border-bottom: 1px solid var(--border);
+  /* Pod/node/repo cells are long unbreakable identifiers; let them wrap
+     instead of overflowing the card. */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+/* Safety net for very wide tables (9 columns): scroll inside the card
+   rather than leaking past it. */
+.table-scroll {
+  overflow-x: auto;
 }
 table.jobs-list th {
   color: var(--muted);

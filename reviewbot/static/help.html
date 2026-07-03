@@ -15,7 +15,8 @@
     </div>
     <div class="right">
       <a href="/" class="secondary nav-link">New review</a>
-      <a href="/admin" class="secondary nav-link">Admin</a>
+      <a href="/admin" class="secondary nav-link">Settings</a>
+      <a href="/admin/pods" class="secondary nav-link">Pods</a>
       <a href="/journal" class="secondary nav-link">Journal</a>
       <a href="/help" class="secondary nav-link" aria-current="page">Help</a>
       <form method="post" action="/auth/logout" style="margin:0">
@@ -54,7 +55,7 @@
             Each review needs an LLM API key. Keys are stored per-repo (or per
             org) in the app's database so you can route different repos to
             different providers. Open the
-            <a href="/admin">Admin page</a> and click
+            <a href="/admin">Settings page</a> and click
             <strong>Add a provider config</strong>:
           </p>
           <ul>
