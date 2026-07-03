@@ -21,6 +21,9 @@ data:
   # callback to serge bypasses it (NO_PROXY).
   TASK_RUNNER_PROXY: "http://{{ $egress }}.{{ .Release.Namespace }}.svc.cluster.local:{{ $t.egress.port }}"
   TASK_RUNNER_NO_PROXY: ".svc.cluster.local,.svc,.cluster.local,localhost,127.0.0.1"
+  # serge keeps this proxy's allowlist in sync with the configured LLM
+  # provider hosts (built-in + dynamic per-repo provider_configs).
+  TASK_EGRESS_NAME: {{ $egress | quote }}
   TASK_CALLBACK_BASE_URL: {{ $t.callbackBaseUrl | default (printf "http://%s.%s.svc.cluster.local" (include "name" .) .Release.Namespace) | quote }}
   {{- with $t.namespace }}
   TASK_K8S_NAMESPACE: {{ . | quote }}

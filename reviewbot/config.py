@@ -250,6 +250,11 @@ class Config:
     # nodeSelector for the task Job pods, as "key=value,key2=value2"
     # (e.g. "scheduling.cast.ai/node-template=default-by-castai").
     task_k8s_node_selector: Optional[str] = None
+    # Name of the serge-egress ConfigMap + Deployment (both share this name).
+    # Set by helm to "<release>-egress". When set on the kubernetes backend,
+    # serge keeps the proxy's allowlist in sync with the configured LLM
+    # provider hosts (see webapp._sync_egress_allowlist). "" = never touch it.
+    task_egress_name: Optional[str] = None
     # Optional Slack notification for PRs created by the /tasks flow.
     # Defaults to the org-level CI feedback Slack secrets; the transformers CI
     # names remain supported as fallbacks.
@@ -495,6 +500,8 @@ class Config:
             task_k8s_node_selector=(
                 os.environ.get("TASK_K8S_NODE_SELECTOR") or ""
             ).strip()
+            or None,
+            task_egress_name=(os.environ.get("TASK_EGRESS_NAME") or "").strip()
             or None,
             slack_bot_token=(
                 os.environ.get("SLACK_CIFEEDBACK_BOT_TOKEN")

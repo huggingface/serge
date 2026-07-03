@@ -31,10 +31,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 log = logging.getLogger(__name__)
 
@@ -149,6 +151,114 @@ def _load_clients():
                 f"could not load kubernetes config (in-cluster or kubeconfig): {exc}"
             ) from exc
     return client.BatchV1Api(), client.CoreV1Api()
+
+
+# --- egress allowlist sync ---------------------------------------------------
+# The serge-egress proxy CONNECT-allows only the hosts in its tinyproxy filter
+# (rendered by helm as git + the default LLM host). But provider configs are
+# dynamic — an admin can add an OpenAI/Anthropic/custom-base provider on the
+# Settings page at any time, and pod-based reviews route their LLM call through
+# this proxy. So serge keeps the filter in sync with the configured LLM hosts.
+_EGRESS_FILTER_KEY = "filter"
+# Marks the last sync on the egress Deployment's pod template; changing it
+# triggers a rollout so tinyproxy re-reads its filter file on start.
+_EGRESS_SYNC_ANNOTATION = "serge.io/allowlist-synced-at"
+
+
+def _host_filter_regex(base: str) -> Optional[str]:
+    """ERE that matches exactly one host, for the tinyproxy allowlist. Accepts a
+    full URL or a bare host; returns ``None`` if no host can be parsed."""
+    raw = (base or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "https://" + raw
+    host = urllib.parse.urlparse(raw).hostname
+    if not host:
+        return None
+    return "^" + re.escape(host) + "$"
+
+
+def sync_egress_allowlist(
+    llm_bases: Iterable[str],
+    *,
+    egress_name: str,
+    namespace: Optional[str] = None,
+) -> bool:
+    """Ensure the ``serge-egress`` proxy allowlists every LLM host in
+    ``llm_bases`` (URLs or bare hosts). Additively unions the host regexes into
+    the proxy's tinyproxy filter ConfigMap; if anything was missing, patches the
+    ConfigMap and rollout-restarts the egress Deployment (both named
+    ``egress_name``) so tinyproxy re-reads the filter. Returns ``True`` when it
+    changed the allowlist.
+
+    Fail-soft by contract: any missing dependency or API error is logged and
+    swallowed (returns ``False``) so serge keeps serving — a stale allowlist
+    only affects reviews to not-yet-allowlisted LLM hosts, and never the app."""
+    if not egress_name:
+        return False
+    want = {rx for b in llm_bases if (rx := _host_filter_regex(b))}
+    if not want:
+        return False
+    try:
+        from kubernetes import client, config
+        from kubernetes.client.rest import ApiException
+    except ImportError:
+        log.warning("egress allowlist: kubernetes client unavailable; skipping sync")
+        return False
+
+    try:
+        try:
+            config.load_incluster_config()
+        except Exception:  # noqa: BLE001 - local kubeconfig (dev)
+            config.load_kube_config()
+        ns = resolve_namespace(K8sSettings(namespace=namespace))
+        core = client.CoreV1Api()
+        apps = client.AppsV1Api()
+
+        cm = core.read_namespaced_config_map(egress_name, ns)
+        current = (cm.data or {}).get(_EGRESS_FILTER_KEY, "") or ""
+        lines = [ln for ln in current.splitlines() if ln.strip()]
+        missing = sorted(want - set(lines))
+        if not missing:
+            return False
+
+        new_filter = "\n".join(lines + missing) + "\n"
+        core.patch_namespaced_config_map(
+            egress_name, ns, {"data": {_EGRESS_FILTER_KEY: new_filter}}
+        )
+        # tinyproxy reads its filter only at startup; roll the Deployment so the
+        # new pod picks up the patched ConfigMap.
+        apps.patch_namespaced_deployment(
+            egress_name,
+            ns,
+            {
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {_EGRESS_SYNC_ANNOTATION: str(time.time())}
+                        }
+                    }
+                }
+            },
+        )
+        log.info(
+            "egress allowlist: added %d LLM host(s) and rolled %s: %s",
+            len(missing),
+            egress_name,
+            ", ".join(missing),
+        )
+        return True
+    except ApiException as exc:
+        log.warning(
+            "egress allowlist sync failed (%s); reviews to newly-added LLM "
+            "hosts may be blocked until this succeeds",
+            getattr(exc, "reason", exc),
+        )
+        return False
+    except Exception:  # noqa: BLE001 - never let allowlist upkeep break serge
+        log.warning("egress allowlist sync failed", exc_info=True)
+        return False
 
 
 def _job_terminal(status) -> Optional[str]:

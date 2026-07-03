@@ -54,6 +54,7 @@ from .k8s_sandbox import (
     list_task_pods,
     parse_node_selector,
     poll_task_job,
+    sync_egress_allowlist,
 )
 from .launcher import (
     DockerLaunchOptions,
@@ -777,6 +778,55 @@ def _api_base_for_provider(provider: str, custom_base: Optional[str]) -> str:
 
 def _llm_bill_to_for_provider(provider: str) -> Optional[str]:
     return cfg.llm_bill_to if provider == _LLM_PROVIDER_HF else None
+
+
+def _egress_llm_bases() -> list[str]:
+    """Every LLM host a pod-based review might dial: the built-in provider
+    bases, the deployment default, and every provider_config's base (custom
+    included). Feeds the serge-egress allowlist so reviews reach their provider
+    through the egress firewall."""
+    bases = set(_LLM_PROVIDER_BASES.values())
+    if cfg.llm_api_base:
+        bases.add(cfg.llm_api_base)
+    try:
+        rows = _store.list_provider_configs()
+    except Exception:  # noqa: BLE001 - allowlist upkeep must never break serge
+        log.warning("egress allowlist: could not list provider configs", exc_info=True)
+        rows = []
+    for row in rows:
+        api_base = (row.get("api_base") or "").strip()
+        if api_base:
+            bases.add(api_base)
+        else:
+            provider = row.get("provider") or ""
+            if provider in _LLM_PROVIDER_BASES:
+                bases.add(_LLM_PROVIDER_BASES[provider])
+    return sorted(bases)
+
+
+def _sync_egress_allowlist() -> None:
+    """Keep the serge-egress proxy allowlist current with the configured LLM
+    hosts. No-op unless reviews/tasks run in kubernetes pods behind that proxy
+    (``task_egress_name`` set). Blocking (k8s I/O) and fail-soft."""
+    if not cfg.task_egress_name:
+        return
+    if "kubernetes" not in (cfg.task_execution, cfg.review_execution):
+        return
+    sync_egress_allowlist(
+        _egress_llm_bases(),
+        egress_name=cfg.task_egress_name,
+        namespace=cfg.task_k8s_namespace,
+    )
+
+
+def _spawn_egress_sync() -> None:
+    """Run the allowlist sync off the request/event loop — it does blocking k8s
+    calls and a Deployment rollout we don't want to wait on."""
+    if not cfg.task_egress_name:
+        return
+    threading.Thread(
+        target=_sync_egress_allowlist, name="egress-allowlist-sync", daemon=True
+    ).start()
 
 
 def _prune_store() -> None:
@@ -1795,6 +1845,14 @@ async def _start_pod_job_watcher() -> None:
     asyncio.create_task(_loop())
 
 
+@app.on_event("startup")
+async def _sync_egress_allowlist_on_start() -> None:
+    """Reconcile the serge-egress allowlist with the built-in + configured LLM
+    provider hosts at boot, so pod-based reviews reach any provider an admin has
+    set up. A no-op off the kubernetes backend (serge runs without kube)."""
+    _spawn_egress_sync()
+
+
 @app.middleware("http")
 async def _no_cache_static(request: Request, call_next):
     """Force browsers to revalidate /static/* on every load. Saves
@@ -2628,6 +2686,8 @@ async def admin_create_provider(request: Request) -> JSONResponse:
         fields["provider"],
         fields["repo_pattern"],
     )
+    # A new provider may introduce a new LLM host; keep the egress allowlist current.
+    _spawn_egress_sync()
     row = _store.get_provider_config(config_id)
     assert row is not None
     return JSONResponse(_provider_config_summary(row), status_code=201)
@@ -2665,6 +2725,8 @@ async def admin_update_provider(request: Request, config_id: str) -> JSONRespons
         fields["repo_pattern"],
         fields["api_key"] is not None,
     )
+    # The base URL may have changed; keep the egress allowlist current.
+    _spawn_egress_sync()
     row = _store.get_provider_config(config_id)
     assert row is not None
     return JSONResponse(_provider_config_summary(row))
