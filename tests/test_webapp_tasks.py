@@ -600,6 +600,120 @@ class TaskLauncherTests(unittest.TestCase):
         cleanup.assert_called_once_with("serge-task-xyz", "serge")
         self.assertNotIn(job.id, webapp._pod_tasks)
 
+    # --- /admin/pods -----------------------------------------------------
+    def _register_task(self, webapp, *, backend, job_name, status="running"):
+        job = self._make_job(webapp)
+        job.status = status
+        worker_cfg, req = self._worker_cfg_and_req(webapp)
+        task = webapp._PodTask(
+            job=job,
+            worker_cfg=worker_cfg,
+            req=req,
+            backend=backend,
+            job_name=job_name,
+            namespace="serge",
+        )
+        webapp._pod_tasks[job.id] = task
+        return job, task
+
+    def test_admin_pods_requires_admin(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        # dev user is not in WEB_ADMIN_USERS → 403.
+        webapp = self._import_webapp()
+        client = TestClient(webapp.app)
+        self.assertEqual(client.get("/admin/pods/data").status_code, 403)
+
+    def test_admin_pods_lists_kubernetes_pods(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp(
+            TASK_EXECUTION="kubernetes",
+            TASK_K8S_NAMESPACE="serge",
+            WEB_ADMIN_USERS="dev",
+        )
+        job, _task = self._register_task(
+            webapp, backend="kubernetes", job_name="serge-task-tracked"
+        )
+        # One pod matches the tracked task; one is an orphan (serge restarted).
+        pods = [
+            {
+                "pod": "serge-task-tracked-abc",
+                "job_name": "serge-task-tracked",
+                "phase": "Running",
+                "node": "node-1",
+                "start_epoch": 1000.0,
+            },
+            {
+                "pod": "serge-task-orphan-xyz",
+                "job_name": "serge-task-orphan",
+                "phase": "Running",
+                "node": "node-2",
+                "start_epoch": 900.0,
+            },
+        ]
+        with patch.object(webapp, "list_task_pods", return_value=("serge", pods)):
+            client = TestClient(webapp.app)
+            r = client.get("/admin/pods/data")
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertEqual(data["backend"], "kubernetes")
+        self.assertIsNone(data["error"])
+        rows = {row["job_name"]: row for row in data["pods"]}
+        # Tracked pod is joined with serge's job → repo + user filled in.
+        self.assertEqual(rows["serge-task-tracked"]["repo"], "acme/widgets")
+        self.assertEqual(rows["serge-task-tracked"]["job_id"], job.id)
+        self.assertEqual(rows["serge-task-tracked"]["phase"], "Running")
+        # Orphan pod still shows, with k8s data but no serge context.
+        self.assertEqual(rows["serge-task-orphan"]["node"], "node-2")
+        self.assertEqual(rows["serge-task-orphan"]["repo"], "")
+
+    def test_admin_pods_shows_just_launched_task_without_pod(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp(
+            TASK_EXECUTION="kubernetes", WEB_ADMIN_USERS="dev"
+        )
+        self._register_task(
+            webapp, backend="kubernetes", job_name="serge-task-new"
+        )
+        # No pod in the cluster yet (just created).
+        with patch.object(webapp, "list_task_pods", return_value=("serge", [])):
+            client = TestClient(webapp.app)
+            data = client.get("/admin/pods/data").json()
+        names = [row["job_name"] for row in data["pods"]]
+        self.assertIn("serge-task-new", names)
+
+    def test_admin_pods_docker_backend_lists_tracked(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp(
+            TASK_EXECUTION="docker", WEB_ADMIN_USERS="dev"
+        )
+        self._register_task(
+            webapp, backend="docker", job_name="serge-task-dkr"
+        )
+        client = TestClient(webapp.app)
+        data = client.get("/admin/pods/data").json()
+        self.assertEqual(data["backend"], "docker")
+        self.assertEqual([r["job_name"] for r in data["pods"]], ["serge-task-dkr"])
+
+    def test_admin_pods_kill(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp(
+            TASK_EXECUTION="kubernetes", WEB_ADMIN_USERS="dev"
+        )
+        with patch.object(webapp, "cleanup_task_job") as cleanup:
+            client = TestClient(webapp.app)
+            r = client.post(
+                "/admin/pods/kill",
+                json={"job_name": "serge-task-x", "namespace": "serge"},
+                headers={"origin": "http://testserver"},
+            )
+        self.assertEqual(r.status_code, 200)
+        cleanup.assert_called_once_with("serge-task-x", "serge")
+
     # --- POST /internal/tasks/{id}/events --------------------------------
     def test_ingest_rejects_missing_token(self):
         if TestClient is None:

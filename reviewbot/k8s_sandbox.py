@@ -553,6 +553,45 @@ def cleanup_task_job(job_name: str, namespace: str) -> None:
     _delete_secret(core, job_name, namespace)
 
 
+def list_task_pods(namespace: Optional[str] = None) -> tuple[str, list[dict]]:
+    """List live task-runner pods in the cluster for the admin view
+    (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 2). Returns ``(namespace, pods)``
+    where each pod is a plain dict: ``pod`` (name), ``job_name`` (the owning
+    Job, from the auto-applied ``job-name`` label — used to join back to serge's
+    tracked task), ``phase``, ``node``, ``start_epoch``. Raises
+    :class:`K8sSandboxError` on API failure."""
+    from kubernetes.client.rest import ApiException
+
+    ns = resolve_namespace(K8sSettings(namespace=namespace))
+    _, core = _load_clients()
+    selector = (
+        "app.kubernetes.io/managed-by=serge,app.kubernetes.io/component=task"
+    )
+    try:
+        pods = core.list_namespaced_pod(ns, label_selector=selector).items
+    except ApiException as exc:
+        raise K8sSandboxError(
+            f"could not list task pods: {exc.reason or exc}"
+        ) from exc
+    out: list[dict] = []
+    for pod in pods:
+        meta = getattr(pod, "metadata", None)
+        st = getattr(pod, "status", None)
+        spec = getattr(pod, "spec", None)
+        labels = getattr(meta, "labels", None) or {}
+        start = getattr(st, "start_time", None)
+        out.append(
+            {
+                "pod": getattr(meta, "name", "") or "",
+                "job_name": labels.get("job-name", "") or "",
+                "phase": getattr(st, "phase", "") or "",
+                "node": getattr(spec, "node_name", "") or "",
+                "start_epoch": start.timestamp() if start else None,
+            }
+        )
+    return ns, out
+
+
 def _delete_secret(core, secret_name: str, namespace: str) -> None:
     """Best-effort Secret deletion (the ownerRef also GCs it with the Job)."""
     from kubernetes.client.rest import ApiException

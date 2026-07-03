@@ -51,6 +51,7 @@ from .k8s_sandbox import (
     K8sSandboxError,
     cleanup_task_job,
     collect_task_result,
+    list_task_pods,
     parse_node_selector,
     poll_task_job,
 )
@@ -2297,6 +2298,114 @@ def admin_page(request: Request) -> Response:
     if not _current_user(request):
         return RedirectResponse("/login", status_code=302)
     return _serve_static("admin.html")
+
+
+@app.get("/admin/pods")
+def admin_pods_page(request: Request) -> Response:
+    if not _current_user(request):
+        return RedirectResponse("/login", status_code=302)
+    return _serve_static("admin_pods.html")
+
+
+def _pod_row(pod: Optional[dict], task: Optional["_PodTask"]) -> dict[str, Any]:
+    """One admin-pods table row, joining the live k8s pod (if any) with serge's
+    tracked task (if any). Either side may be absent: a just-launched task has no
+    pod yet; an orphan pod (serge restarted) has no tracked task."""
+    job = task.job if task else None
+    start_epoch = None
+    if pod and pod.get("start_epoch"):
+        start_epoch = pod["start_epoch"]
+    elif job is not None:
+        start_epoch = job.created_at
+    return {
+        "job_id": job.id if job else "",
+        "pod": (pod or {}).get("pod", ""),
+        "job_name": (pod or {}).get("job_name", "") or (task.job_name if task else ""),
+        "namespace": (task.namespace if task else "") or (cfg.task_k8s_namespace or ""),
+        "kind": (job.kind if job else "task"),
+        "repo": (f"{job.target_owner}/{job.target_repo}" if job else ""),
+        "number": (job.target_number if job else 0),
+        "user": (job.user if job else ""),
+        "status": (job.status if job else ""),  # serge's view of the job
+        "phase": (pod or {}).get("phase", ""),  # kubernetes pod phase
+        "node": (pod or {}).get("node", ""),
+        "backend": (task.backend if task else "kubernetes"),
+        "start_epoch": start_epoch,
+    }
+
+
+@app.get("/admin/pods/data")
+def admin_pods_data(request: Request) -> JSONResponse:
+    """Live pod-backed task jobs for the admin monitor. Kubernetes: the actual
+    running pods in the cluster, joined with serge's tracked tasks for repo/user
+    context (so orphans left by a serge restart still show up). Docker/inprocess:
+    serge's tracked tasks. Admin-only (it exposes cross-user activity + a kill
+    action)."""
+    user = _require_user(request)
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="admin_only")
+
+    with _pod_tasks_lock:
+        tracked = list(_pod_tasks.values())
+    by_job_name = {t.job_name: t for t in tracked if t.job_name}
+
+    rows: list[dict[str, Any]] = []
+    error: Optional[str] = None
+    backend = cfg.task_execution
+
+    if backend == "kubernetes":
+        try:
+            _ns, pods = list_task_pods(cfg.task_k8s_namespace)
+        except Exception as exc:  # noqa: BLE001 — surface, don't 500 the page
+            log.warning("admin/pods: could not list task pods: %s", exc)
+            error = str(exc)
+            pods = []
+        seen: set[str] = set()
+        for pod in pods:
+            rows.append(_pod_row(pod, by_job_name.get(pod["job_name"])))
+            if pod["job_name"]:
+                seen.add(pod["job_name"])
+        # Tracked k8s tasks whose pod hasn't shown up yet (just launched).
+        for task in tracked:
+            if (
+                task.backend == "kubernetes"
+                and task.job_name
+                and task.job_name not in seen
+            ):
+                rows.append(_pod_row(None, task))
+    else:
+        for task in tracked:
+            rows.append(_pod_row(None, task))
+
+    rows.sort(key=lambda r: (r["start_epoch"] or 0), reverse=True)
+    return JSONResponse({"pods": rows, "backend": backend, "error": error})
+
+
+@app.post("/admin/pods/kill")
+async def admin_pods_kill(request: Request) -> JSONResponse:
+    """Delete a task Job (and its pod) by name. Admin-only + same-origin. The
+    watcher/TTL would eventually reap a finished Job; this is the manual stop for
+    a runaway one."""
+    _require_same_origin(request)
+    user = _require_user(request)
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="admin_only")
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid_json_body")
+    job_name = str(payload.get("job_name") or "").strip()
+    namespace = str(payload.get("namespace") or "").strip() or (
+        cfg.task_k8s_namespace or ""
+    )
+    if not job_name or not namespace:
+        raise HTTPException(status_code=400, detail="job_name_and_namespace_required")
+    log.info("admin %s killing task Job %s/%s", user, namespace, job_name)
+    try:
+        await asyncio.to_thread(cleanup_task_job, job_name, namespace)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("admin/pods kill failed for %s: %s", job_name, exc)
+        raise HTTPException(status_code=502, detail="kill_failed")
+    return JSONResponse({"ok": True})
 
 
 @app.get("/admin/providers")
