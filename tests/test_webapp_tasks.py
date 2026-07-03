@@ -825,6 +825,82 @@ class TaskLauncherTests(unittest.TestCase):
         self.assertEqual(job.draft.prompt_tokens, 100)
         self.assertEqual(job.draft.completion_tokens, 25)
 
+    def _webhook_review_job(self, webapp):
+        job = self._review_job(webapp)
+        job.source = "webhook"
+        req = webapp.ReviewRequest(
+            owner="acme",
+            repo="widgets",
+            number=7,
+            trigger_comment_id=0,
+            trigger_comment_body="@serge review",
+            commenter="octocat",
+        )
+        webapp._pod_tasks[job.id] = webapp._PodTask(
+            job=job, worker_cfg=webapp.cfg, req=req, backend="kubernetes"
+        )
+        return job
+
+    def test_webhook_review_auto_publishes_on_callback(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp(REVIEW_EXECUTION="kubernetes")
+        job = self._webhook_review_job(webapp)
+        from reviewbot.store import encode_draft
+
+        draft = webapp.decode_draft(
+            '{"owner":"acme","repo":"widgets","number":7,"head_sha":"abc",'
+            '"summary":"lgtm","event":"COMMENT","comments":[]}'
+        )
+        with (
+            patch.object(webapp, "installation_id_for_repo", return_value=1),
+            patch.object(webapp, "installation_token", return_value="tok"),
+            patch.object(webapp, "GitHubClient", lambda *a, **k: object()),
+            patch.object(webapp, "publish_review", return_value=draft) as pub,
+            patch.object(webapp, "_persist_terminal"),
+            patch.object(webapp, "_notify_task_finished"),
+        ):
+            client = TestClient(webapp.app)
+            r = client.post(
+                f"/internal/tasks/{job.id}/events",
+                json={
+                    "terminal": {
+                        "status": "done",
+                        "result": {"draft": encode_draft(draft)},
+                    }
+                },
+                headers={"Authorization": "Bearer cbtok"},
+            )
+        self.assertEqual(r.status_code, 200)
+        pub.assert_called_once()
+        self.assertEqual(job.status, "published")
+        self.assertIsNotNone(job.published_draft)
+
+    def test_webhook_review_failure_posts_comment(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp(REVIEW_EXECUTION="kubernetes")
+        job = self._webhook_review_job(webapp)
+        with (
+            patch.object(webapp, "installation_id_for_repo", return_value=1),
+            patch.object(webapp, "installation_token", return_value="tok"),
+            patch.object(webapp, "GitHubClient", lambda *a, **k: object()),
+            patch.object(webapp, "_post_webhook_failure_comment") as comment,
+            patch.object(webapp, "publish_review") as pub,
+            patch.object(webapp, "_persist_terminal"),
+            patch.object(webapp, "_notify_task_finished"),
+        ):
+            client = TestClient(webapp.app)
+            r = client.post(
+                f"/internal/tasks/{job.id}/events",
+                json={"terminal": {"status": "error", "error": "model exploded"}},
+                headers={"Authorization": "Bearer cbtok"},
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(job.status, "error")
+        comment.assert_called_once()
+        pub.assert_not_called()
+
     # --- POST /internal/tasks/{id}/events --------------------------------
     def test_ingest_rejects_missing_token(self):
         if TestClient is None:

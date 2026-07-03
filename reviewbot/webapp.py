@@ -510,12 +510,17 @@ def _run_webhook_review_worker(
             _push_event(job, kind, text)
 
         if req.inline is not None:
-            # Inline follow-up: a focused reply on the comment thread.
-            # There is no draft, so the page just streams the console.
+            # Inline follow-up: a focused reply on the comment thread. There is
+            # no draft, so the page just streams the console. Kept in-process for
+            # now (a small, distinct LLM+write path); podding it is future work.
             run_followup(worker_cfg, gh, req, chunk_callback=emit)
             job.status = "done"
             emit("step", "done")
             emit("done", "")
+        elif cfg.review_execution != "inprocess":
+            # Full review in a pod; serge auto-publishes on the callback
+            # (job.source == "webhook"). Returns fast for the k8s backend.
+            _launch_review_pod(job, worker_cfg, req, token)
         else:
             _execute_review(job, worker_cfg, gh, token, req, auto_publish=True)
     except _UnparseableLLMOutput as exc:
@@ -1626,6 +1631,44 @@ def _launch_review_pod(
 
     _finalize_task(job.id)
     _untrack_pod_task(job.id)
+
+
+def _webhook_publish_or_report(job: Job) -> None:
+    """serge-side GitHub write for a **webhook** review whose pod just reported
+    (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 4). Runs in a thread off the callback:
+    on success it auto-publishes the draft (no human in the loop); on error it
+    posts the failure comment. Kept in serge — a GitHub API call, not LLM work —
+    so the pod stays a pure LLM worker and the error/publish logic isn't
+    duplicated. Best-effort: a failure here is logged, never re-raised."""
+    task = _pod_tasks.get(job.id)
+    worker_cfg = task.worker_cfg if task else cfg
+    req = task.req if task else None
+    if not (cfg.github_app_id and cfg.github_private_key):
+        return
+    try:
+        iid = installation_id_for_repo(
+            cfg.github_app_id, cfg.github_private_key, job.target_owner, job.target_repo
+        )
+        token = installation_token(cfg.github_app_id, cfg.github_private_key, iid)
+        gh = GitHubClient(token)
+    except Exception:  # noqa: BLE001
+        log.warning("webhook publish: token mint failed for %s", job.id, exc_info=True)
+        return
+
+    if job.status == "error":
+        if isinstance(req, ReviewRequest):
+            _post_webhook_failure_comment(
+                gh, req, job.error or "review failed", raw_output=job.raw_llm_output
+            )
+        return
+    if job.draft is not None:
+        try:
+            # No edits: a webhook review auto-publishes exactly what the model
+            # produced (APPROVE may be downgraded inside publish_review).
+            job.published_draft = publish_review(worker_cfg, gh, job.draft)
+            job.status = "published"
+        except Exception:  # noqa: BLE001
+            log.exception("webhook auto-publish failed for job %s", job.id)
 
 
 def _notify_task_finished(worker_cfg: Config, req: TaskRequest, job: Job) -> None:
@@ -2804,6 +2847,11 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
         if terminal.get("raw_llm_output"):
             job.raw_llm_output = str(terminal["raw_llm_output"])
         job.status = (terminal.get("status") or "error").strip() or "error"
+        # Webhook reviews have no human in the loop: serge auto-publishes the
+        # draft (or posts a failure comment) here, off the event loop. UI reviews
+        # stop at the draft for the human to publish (unchanged).
+        if job.kind == "review" and job.source == "webhook":
+            await asyncio.to_thread(_webhook_publish_or_report, job)
         # Happy path: the runner reported a terminal outcome. Finalize now
         # (notify + persist) — the non-blocking launcher no longer waits to do
         # it. Idempotent: the Job watcher's later reap is a no-op. The watcher
