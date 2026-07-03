@@ -103,6 +103,17 @@ class CloneCache:
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_ASKPASS": "/bin/false",
         }
+        # Pass through egress-proxy config. git subprocesses run with this
+        # curated env, so without these the fetch ignores the pod's proxy and
+        # tries direct egress — which the per-task-pod NetworkPolicy blocks,
+        # hanging the fetch until its timeout. No-op on host/dev runs (unset).
+        for _proxy_var in (
+            "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+            "https_proxy", "http_proxy", "no_proxy",
+        ):
+            _proxy_val = os.environ.get(_proxy_var)
+            if _proxy_val:
+                self._env[_proxy_var] = _proxy_val
         os.makedirs(self._repos_dir, exist_ok=True)
         os.makedirs(self._worktrees_dir, exist_ok=True)
 

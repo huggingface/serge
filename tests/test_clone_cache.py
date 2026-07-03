@@ -156,5 +156,38 @@ class CloneCacheTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(co.path, ".ai")))
 
 
+class CloneCacheProxyEnvTests(unittest.TestCase):
+    """The git subprocess env must carry the egress-proxy vars, or in-pod
+    fetches ignore the proxy and hit the (blocked) direct egress path."""
+
+    def test_proxy_vars_passed_through(self) -> None:
+        from unittest import mock
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HTTPS_PROXY": "http://egress:3128",
+                "NO_PROXY": ".svc.cluster.local",
+            },
+            clear=False,
+        ):
+            cache = CloneCache(os.path.join(tmp.name, "cache"))
+        self.assertEqual(cache._env.get("HTTPS_PROXY"), "http://egress:3128")
+        self.assertEqual(cache._env.get("NO_PROXY"), ".svc.cluster.local")
+
+    def test_unset_proxy_vars_absent(self) -> None:
+        from unittest import mock
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            os.environ["PATH"] = "/usr/bin"
+            cache = CloneCache(os.path.join(tmp.name, "cache"))
+        self.assertNotIn("HTTPS_PROXY", cache._env)
+        self.assertNotIn("HTTP_PROXY", cache._env)
+
+
 if __name__ == "__main__":
     unittest.main()
