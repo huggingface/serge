@@ -31,4 +31,11 @@ data:
   {{- with $t.nodeSelector }}
   TASK_K8S_NODE_SELECTOR: {{ . | quote }}
   {{- end }}
+  {{- if $t.reviewPods }}
+  # Run PR reviews in per-review pods too, reusing this backend's infra.
+  REVIEW_EXECUTION: "kubernetes"
+  {{- with $t.reviewImage }}
+  REVIEW_RUNNER_IMAGE: {{ . | quote }}
+  {{- end }}
+  {{- end }}
   {{- end }}

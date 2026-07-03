@@ -120,6 +120,13 @@ taskExecution:
     podServiceAccount: ""
     # nodeSelector for the task pods, as "key=value,key2=value2".
     nodeSelector: ""
+    # Also run PR *reviews* in per-review pods (SERGE_ORCHESTRATOR_PODS_PLAN.md
+    # Phase 3/4), reusing this backend's egress proxy + RBAC + callback. When
+    # false, reviews run in-process in serge (default) even with task pods on.
+    reviewPods: false
+    # Optional slimmer image for review pods (reviews don't run `make fix-repo`).
+    # "" falls back to the task runner `image` above.
+    reviewImage: ""
     # Base URL the runner POSTs events + the terminal result back to. "" =
     # serge's in-cluster Service DNS (http://<release>.<ns>.svc.cluster.local).
     # The callback bypasses the egress proxy (see NO_PROXY in the ConfigMap).
