@@ -62,6 +62,33 @@ writes only inside its own `serge/*` branch namespace, and a follow-up loop cap
 bounds the number of commits per fix branch. Task `context`/logs are untrusted
 input, handled like a PR body.
 
+## Per-Task Pod Network Firewall
+
+When tasks run in the pod-per-task model (`TASK_EXECUTION=kubernetes`), each task
+runs in its own pod that holds a scoped GitHub token + the LLM key while executing
+repo build code (e.g. `make style`). Its egress is therefore locked down:
+
+- The task pod's `NetworkPolicy` **denies all egress** except to the in-cluster
+  `serge-egress` forward proxy, kube-dns, and serge's own callback Service.
+- `serge-egress` (a small tinyproxy Deployment, built in-house from the Debian
+  package) permits `CONNECT` only to an allowlist — `*.github.com`,
+  `*.githubusercontent.com`, and `router.huggingface.co` — and denies everything
+  else. serge injects it as the pod's `HTTPS_PROXY`/`HTTP_PROXY`; `NO_PROXY` keeps
+  the in-cluster callback off the proxy. Arbitrary repo code in the pod can thus
+  reach only GitHub + the HF LLM, never an attacker-controlled host.
+
+### Accepted residual risks
+
+- **DNS egress.** Task pods may reach kube-dns (port 53) for name resolution. The
+  stricter no-DNS stance — injecting the proxy's ClusterIP directly and denying
+  all DNS to close the DNS-tunnel exfil channel — is **not** implemented; the DNS
+  egress is an accepted residual risk. (Won't-fix unless the threat model changes.)
+- **GitHub token tunnel.** Because the pod holds a valid GitHub token during the
+  arbitrary-code phase, data could in principle be tunneled through legitimate
+  requests to `github.com`. Fully closing this needs the old split-pod model (no
+  secrets present while untrusted code runs), which this design deliberately
+  trades away for simplicity and speed.
+
 ## Web App Sessions
 
 Production web app deployments should use OAuth, a strong
