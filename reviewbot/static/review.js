@@ -56,7 +56,10 @@
     } catch {}
   }
 
-  const STEP_ORDER = ["clone", "fetch", "context", "llm", "done"];
+  // "launch" is the pod-launch step (pod backends emit it before "clone"); for
+  // the in-process backend no "launch" event fires, but it auto-completes as
+  // soon as "clone" activates (earlier steps are marked done), so it's harmless.
+  const STEP_ORDER = ["launch", "clone", "fetch", "context", "llm", "done"];
   const progressFill = document.getElementById("progress-fill");
   const llmDetailEl = document.getElementById("llm-detail");
   const tokInEl = document.getElementById("tok-in");

@@ -1472,6 +1472,11 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             with _pod_tasks_lock:
                 task.job_name = job_name
                 task.namespace = namespace
+            emit(
+                "log",
+                f"Runner pod {job_name} created; waiting for it to schedule + "
+                "pull the image (can take ~1–2 min on a cold node)…",
+            )
             return  # watcher + callback own the rest
 
         # docker: blocking (local/dev path; low concurrency). Hold the pool
@@ -1598,6 +1603,11 @@ def _launch_review_pod(
             with _pod_tasks_lock:
                 task.job_name = job_name
                 task.namespace = namespace
+            emit(
+                "log",
+                f"Runner pod {job_name} created; waiting for it to schedule + "
+                "pull the image (can take ~1–2 min on a cold node)…",
+            )
             return  # watcher + callback own the rest
 
         code, _out = launch_docker(
@@ -2857,6 +2867,11 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
         # it. Idempotent: the Job watcher's later reap is a no-op. The watcher
         # still reaps the k8s Job (TTL is the backstop).
         _finalize_task(job_id)
+        # Signal the live SSE stream that the job is done so the page loads the
+        # draft (review) / result without a manual refresh — mirrors the final
+        # "done" the in-process worker emits. The pod streams events but its
+        # terminal outcome arrives as this callback, not an SSE "done".
+        _push_event(job, "done", "")
     else:
         _push_event(
             job,
