@@ -108,8 +108,12 @@ class CloneCache:
         # tries direct egress — which the per-task-pod NetworkPolicy blocks,
         # hanging the fetch until its timeout. No-op on host/dev runs (unset).
         for _proxy_var in (
-            "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
-            "https_proxy", "http_proxy", "no_proxy",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "https_proxy",
+            "http_proxy",
+            "no_proxy",
         ):
             _proxy_val = os.environ.get(_proxy_var)
             if _proxy_val:
@@ -328,6 +332,7 @@ class CloneCache:
         depth: int = 50,
         remote_url: Optional[str] = None,
         standalone: bool = False,
+        mirror_bare: Optional[str] = None,
     ) -> Optional[Checkout]:
         """Fetch an arbitrary branch ``ref`` (e.g. ``main`` or a
         ``serge/fix-*`` branch) into the shared bare repo and add a worktree
@@ -350,7 +355,17 @@ class CloneCache:
         shell out to git. A standalone clone gives the checkout its own
         ``.git`` so git works inside the sandbox. It costs a per-task object
         copy, so reviews, the bwrap/dev backend, and any host-side run keep the
-        cheaper linked worktree (``standalone=False``)."""
+        cheaper linked worktree (``standalone=False``).
+
+        ``mirror_bare`` (standalone only) is the path to a warm read-only bare
+        mirror of this repo on shared storage (SERGE_SHARED_MIRROR_PLAN.md). When
+        given and valid, it is wired as a read-only ``objects/info/alternates`` on
+        this job's throwaway bare *before* the GitHub fetch, so the fetch dedups
+        against the mirror and transfers only the delta (often nothing). The final
+        clone uses ``--dissociate`` to copy the borrowed objects in, so the
+        worktree stays fully self-contained (no pointer into the mirror) and the
+        mirror is never written. Ignored when the path is missing / not a git
+        object store — the code falls back to a full fetch from GitHub."""
         bare = self._bare_path(owner, repo)
         local_branch = f"task-{_slug(ref)}-{_slug(job_id)}"
         wt = os.path.join(
@@ -378,6 +393,25 @@ class CloneCache:
         with lock:
             try:
                 self._ensure_bare(bare)
+                # Seed from the warm mirror (standalone only): borrow its objects
+                # read-only via an alternate so the GitHub fetch below transfers
+                # only the delta vs the mirror. The alternate lives on this job's
+                # throwaway bare (emptyDir); the mirror itself is never written.
+                # `--dissociate` on the clone later copies borrowed objects into
+                # the worktree, so the checkout stays self-contained.
+                used_mirror = False
+                if (
+                    standalone
+                    and mirror_bare
+                    and os.path.isdir(os.path.join(mirror_bare, "objects"))
+                ):
+                    info_dir = os.path.join(bare, "objects", "info")
+                    os.makedirs(info_dir, exist_ok=True)
+                    with open(os.path.join(info_dir, "alternates"), "w") as fh:
+                        fh.write(
+                            os.path.abspath(os.path.join(mirror_bare, "objects")) + "\n"
+                        )
+                    used_mirror = True
                 self._git(
                     bare,
                     *auth_args,
@@ -400,6 +434,10 @@ class CloneCache:
                     # store physically separate from the shared bare repo, so a
                     # task running build commands with the worktree mounted
                     # read-write cannot corrupt the cache.
+                    # ``--dissociate`` (only when seeded from a mirror) copies the
+                    # objects borrowed via the alternate into the clone, so the
+                    # worktree has no lingering pointer into the read-only mirror.
+                    dissociate = ["--dissociate"] if used_mirror else []
                     subprocess.run(
                         [
                             "git",
@@ -407,6 +445,7 @@ class CloneCache:
                             "--quiet",
                             "--local",
                             "--no-hardlinks",
+                            *dissociate,
                             "--single-branch",
                             "--branch",
                             local_branch,
