@@ -47,13 +47,19 @@ from .github_auth import (
     user_is_org_member,
 )
 from .github_client import GitHubClient
-from .k8s_sandbox import K8sSandboxError, parse_node_selector
+from .k8s_sandbox import (
+    K8sSandboxError,
+    cleanup_task_job,
+    collect_task_result,
+    parse_node_selector,
+    poll_task_job,
+)
 from .launcher import (
     DockerLaunchOptions,
     K8sLaunchOptions,
     build_spec,
+    create_kubernetes,
     launch_docker,
-    launch_kubernetes,
     runner_config,
 )
 from .errors import format_github_http_error as _format_github_http_error
@@ -1234,26 +1240,159 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         _persist_terminal(job)
 
 
+# ---------------------------------------------------------------------------
+# Non-blocking pod-task lifecycle (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 1).
+# The kubernetes backend launches the Job and returns immediately — no serge
+# thread is parked for the pod's lifetime. Terminal state arrives via the
+# callback (happy path) or the Job watcher (crash path); a single idempotent
+# finalize runs notify + persist exactly once, whichever trigger fires first.
+# The docker backend stays blocking (local/dev, low concurrency) and needs no
+# watcher — serge runs without kube exactly as before.
+# ---------------------------------------------------------------------------
+_POD_WATCH_INTERVAL = 5.0  # seconds between watcher polls
+# After a Job goes terminal we wait this long for an in-flight terminal callback
+# before declaring a crash — the runner POSTs its callback just before exiting.
+_POD_TERMINAL_GRACE = 12.0
+
+
+@dataclasses.dataclass
+class _PodTask:
+    job: Job
+    worker_cfg: Config
+    req: TaskRequest
+    backend: str  # "docker" | "kubernetes"
+    job_name: str = ""
+    namespace: str = ""
+    deadline: float = 0.0  # monotonic hard-timeout backstop
+    terminal_since: Optional[float] = None
+    finalized: bool = False
+
+
+_pod_tasks: dict[str, _PodTask] = {}
+_pod_tasks_lock = threading.Lock()
+
+
+def _finalize_task(job_id: str) -> bool:
+    """Run terminal notify + persist for a pod task exactly once. Safe to call
+    from the callback endpoint, the docker launcher thread, and the Job watcher
+    concurrently — the first caller wins. Returns True if it performed the
+    finalize."""
+    with _pod_tasks_lock:
+        task = _pod_tasks.get(job_id)
+        if task is None or task.finalized:
+            return False
+        task.finalized = True
+    job = task.job
+    job.callback_token = None
+    _notify_task_finished(task.worker_cfg, task.req, job)
+    _persist_terminal(job)
+    return True
+
+
+def _untrack_pod_task(job_id: str) -> None:
+    with _pod_tasks_lock:
+        _pod_tasks.pop(job_id, None)
+
+
+def _reconcile_pod_task(task: _PodTask) -> None:
+    """Watcher step for one kubernetes pod task (runs in a worker thread).
+
+    Happy path: the callback already set a terminal status + finalized; here we
+    just reap the Job. Crash path: the Job reached a terminal state while serge's
+    job is still ``running`` and no callback landed within the grace window — mark
+    it errored, finalize, reap. Deletion is best-effort (``ttlSecondsAfterFinished``
+    on the Job is the backstop)."""
+    if task.backend != "kubernetes" or not task.job_name:
+        return  # docker, or k8s Job not created yet
+    job = task.job
+    now = time.monotonic()
+
+    if task.finalized:
+        cleanup_task_job(task.job_name, task.namespace)
+        _untrack_pod_task(job.id)
+        return
+
+    try:
+        outcome = poll_task_job(task.job_name, task.namespace)
+    except K8sSandboxError:
+        log.warning("watcher: could not poll task Job %s", task.job_name, exc_info=True)
+        if now > task.deadline:
+            _reconcile_crash(task, "task runner did not finish in time")
+        return
+
+    if outcome is None:
+        if now > task.deadline:
+            _reconcile_crash(task, "task runner did not finish in time")
+        return
+
+    # Job is terminal. If the callback already recorded a terminal status,
+    # finalize + reap. Otherwise give an in-flight callback the grace window
+    # before declaring a crash.
+    if job.status != "running":
+        _finalize_task(job.id)
+        cleanup_task_job(task.job_name, task.namespace)
+        _untrack_pod_task(job.id)
+        return
+    if task.terminal_since is None:
+        task.terminal_since = now
+        return
+    if now - task.terminal_since < _POD_TERMINAL_GRACE:
+        return
+    exit_code, _tail = collect_task_result(task.job_name, task.namespace)
+    _reconcile_crash(
+        task, f"task runner exited without reporting (exit code {exit_code})"
+    )
+
+
+def _reconcile_crash(task: _PodTask, message: str) -> None:
+    """Mark a task errored (if still running), finalize, and reap its Job."""
+    job = task.job
+    if job.status == "running":
+        log.warning("task %s reconciled to error by watcher: %s", job.id, message)
+        job.status = "error"
+        job.error = message
+        _push_event(job, "step", "error")
+        _push_event(job, "error", message)
+        _push_event(job, "done", "")
+    _finalize_task(job.id)
+    if task.job_name:
+        cleanup_task_job(task.job_name, task.namespace)
+    _untrack_pod_task(job.id)
+
+
 def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
-    """Out-of-process launcher for the write-capable /tasks flow (Phase 2 of
-    SERGE_PERTASK_POD_PLAN.md).
+    """Out-of-process launcher for the write-capable /tasks flow.
 
-    Instead of running the agent loop in a serge thread (``_run_task_worker``),
     serge mints the short-lived GitHub installation token + a per-job callback
-    token, builds the task spec, and starts a per-task runner container. The
-    runner runs the whole loop + in-process normalize and streams every event
-    and the terminal outcome back to ``POST /internal/tasks/{id}/events``.
+    token, builds the task spec, and starts a per-task runner. The runner runs
+    the whole loop + in-process normalize and streams every event and the
+    terminal outcome back to ``POST /internal/tasks/{id}/events``.
 
-    This thread blocks on the container (block-in-pool, mirroring the in-process
-    pool — see the plan's "Launcher watch" open question) so a runner that dies
-    without ever reporting a terminal callback still reconciles to ``error``.
-    Terminal ``status``/``result`` for the happy path are set by the callback
-    ingest endpoint; this thread only handles launch failures + the crash sweep,
-    then notifies Slack and persists the terminal snapshot exactly like the
-    in-process worker."""
+    Kubernetes is **non-blocking**: the Job is created and this returns — the
+    callback (happy path) or the Job watcher (crash) reconciles + finalizes, so
+    concurrency is bounded by the cluster, not by the launcher pool. Docker stays
+    blocking (local/dev; no watcher needed), so serge runs without kube as
+    before. Terminal notify + persist run once via :func:`_finalize_task`."""
 
     def emit(kind: str, text: str) -> None:
         _push_event(job, kind, text)
+
+    def fail(message: str) -> None:
+        job.status = "error"
+        job.error = message
+        emit("step", "error")
+        emit("error", message)
+        emit("done", "")
+
+    task = _PodTask(
+        job=job,
+        worker_cfg=worker_cfg,
+        req=req,
+        backend=cfg.task_execution,
+        deadline=time.monotonic() + (cfg.task_runner_timeout or 3600) + 60,
+    )
+    with _pod_tasks_lock:
+        _pod_tasks[job.id] = task
 
     try:
         if cfg.task_execution not in ("docker", "kubernetes"):
@@ -1298,24 +1437,12 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             "log",
             f"Launching task runner ({cfg.task_execution}: {cfg.task_runner_image})…",
         )
-        # Both backends block until the runner pod/container exits; the runner
-        # POSTs its terminal callback (synchronously) before it exits, so by the
-        # time this returns the ingest endpoint has already recorded the outcome.
-        if cfg.task_execution == "docker":
-            code, _out = launch_docker(
-                spec,
-                DockerLaunchOptions(
-                    image=cfg.task_runner_image,
-                    network=cfg.task_runner_network,
-                    proxy=cfg.task_runner_proxy,
-                    memory=cfg.task_runner_memory,
-                    name=f"serge-task-{job.id[:12]}",
-                ),
-                wait=True,
-                timeout=cfg.task_runner_timeout,
-            )
-        else:  # kubernetes
-            code, _out = launch_kubernetes(
+
+        if cfg.task_execution == "kubernetes":
+            # Non-blocking: create the Job + Secret and return. The runner
+            # streams its outcome via the callback; the watcher reconciles a
+            # crash. No serge thread is parked for the pod's lifetime.
+            job_name, namespace = create_kubernetes(
                 spec,
                 K8sLaunchOptions(
                     image=cfg.task_runner_image,
@@ -1328,46 +1455,48 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
                 ),
                 timeout=cfg.task_runner_timeout,
             )
+            with _pod_tasks_lock:
+                task.job_name = job_name
+                task.namespace = namespace
+            return  # watcher + callback own the rest
+
+        # docker: blocking (local/dev path; low concurrency). Hold the pool
+        # thread until the container exits, then reconcile a crash + finalize.
+        code, _out = launch_docker(
+            spec,
+            DockerLaunchOptions(
+                image=cfg.task_runner_image,
+                network=cfg.task_runner_network,
+                proxy=cfg.task_runner_proxy,
+                memory=cfg.task_runner_memory,
+                name=f"serge-task-{job.id[:12]}",
+            ),
+            wait=True,
+            timeout=cfg.task_runner_timeout,
+        )
         if job.status == "running":
-            # Runner exited without a terminal callback → crashed / OOM /
-            # evicted before it could report. Reconcile to error.
             log.warning(
                 "task %s runner exited (code=%s) with no terminal callback",
                 job.id,
                 code,
             )
-            job.status = "error"
-            job.error = f"task runner exited without reporting (exit code {code})"
-            emit("step", "error")
-            emit("error", job.error)
-            emit("done", "")
+            fail(f"task runner exited without reporting (exit code {code})")
     except (TaskError, AppNotInstalledError, K8sSandboxError) as exc:
         log.warning("task %s launch failed: %s", job.id, exc)
-        job.status = "error"
-        job.error = str(exc)
-        emit("step", "error")
-        emit("error", job.error)
-        emit("done", "")
+        fail(str(exc))
     except subprocess.TimeoutExpired:
         log.warning(
             "task %s runner timed out after %ss", job.id, cfg.task_runner_timeout
         )
-        job.status = "error"
-        job.error = f"task runner timed out after {cfg.task_runner_timeout}s"
-        emit("step", "error")
-        emit("error", job.error)
-        emit("done", "")
+        fail(f"task runner timed out after {cfg.task_runner_timeout}s")
     except Exception as exc:  # noqa: BLE001
         log.exception("task launcher crashed for job %s", job.id)
-        job.status = "error"
-        job.error = f"{type(exc).__name__}: task launch crashed (see server log)"
-        emit("step", "error")
-        emit("error", job.error)
-        emit("done", "")
-    finally:
-        job.callback_token = None
-        _notify_task_finished(worker_cfg, req, job)
-        _persist_terminal(job)
+        fail(f"{type(exc).__name__}: task launch crashed (see server log)")
+
+    # Reached for docker (success or failure) and for any launch failure — but
+    # NOT the kubernetes success path (which returned above). Finalize once.
+    _finalize_task(job.id)
+    _untrack_pod_task(job.id)
 
 
 def _notify_task_finished(worker_cfg: Config, req: TaskRequest, job: Job) -> None:
@@ -1458,6 +1587,28 @@ async def _start_clone_cache_gc() -> None:
                 await asyncio.to_thread(_clone_cache.gc, ttl)
             except Exception:  # noqa: BLE001
                 log.exception("clone cache GC failed")
+
+    asyncio.create_task(_loop())
+
+
+@app.on_event("startup")
+async def _start_pod_job_watcher() -> None:
+    """Reconcile non-blocking kubernetes task pods: detect a Job that finished
+    without a terminal callback (crash / OOM / eviction) and mark it errored,
+    and reap finished Jobs (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 1). A no-op for
+    docker/inprocess deployments (no kubernetes pod tasks are tracked), so it
+    never touches the kubernetes client unless a k8s task exists."""
+
+    async def _loop() -> None:
+        while True:
+            await asyncio.sleep(_POD_WATCH_INTERVAL)
+            with _pod_tasks_lock:
+                tasks = [t for t in _pod_tasks.values() if t.backend == "kubernetes"]
+            for task in tasks:
+                try:
+                    await asyncio.to_thread(_reconcile_pod_task, task)
+                except Exception:  # noqa: BLE001
+                    log.exception("pod job watcher failed for %s", task.job.id)
 
     asyncio.create_task(_loop())
 
@@ -2406,6 +2557,11 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
         if terminal.get("raw_llm_output"):
             job.raw_llm_output = str(terminal["raw_llm_output"])
         job.status = (terminal.get("status") or "error").strip() or "error"
+        # Happy path: the runner reported a terminal outcome. Finalize now
+        # (notify + persist) — the non-blocking launcher no longer waits to do
+        # it. Idempotent: the Job watcher's later reap is a no-op. The watcher
+        # still reaps the k8s Job (TTL is the backstop).
+        _finalize_task(job_id)
     else:
         _push_event(
             job,

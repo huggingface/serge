@@ -415,6 +415,59 @@ def run_task_job(
     without reporting. The Job (and, via ownerRef, the Secret) is always deleted
     on the way out. Raises :class:`K8sSandboxError` on infrastructure failure or
     timeout."""
+    job_name, namespace = create_task_job(
+        spec,
+        image=image,
+        settings=settings,
+        timeout=timeout,
+        proxy=proxy,
+        no_proxy=no_proxy,
+        memory=memory,
+        clone_dir=clone_dir,
+        uid=uid,
+        gid=gid,
+    )
+    _, core = _load_clients()
+    try:
+        deadline = time.monotonic() + timeout + poll_interval * 2
+        outcome: Optional[str] = None
+        while time.monotonic() < deadline:
+            outcome = poll_task_job(job_name, namespace)
+            if outcome is not None:
+                break
+            time.sleep(poll_interval)
+        if outcome is None:
+            raise K8sSandboxError(
+                f"task Job {job_name} did not finish within {timeout}s"
+            )
+
+        exit_code, tail = _collect_pod_result(core, namespace, job_name)
+        if outcome == "failed" and exit_code == 0:
+            exit_code = 1
+        return exit_code, tail
+    finally:
+        cleanup_task_job(job_name, namespace)
+
+
+def create_task_job(
+    spec: dict[str, Any],
+    *,
+    image: str,
+    settings: K8sSettings,
+    timeout: int,
+    proxy: Optional[str] = None,
+    no_proxy: Optional[str] = None,
+    memory: Optional[str] = None,
+    clone_dir: str = "/tmp/serge-clones",
+    uid: Optional[int] = None,
+    gid: Optional[int] = None,
+) -> tuple[str, str]:
+    """Create the task Job + its per-job Secret and return ``(job_name,
+    namespace)`` **without waiting** — the non-blocking launch path
+    (SERGE_ORCHESTRATOR_PODS_PLAN.md). The caller reconciles completion
+    out-of-band via :func:`poll_task_job` + a watcher, so no serge thread is
+    parked for the pod's lifetime. Raises :class:`K8sSandboxError` on failure
+    (the Job is cleaned up if the Secret create fails)."""
     from kubernetes.client.rest import ApiException
 
     namespace = resolve_namespace(settings)
@@ -459,33 +512,45 @@ def run_task_job(
         raise K8sSandboxError(
             f"could not create task Secret {secret_name}: {exc.reason or exc}"
         ) from exc
+    return job_name, namespace
 
+
+def poll_task_job(job_name: str, namespace: str) -> Optional[str]:
+    """Return the Job's terminal outcome (``"succeeded"``/``"failed"``) or
+    ``None`` if it is still running. A vanished Job (404 — deleted or TTL-GC'd)
+    counts as ``"failed"`` (terminal). Raises :class:`K8sSandboxError` on any
+    other API error."""
+    from kubernetes.client.rest import ApiException
+
+    batch, _ = _load_clients()
     try:
-        deadline = time.monotonic() + timeout + poll_interval * 2
-        outcome: Optional[str] = None
-        while time.monotonic() < deadline:
-            try:
-                status = batch.read_namespaced_job_status(job_name, namespace).status
-            except ApiException as exc:
-                raise K8sSandboxError(
-                    f"could not read task Job status: {exc.reason or exc}"
-                ) from exc
-            outcome = _job_terminal(status)
-            if outcome is not None:
-                break
-            time.sleep(poll_interval)
-        if outcome is None:
-            raise K8sSandboxError(
-                f"task Job {job_name} did not finish within {timeout}s"
-            )
+        status = batch.read_namespaced_job_status(job_name, namespace).status
+    except ApiException as exc:
+        if getattr(exc, "status", None) == 404:
+            return "failed"
+        raise K8sSandboxError(
+            f"could not read task Job status: {exc.reason or exc}"
+        ) from exc
+    return _job_terminal(status)
 
-        exit_code, tail = _collect_pod_result(core, namespace, job_name)
-        if outcome == "failed" and exit_code == 0:
-            exit_code = 1
-        return exit_code, tail
-    finally:
-        _delete_job(batch, job_name, namespace)
-        _delete_secret(core, secret_name, namespace)
+
+def collect_task_result(job_name: str, namespace: str) -> tuple[int, str]:
+    """``(exit_code, log_tail)`` for a terminated task Job pod. Best-effort: a
+    missing pod / unreadable logs yields ``(1, "")`` rather than raising, so the
+    watcher can always finish reconciling."""
+    _, core = _load_clients()
+    try:
+        return _collect_pod_result(core, namespace, job_name)
+    except K8sSandboxError:
+        return 1, ""
+
+
+def cleanup_task_job(job_name: str, namespace: str) -> None:
+    """Delete the task Job (+ its Secret via ownerRef). ``ttlSecondsAfterFinished``
+    on the Job is the backstop if this is ever missed."""
+    batch, core = _load_clients()
+    _delete_job(batch, job_name, namespace)
+    _delete_secret(core, job_name, namespace)
 
 
 def _delete_secret(core, secret_name: str, namespace: str) -> None:

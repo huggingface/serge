@@ -108,8 +108,12 @@ class CloneCache:
         # tries direct egress — which the per-task-pod NetworkPolicy blocks,
         # hanging the fetch until its timeout. No-op on host/dev runs (unset).
         for _proxy_var in (
-            "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
-            "https_proxy", "http_proxy", "no_proxy",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "https_proxy",
+            "http_proxy",
+            "no_proxy",
         ):
             _proxy_val = os.environ.get(_proxy_var)
             if _proxy_val:

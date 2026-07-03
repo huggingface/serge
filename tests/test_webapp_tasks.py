@@ -465,7 +465,10 @@ class TaskLauncherTests(unittest.TestCase):
 
         self.assertEqual(job.status, "published")
 
-    def test_launch_kubernetes_dispatches_and_reconciles(self):
+    def test_launch_kubernetes_is_nonblocking(self):
+        # The kubernetes backend creates the Job and returns immediately: it does
+        # NOT block on the pod, NOT finalize, and leaves the callback token live
+        # so the runner can report. The watcher/callback reconcile later.
         webapp = self._import_webapp(
             TASK_EXECUTION="kubernetes",
             TASK_K8S_NAMESPACE="serge",
@@ -478,33 +481,38 @@ class TaskLauncherTests(unittest.TestCase):
         worker_cfg, req = self._worker_cfg_and_req(webapp)
         captured = {}
 
-        def fake_launch(spec, opts, *, timeout, poll_interval=2.0):
+        def fake_create(spec, opts, *, timeout):
             captured["spec"] = spec
             captured["opts"] = opts
-            return 0, "pod log"
+            return "serge-task-xyz", "serge"
 
         with (
             patch.object(webapp, "installation_id_for_repo", return_value=1),
             patch.object(webapp, "installation_token", return_value="gh-token"),
-            patch.object(webapp, "launch_kubernetes", side_effect=fake_launch),
-            patch.object(webapp, "_notify_task_finished"),
-            patch.object(webapp, "_persist_terminal"),
+            patch.object(webapp, "create_kubernetes", side_effect=fake_create),
+            patch.object(webapp, "_notify_task_finished") as notify,
+            patch.object(webapp, "_persist_terminal") as persist,
         ):
             webapp._launch_task_pod(job, worker_cfg, req)
 
         opts = captured["opts"]
-        self.assertEqual(opts.image, "serge/runner:latest")
         self.assertEqual(opts.namespace, "serge")
         self.assertEqual(opts.service_account, "serge-task")
         self.assertEqual(opts.node_selector, {"pool": "tasks"})
         self.assertEqual(opts.proxy, "http://egress:3128")
-        self.assertEqual(opts.no_proxy, ".svc.cluster.local")
         self.assertEqual(captured["spec"]["github_token"], "gh-token")
-        # No terminal callback arrived → reconcile to error.
-        self.assertEqual(job.status, "error")
-        self.assertIsNone(job.callback_token)
+        # Non-blocking: still running, token live, no finalize yet.
+        self.assertEqual(job.status, "running")
+        self.assertIsNotNone(job.callback_token)
+        notify.assert_not_called()
+        persist.assert_not_called()
+        # A pod task is tracked for the watcher, with the created Job's name.
+        task = webapp._pod_tasks[job.id]
+        self.assertEqual(task.backend, "kubernetes")
+        self.assertEqual(task.job_name, "serge-task-xyz")
+        self.assertEqual(task.namespace, "serge")
 
-    def test_launch_kubernetes_surfaces_sandbox_error(self):
+    def test_launch_kubernetes_surfaces_create_error(self):
         webapp = self._import_webapp(TASK_EXECUTION="kubernetes")
         job = self._make_job(webapp)
         worker_cfg, req = self._worker_cfg_and_req(webapp)
@@ -514,16 +522,83 @@ class TaskLauncherTests(unittest.TestCase):
             patch.object(webapp, "installation_token", return_value="gh-token"),
             patch.object(
                 webapp,
-                "launch_kubernetes",
+                "create_kubernetes",
                 side_effect=webapp.K8sSandboxError("no cluster"),
             ),
-            patch.object(webapp, "_notify_task_finished"),
-            patch.object(webapp, "_persist_terminal"),
+            patch.object(webapp, "_notify_task_finished") as notify,
+            patch.object(webapp, "_persist_terminal") as persist,
         ):
             webapp._launch_task_pod(job, worker_cfg, req)
 
+        # Launch failure finalizes immediately (notify + persist) and untracks.
         self.assertEqual(job.status, "error")
         self.assertEqual(job.error, "no cluster")
+        notify.assert_called_once()
+        persist.assert_called_once()
+        self.assertNotIn(job.id, webapp._pod_tasks)
+
+    def test_watcher_reconciles_crashed_pod(self):
+        # A k8s Job that reached a terminal state while serge's job is still
+        # "running" and no callback landed within the grace window → the watcher
+        # marks it errored, finalizes once, and reaps the Job.
+        webapp = self._import_webapp(TASK_EXECUTION="kubernetes")
+        job = self._make_job(webapp)
+        worker_cfg, req = self._worker_cfg_and_req(webapp)
+        task = webapp._PodTask(
+            job=job,
+            worker_cfg=worker_cfg,
+            req=req,
+            backend="kubernetes",
+            job_name="serge-task-xyz",
+            namespace="serge",
+            deadline=webapp.time.monotonic() + 3600,
+            terminal_since=webapp.time.monotonic() - 100,  # past the grace window
+        )
+        webapp._pod_tasks[job.id] = task
+
+        with (
+            patch.object(webapp, "poll_task_job", return_value="failed"),
+            patch.object(webapp, "collect_task_result", return_value=(1, "boom")),
+            patch.object(webapp, "cleanup_task_job") as cleanup,
+            patch.object(webapp, "_notify_task_finished") as notify,
+            patch.object(webapp, "_persist_terminal") as persist,
+        ):
+            webapp._reconcile_pod_task(task)
+
+        self.assertEqual(job.status, "error")
+        self.assertIsNone(job.callback_token)
+        notify.assert_called_once()
+        persist.assert_called_once()
+        cleanup.assert_called_once_with("serge-task-xyz", "serge")
+        self.assertNotIn(job.id, webapp._pod_tasks)
+
+    def test_watcher_reaps_finalized_pod(self):
+        # Happy path: the callback already finalized. The watcher just reaps the
+        # Job and untracks — no second notify/persist.
+        webapp = self._import_webapp(TASK_EXECUTION="kubernetes")
+        job = self._make_job(webapp)
+        job.status = "published"
+        worker_cfg, req = self._worker_cfg_and_req(webapp)
+        task = webapp._PodTask(
+            job=job,
+            worker_cfg=worker_cfg,
+            req=req,
+            backend="kubernetes",
+            job_name="serge-task-xyz",
+            namespace="serge",
+            finalized=True,
+        )
+        webapp._pod_tasks[job.id] = task
+
+        with (
+            patch.object(webapp, "poll_task_job") as poll,
+            patch.object(webapp, "cleanup_task_job") as cleanup,
+        ):
+            webapp._reconcile_pod_task(task)
+
+        poll.assert_not_called()  # finalized → skip straight to reap
+        cleanup.assert_called_once_with("serge-task-xyz", "serge")
+        self.assertNotIn(job.id, webapp._pod_tasks)
 
     # --- POST /internal/tasks/{id}/events --------------------------------
     def test_ingest_rejects_missing_token(self):

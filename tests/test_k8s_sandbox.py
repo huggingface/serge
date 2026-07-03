@@ -256,5 +256,73 @@ class RunTaskJobTests(unittest.TestCase):
         self.assertTrue(batch.delete_namespaced_job.called)
 
 
+class NonBlockingLaunchTests(unittest.TestCase):
+    """The non-blocking primitives (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 1):
+    create_task_job / poll_task_job / collect_task_result / cleanup_task_job."""
+
+    def setUp(self):
+        self.addCleanup(_install_fake_kubernetes())
+
+    def _clients(self):
+        batch = mock.Mock()
+        batch.create_namespaced_job.return_value = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(uid="job-uid-1")
+        )
+        core = mock.Mock()
+        return batch, core
+
+    def test_create_returns_without_waiting(self):
+        batch, core = self._clients()
+        with mock.patch.object(
+            k8s_sandbox, "_load_clients", return_value=(batch, core)
+        ):
+            name, ns = k8s_sandbox.create_task_job(
+                {"job_id": "j1", "github_token": "tok"},
+                image="serge/runner:latest",
+                settings=K8sSettings(namespace="serge"),
+                timeout=30,
+            )
+        self.assertEqual(ns, "serge")
+        self.assertTrue(name.startswith("serge-task-"))
+        self.assertTrue(batch.create_namespaced_job.called)
+        self.assertTrue(core.create_namespaced_secret.called)
+        # Crucially, it never polls or deletes — the watcher owns that.
+        self.assertFalse(batch.read_namespaced_job_status.called)
+        self.assertFalse(batch.delete_namespaced_job.called)
+
+    def test_poll_running_then_terminal(self):
+        batch, core = self._clients()
+        running = types.SimpleNamespace(succeeded=None, failed=None, conditions=None)
+        done = types.SimpleNamespace(succeeded=1, failed=None, conditions=None)
+        batch.read_namespaced_job_status.side_effect = [
+            types.SimpleNamespace(status=running),
+            types.SimpleNamespace(status=done),
+        ]
+        with mock.patch.object(
+            k8s_sandbox, "_load_clients", return_value=(batch, core)
+        ):
+            self.assertIsNone(k8s_sandbox.poll_task_job("j", "serge"))
+            self.assertEqual(k8s_sandbox.poll_task_job("j", "serge"), "succeeded")
+
+    def test_poll_treats_404_as_failed(self):
+        batch, core = self._clients()
+        exc = _FakeApiException("gone")
+        exc.status = 404
+        batch.read_namespaced_job_status.side_effect = exc
+        with mock.patch.object(
+            k8s_sandbox, "_load_clients", return_value=(batch, core)
+        ):
+            self.assertEqual(k8s_sandbox.poll_task_job("j", "serge"), "failed")
+
+    def test_cleanup_deletes_job_and_secret(self):
+        batch, core = self._clients()
+        with mock.patch.object(
+            k8s_sandbox, "_load_clients", return_value=(batch, core)
+        ):
+            k8s_sandbox.cleanup_task_job("serge-task-x", "serge")
+        self.assertTrue(batch.delete_namespaced_job.called)
+        self.assertTrue(core.delete_namespaced_secret.called)
+
+
 if __name__ == "__main__":
     unittest.main()
