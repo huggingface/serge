@@ -31,4 +31,9 @@ data:
   {{- with $t.nodeSelector }}
   TASK_K8S_NODE_SELECTOR: {{ . | quote }}
   {{- end }}
+  {{- if .Values.mirror.enabled }}
+  # Mount the shared mirror PVC read-only (per-repo subPath) into task pods as a
+  # fetch seed (SERGE_SHARED_MIRROR_PLAN.md).
+  TASK_K8S_MIRROR_CLAIM: {{ printf "%s-mirror" (include "name" .) | quote }}
+  {{- end }}
   {{- end }}

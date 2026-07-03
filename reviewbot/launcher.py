@@ -219,6 +219,11 @@ class K8sLaunchOptions:
     uid: Optional[int] = None
     gid: Optional[int] = None
     clone_dir: str = "/tmp/serge-clones"
+    # Shared mirror PVC mounted read-only (per-repo subPath) as a fetch seed
+    # (SERGE_SHARED_MIRROR_PLAN.md). All None → no mirror mount.
+    mirror_claim: Optional[str] = None
+    mirror_subpath: Optional[str] = None
+    mirror_mount: str = "/mnt/serge-mirror"
 
 
 def launch_kubernetes(
@@ -251,5 +256,8 @@ def launch_kubernetes(
         clone_dir=opts.clone_dir,
         uid=opts.uid,
         gid=opts.gid,
+        mirror_claim=opts.mirror_claim,
+        mirror_subpath=opts.mirror_subpath,
+        mirror_mount=opts.mirror_mount,
         poll_interval=poll_interval,
     )

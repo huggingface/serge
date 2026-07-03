@@ -170,6 +170,41 @@ class TaskJobManifestTests(unittest.TestCase):
         res = m["spec"]["template"]["spec"]["containers"][0]["resources"]
         self.assertEqual(res["limits"]["memory"], "4Gi")
 
+    def test_no_mirror_mount_by_default(self):
+        m = self._job()
+        pod = m["spec"]["template"]["spec"]
+        self.assertNotIn("mirror", [v["name"] for v in pod["volumes"]])
+        self.assertNotIn(
+            "mirror", [vm["name"] for vm in pod["containers"][0]["volumeMounts"]]
+        )
+        env = {e["name"] for e in pod["containers"][0]["env"]}
+        self.assertNotIn("WEB_MIRROR_BARE", env)
+
+    def test_mirror_mounted_readonly_with_subpath(self):
+        m = self._job(
+            mirror_claim="serge-mirror",
+            mirror_subpath="repos/acme__widget.git",
+        )
+        pod = m["spec"]["template"]["spec"]
+        vol = next(v for v in pod["volumes"] if v["name"] == "mirror")
+        self.assertEqual(vol["persistentVolumeClaim"]["claimName"], "serge-mirror")
+        self.assertTrue(vol["persistentVolumeClaim"]["readOnly"])
+        mount = next(
+            vm for vm in pod["containers"][0]["volumeMounts"] if vm["name"] == "mirror"
+        )
+        self.assertEqual(mount["mountPath"], "/mnt/serge-mirror")
+        self.assertEqual(mount["subPath"], "repos/acme__widget.git")
+        self.assertTrue(mount["readOnly"])
+        env = {e["name"]: e["value"] for e in pod["containers"][0]["env"]}
+        self.assertEqual(env["WEB_MIRROR_BARE"], "/mnt/serge-mirror")
+
+    def test_mirror_needs_both_claim_and_subpath(self):
+        # A claim without a subpath (or vice versa) must not mount anything —
+        # avoids exposing the whole mirror or mounting a bogus path.
+        m = self._job(mirror_claim="serge-mirror")
+        pod = m["spec"]["template"]["spec"]
+        self.assertNotIn("mirror", [v["name"] for v in pod["volumes"]])
+
     def test_missing_image_raises(self):
         with self.assertRaises(K8sSandboxError):
             self._job(image="")

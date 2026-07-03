@@ -38,7 +38,7 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeSerializer
 
 from . import __version__, build_info, git_sha
-from .clone_cache import CloneCache, Checkout
+from .clone_cache import CloneCache, Checkout, mirror_bare_path, mirror_repo_relpath
 from .config import Config
 from .github_auth import (
     AppNotInstalledError,
@@ -47,6 +47,7 @@ from .github_auth import (
     user_is_org_member,
 )
 from .github_client import GitHubClient
+from .mirror import MirrorWarmer
 from .k8s_sandbox import K8sSandboxError, parse_node_selector
 from .launcher import (
     DockerLaunchOptions,
@@ -359,6 +360,37 @@ _clone_cache = CloneCache(cfg.web_clone_cache_dir)
 # Jobs left mid-flight by a previous process are marked crashed above;
 # their worktrees are orphaned, so clear them on startup.
 _clone_cache.reset_worktrees()
+
+
+def _mint_mirror_token(owner: str, repo: str) -> Optional[str]:
+    """Token provider for the mirror warmer: mint a short-lived installation
+    token for a repo, or None if the App isn't installed there (skip it)."""
+    if not (cfg.github_app_id and cfg.github_private_key):
+        return None
+    try:
+        iid = installation_id_for_repo(
+            cfg.github_app_id, cfg.github_private_key, owner, repo
+        )
+        return installation_token(cfg.github_app_id, cfg.github_private_key, iid)
+    except AppNotInstalledError:
+        return None
+    except Exception:  # noqa: BLE001 — best-effort; warmer logs + skips
+        log.warning("mirror: token minting error for %s/%s", owner, repo, exc_info=True)
+        return None
+
+
+# Warm shared git mirror (SERGE_SHARED_MIRROR_PLAN.md), an optimization only.
+# Disabled (None) unless WEB_MIRROR_DIR is set — serge runs identically without
+# it, with or without kube. The refresh thread starts in a startup hook.
+_mirror_warmer: Optional[MirrorWarmer] = (
+    MirrorWarmer(
+        cfg.web_mirror_dir,
+        _mint_mirror_token,
+        interval_seconds=cfg.mirror_update_interval_seconds,
+    )
+    if cfg.web_mirror_dir
+    else None
+)
 
 # Same immediate-review webhook behavior as the legacy Flask app, now
 # hosted by reviewbot-web at /webhook. Keep this separate from the staged
@@ -1266,6 +1298,11 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         if not cfg.task_callback_base_url:
             raise TaskError("TASK_CALLBACK_BASE_URL is not configured", status_code=500)
 
+        # Track this repo for warming so subsequent tasks get a seeded checkout
+        # (mirror-on-first-request). No-op unless the mirror is enabled.
+        if _mirror_warmer is not None:
+            _mirror_warmer.register(req.owner, req.repo)
+
         assert cfg.github_app_id and cfg.github_private_key
         installation_id = installation_id_for_repo(
             cfg.github_app_id, cfg.github_private_key, req.owner, req.repo
@@ -1293,15 +1330,36 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             ),
             callback_token=callback_token,
         )
+        # Warm shared mirror as a fetch seed (SERGE_SHARED_MIRROR_PLAN.md), if one
+        # exists for this repo. serge has the mirror mounted, so it can check the
+        # bare exists before wiring it in — a missing mirror just means the pod
+        # clones from GitHub as before. Optional everywhere; never required.
+        mirror_bare = ""
+        mirror_subpath = ""
+        if cfg.web_mirror_dir:
+            _mb = mirror_bare_path(cfg.web_mirror_dir, req.owner, req.repo)
+            if os.path.isdir(os.path.join(_mb, "objects")):
+                mirror_bare = _mb
+                mirror_subpath = mirror_repo_relpath(req.owner, req.repo)
+        _mirror_mount = "/mnt/serge-mirror"
+
         emit("step", "launch")
         emit(
             "log",
             f"Launching task runner ({cfg.task_execution}: {cfg.task_runner_image})…",
         )
+        if mirror_bare:
+            emit("log", "Seeding checkout from the warm mirror")
         # Both backends block until the runner pod/container exits; the runner
         # POSTs its terminal callback (synchronously) before it exits, so by the
         # time this returns the ingest endpoint has already recorded the outcome.
         if cfg.task_execution == "docker":
+            docker_volumes: dict[str, str] = {}
+            docker_env: dict[str, str] = {}
+            if mirror_bare:
+                # Bind-mount the repo's bare mirror read-only as the fetch seed.
+                docker_volumes[mirror_bare] = f"{_mirror_mount}:ro"
+                docker_env["WEB_MIRROR_BARE"] = _mirror_mount
             code, _out = launch_docker(
                 spec,
                 DockerLaunchOptions(
@@ -1310,11 +1368,18 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
                     proxy=cfg.task_runner_proxy,
                     memory=cfg.task_runner_memory,
                     name=f"serge-task-{job.id[:12]}",
+                    volumes=docker_volumes,
+                    env=docker_env,
                 ),
                 wait=True,
                 timeout=cfg.task_runner_timeout,
             )
         else:  # kubernetes
+            # Mount the mirror PVC read-only (per-repo subPath) only when a claim
+            # is configured AND the repo's bare mirror exists.
+            mount_claim = (
+                cfg.task_k8s_mirror_claim if (mirror_bare and mirror_subpath) else None
+            )
             code, _out = launch_kubernetes(
                 spec,
                 K8sLaunchOptions(
@@ -1325,6 +1390,9 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
                     proxy=cfg.task_runner_proxy,
                     no_proxy=cfg.task_runner_no_proxy,
                     memory=cfg.task_runner_memory,
+                    mirror_claim=mount_claim,
+                    mirror_subpath=(mirror_subpath or None),
+                    mirror_mount=_mirror_mount,
                 ),
                 timeout=cfg.task_runner_timeout,
             )
@@ -1460,6 +1528,15 @@ async def _start_clone_cache_gc() -> None:
                 log.exception("clone cache GC failed")
 
     asyncio.create_task(_loop())
+
+
+@app.on_event("startup")
+async def _start_mirror_warmer() -> None:
+    """Start the in-process git-mirror warmer (no-op unless WEB_MIRROR_DIR is
+    set). A plain daemon thread, so it works for every backend — serge never
+    needs Kubernetes for this."""
+    if _mirror_warmer is not None:
+        _mirror_warmer.start()
 
 
 @app.middleware("http")

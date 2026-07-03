@@ -56,6 +56,19 @@ def _slug(value: str) -> str:
     return _SAFE.sub("-", value)
 
 
+def mirror_repo_relpath(owner: str, repo: str) -> str:
+    """Location of a repo's bare mirror under a mirror root, relative:
+    ``repos/<owner>__<repo>.git`` (same slugging as the clone cache, so the
+    warmer and a task pod agree on the path). Used as the k8s subPath and to
+    build the absolute path via :func:`mirror_bare_path`."""
+    return os.path.join("repos", f"{_slug(owner)}__{_slug(repo)}.git")
+
+
+def mirror_bare_path(mirror_dir: str, owner: str, repo: str) -> str:
+    """Absolute path of a repo's bare mirror under ``mirror_dir``."""
+    return os.path.join(mirror_dir, mirror_repo_relpath(owner, repo))
+
+
 @dataclass
 class Checkout:
     """A live worktree handed to one review worker. Pass it back to
@@ -499,6 +512,53 @@ class CloneCache:
                 return None
 
         return Checkout(path=wt, branch=local_branch, bare=bare, owner=owner, repo=repo)
+
+    def update_mirror(
+        self,
+        token: Optional[str],
+        owner: str,
+        repo: str,
+        *,
+        remote_url: Optional[str] = None,
+        timeout: int = 600,
+    ) -> str:
+        """Refresh (creating if needed) the warm bare mirror for ``owner/repo``
+        with a full-history ``git fetch --prune`` of all branches
+        (SERGE_SHARED_MIRROR_PLAN.md). Returns the bare-repo path. Used by the
+        in-process mirror warmer; the resulting bare is what task/review pods
+        borrow objects from via :meth:`acquire_ref`'s ``mirror_bare``.
+
+        No ``git gc``/repack — readers negotiate against this repo concurrently,
+        and git keeps old packs alive until refs flip, so a plain fetch is safe
+        while an aggressive repack could yank objects out from under a reader.
+        Raises ``subprocess.CalledProcessError`` / ``TimeoutExpired`` on git
+        failure (the caller decides whether to drop the repo or retry)."""
+        bare = self._bare_path(owner, repo)
+        url = remote_url or f"https://github.com/{owner}/{repo}.git"
+        auth_args: list[str] = []
+        basic = ""
+        if token:
+            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            auth_args = ["-c", f"http.extraHeader=Authorization: Basic {basic}"]
+        redact = (token or "", basic)
+        lock = self._lock_for(bare)
+        with lock:
+            self._ensure_bare(bare)
+            self._git(
+                bare,
+                *auth_args,
+                "-c",
+                "core.symlinks=false",
+                "fetch",
+                "--prune",
+                "--no-tags",
+                url,
+                "+refs/heads/*:refs/heads/*",
+                timeout=timeout,
+                redact=redact,
+            )
+            os.utime(bare, None)
+        return bare
 
     def apply_patch(self, checkout: Checkout, diff_text: str) -> None:
         """Apply a unified diff to the worktree (and the index). Raises
