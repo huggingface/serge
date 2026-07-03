@@ -130,6 +130,15 @@ class Config:
     web_clone_cache_dir: str = ""
     web_clone_cache_ttl_seconds: int = 7 * 24 * 3600
     web_clone_depth: int = 50
+    # Shared git mirror cache (SERGE_SHARED_MIRROR_PLAN.md), an optimization only.
+    # ``web_mirror_dir`` is the RWX mirror ROOT serge warms + reads (WEB_MIRROR_DIR;
+    # "" disables the feature entirely — serge then behaves exactly as before, with
+    # or without kube). ``web_mirror_bare`` is the per-repo bare mounted read-only
+    # inside a task pod (WEB_MIRROR_BARE), used as a fetch seed. The warmer refresh
+    # cadence is ``mirror_update_interval_seconds``.
+    web_mirror_dir: str = ""
+    web_mirror_bare: str = ""
+    mirror_update_interval_seconds: int = 300
     # Drop the Secure flag from the session cookie so plain-HTTP works
     # (typical for VPN-private deployments without TLS termination).
     # Independent of DEV_NO_AUTH: you can have mandatory auth without
@@ -250,6 +259,9 @@ class Config:
     # nodeSelector for the task Job pods, as "key=value,key2=value2"
     # (e.g. "scheduling.cast.ai/node-template=default-by-castai").
     task_k8s_node_selector: Optional[str] = None
+    # Mirror PVC claim to mount read-only (per-repo subPath) into k8s task pods
+    # as the fetch seed (SERGE_SHARED_MIRROR_PLAN.md). None = no mirror mount.
+    task_k8s_mirror_claim: Optional[str] = None
     # Optional Slack notification for PRs created by the /tasks flow.
     # Defaults to the org-level CI feedback Slack secrets; the transformers CI
     # names remain supported as fallbacks.
@@ -436,6 +448,11 @@ class Config:
                 "WEB_CLONE_CACHE_TTL_SECONDS", 7 * 24 * 3600
             ),
             web_clone_depth=_int_env("WEB_CLONE_DEPTH", 50),
+            web_mirror_dir=(os.environ.get("WEB_MIRROR_DIR") or "").strip(),
+            web_mirror_bare=(os.environ.get("WEB_MIRROR_BARE") or "").strip(),
+            mirror_update_interval_seconds=_int_env(
+                "MIRROR_UPDATE_INTERVAL_SECONDS", 300
+            ),
             web_github_app_url=(os.environ.get("WEB_GITHUB_APP_URL") or "").strip()
             or "https://github.com/apps/sergereview",
             task_api_enabled=_bool_env("TASK_API_ENABLED", False),
@@ -494,6 +511,10 @@ class Config:
             or None,
             task_k8s_node_selector=(
                 os.environ.get("TASK_K8S_NODE_SELECTOR") or ""
+            ).strip()
+            or None,
+            task_k8s_mirror_claim=(
+                os.environ.get("TASK_K8S_MIRROR_CLAIM") or ""
             ).strip()
             or None,
             slack_bot_token=(

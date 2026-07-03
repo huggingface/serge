@@ -56,6 +56,19 @@ def _slug(value: str) -> str:
     return _SAFE.sub("-", value)
 
 
+def mirror_repo_relpath(owner: str, repo: str) -> str:
+    """Location of a repo's bare mirror under a mirror root, relative:
+    ``repos/<owner>__<repo>.git`` (same slugging as the clone cache, so the
+    warmer and a task pod agree on the path). Used as the k8s subPath and to
+    build the absolute path via :func:`mirror_bare_path`."""
+    return os.path.join("repos", f"{_slug(owner)}__{_slug(repo)}.git")
+
+
+def mirror_bare_path(mirror_dir: str, owner: str, repo: str) -> str:
+    """Absolute path of a repo's bare mirror under ``mirror_dir``."""
+    return os.path.join(mirror_dir, mirror_repo_relpath(owner, repo))
+
+
 @dataclass
 class Checkout:
     """A live worktree handed to one review worker. Pass it back to
@@ -409,6 +422,7 @@ class CloneCache:
         depth: int = 50,
         remote_url: Optional[str] = None,
         standalone: bool = False,
+        mirror_bare: Optional[str] = None,
     ) -> Optional[Checkout]:
         """Fetch an arbitrary branch ``ref`` (e.g. ``main`` or a
         ``serge/fix-*`` branch) into the shared bare repo and add a worktree
@@ -431,7 +445,17 @@ class CloneCache:
         shell out to git. A standalone clone gives the checkout its own
         ``.git`` so git works inside the sandbox. It costs a per-task object
         copy, so reviews, the bwrap/dev backend, and any host-side run keep the
-        cheaper linked worktree (``standalone=False``)."""
+        cheaper linked worktree (``standalone=False``).
+
+        ``mirror_bare`` (standalone only) is the path to a warm read-only bare
+        mirror of this repo on shared storage (SERGE_SHARED_MIRROR_PLAN.md). When
+        given and valid, it is wired as a read-only ``objects/info/alternates`` on
+        this job's throwaway bare *before* the GitHub fetch, so the fetch dedups
+        against the mirror and transfers only the delta (often nothing). The final
+        clone uses ``--dissociate`` to copy the borrowed objects in, so the
+        worktree stays fully self-contained (no pointer into the mirror) and the
+        mirror is never written. Ignored when the path is missing / not a git
+        object store — the code falls back to a full fetch from GitHub."""
         bare = self._bare_path(owner, repo)
         local_branch = f"task-{_slug(ref)}-{_slug(job_id)}"
         wt = os.path.join(
@@ -459,6 +483,25 @@ class CloneCache:
         with lock:
             try:
                 self._ensure_bare(bare)
+                # Seed from the warm mirror (standalone only): borrow its objects
+                # read-only via an alternate so the GitHub fetch below transfers
+                # only the delta vs the mirror. The alternate lives on this job's
+                # throwaway bare (emptyDir); the mirror itself is never written.
+                # `--dissociate` on the clone later copies borrowed objects into
+                # the worktree, so the checkout stays self-contained.
+                used_mirror = False
+                if (
+                    standalone
+                    and mirror_bare
+                    and os.path.isdir(os.path.join(mirror_bare, "objects"))
+                ):
+                    info_dir = os.path.join(bare, "objects", "info")
+                    os.makedirs(info_dir, exist_ok=True)
+                    with open(os.path.join(info_dir, "alternates"), "w") as fh:
+                        fh.write(
+                            os.path.abspath(os.path.join(mirror_bare, "objects")) + "\n"
+                        )
+                    used_mirror = True
                 self._git(
                     bare,
                     *auth_args,
@@ -481,6 +524,10 @@ class CloneCache:
                     # store physically separate from the shared bare repo, so a
                     # task running build commands with the worktree mounted
                     # read-write cannot corrupt the cache.
+                    # ``--dissociate`` (only when seeded from a mirror) copies the
+                    # objects borrowed via the alternate into the clone, so the
+                    # worktree has no lingering pointer into the read-only mirror.
+                    dissociate = ["--dissociate"] if used_mirror else []
                     subprocess.run(
                         [
                             "git",
@@ -488,6 +535,7 @@ class CloneCache:
                             "--quiet",
                             "--local",
                             "--no-hardlinks",
+                            *dissociate,
                             "--single-branch",
                             "--branch",
                             local_branch,
@@ -541,6 +589,53 @@ class CloneCache:
                 return None
 
         return Checkout(path=wt, branch=local_branch, bare=bare, owner=owner, repo=repo)
+
+    def update_mirror(
+        self,
+        token: Optional[str],
+        owner: str,
+        repo: str,
+        *,
+        remote_url: Optional[str] = None,
+        timeout: int = 600,
+    ) -> str:
+        """Refresh (creating if needed) the warm bare mirror for ``owner/repo``
+        with a full-history ``git fetch --prune`` of all branches
+        (SERGE_SHARED_MIRROR_PLAN.md). Returns the bare-repo path. Used by the
+        in-process mirror warmer; the resulting bare is what task/review pods
+        borrow objects from via :meth:`acquire_ref`'s ``mirror_bare``.
+
+        No ``git gc``/repack — readers negotiate against this repo concurrently,
+        and git keeps old packs alive until refs flip, so a plain fetch is safe
+        while an aggressive repack could yank objects out from under a reader.
+        Raises ``subprocess.CalledProcessError`` / ``TimeoutExpired`` on git
+        failure (the caller decides whether to drop the repo or retry)."""
+        bare = self._bare_path(owner, repo)
+        url = remote_url or f"https://github.com/{owner}/{repo}.git"
+        auth_args: list[str] = []
+        basic = ""
+        if token:
+            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            auth_args = ["-c", f"http.extraHeader=Authorization: Basic {basic}"]
+        redact = (token or "", basic)
+        lock = self._lock_for(bare)
+        with lock:
+            self._ensure_bare(bare)
+            self._git(
+                bare,
+                *auth_args,
+                "-c",
+                "core.symlinks=false",
+                "fetch",
+                "--prune",
+                "--no-tags",
+                url,
+                "+refs/heads/*:refs/heads/*",
+                timeout=timeout,
+                redact=redact,
+            )
+            os.utime(bare, None)
+        return bare
 
     def apply_patch(self, checkout: Checkout, diff_text: str) -> None:
         """Apply a unified diff to the worktree (and the index). Raises

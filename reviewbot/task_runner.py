@@ -285,6 +285,9 @@ def run(spec: RunnerSpec) -> int:
             depth=cfg.web_clone_depth,
             remote_url=spec.repo_remote_url,
             standalone=True,
+            # Read-only warm mirror mounted into the pod (SERGE_SHARED_MIRROR_PLAN).
+            # None/absent → a plain GitHub fetch; the mirror only shrinks it.
+            mirror_bare=(cfg.web_mirror_bare or None),
         )
         if checkout is None:
             raise TaskError(

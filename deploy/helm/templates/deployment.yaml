@@ -54,6 +54,12 @@ spec:
             # Persist the SQLite job store on the mounted volume.
             - name: WEB_STORE_PATH
               value: "{{ .Values.persistence.mountPath }}/jobs.db"
+            {{- if .Values.mirror.enabled }}
+            # Shared git mirror cache root (RWX). The warmer keeps bare repos
+            # under here; pods use them as a fetch seed. See mirror.* in values.
+            - name: WEB_MIRROR_DIR
+              value: "{{ .Values.mirror.mountPath }}"
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -70,6 +76,10 @@ spec:
           volumeMounts:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
+            {{- if .Values.mirror.enabled }}
+            - name: mirror
+              mountPath: {{ .Values.mirror.mountPath }}
+            {{- end }}
       volumes:
         - name: data
           {{- if .Values.persistence.enabled }}
@@ -78,6 +88,11 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if .Values.mirror.enabled }}
+        - name: mirror
+          persistentVolumeClaim:
+            claimName: {{ include "name" . }}-mirror
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{ toYaml . | nindent 8 }}
       {{- end }}

@@ -21,6 +21,26 @@ persistence:
   size: 5Gi
   mountPath: /var/lib/reviewbot
 
+# Shared git mirror cache (SERGE_SHARED_MIRROR_PLAN.md). When enabled, the chart
+# creates a second PVC (ReadWriteMany) that serge mounts read-write to keep warm
+# bare git mirrors. Task/review pods mount the same claim read-only (per-repo
+# subPath) and use each mirror as a fetch seed so their GitHub fetch shrinks to a
+# delta. Requires an RWX storage class (e.g. an EFS-backed class on EKS) — the
+# default RWO -data class will NOT work here. Leave disabled to keep today's
+# behaviour (pods clone the tip straight from GitHub).
+mirror:
+  enabled: false
+  # RWX storage class for the mirror PVC. REQUIRED when enabled; "" would fall
+  # back to the (RWO) cluster default, which cannot be shared into pods.
+  storageClass: ""
+  accessMode: ReadWriteMany
+  size: 50Gi
+  # Where serge mounts the mirror read-write. The warmer writes bare repos under
+  # <mountPath>/repos/<owner>__<repo>.git; WEB_MIRROR_DIR is set to this.
+  mountPath: /var/lib/reviewbot/mirror
+  # How often the warmer refreshes each mirrored repo (git fetch --prune).
+  updateIntervalSeconds: 300
+
 service:
   type: ClusterIP
   port: 80

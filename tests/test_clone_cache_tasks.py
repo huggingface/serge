@@ -117,6 +117,100 @@ class AcquireRefTests(unittest.TestCase):
         co = self._acquire(ref="nope", job_id="jobX")
         self.assertIsNone(co)
 
+    def _make_mirror(self):
+        """A warm bare mirror of ``src`` at its current tip, as the shared
+        mirror PVC would hold it."""
+        mirror = os.path.join(self._tmp.name, "mirror.git")
+        _git(self._tmp.name, "clone", "--quiet", "--bare", self.src, mirror)
+        return mirror
+
+    def test_mirror_seeded_checkout_is_self_contained_and_correct(self):
+        # Warm the mirror at the base, then push a delta to upstream so the
+        # ref tip is newer than the mirror (the realistic case).
+        mirror = self._make_mirror()
+        self._write("hello.txt", "hi patched via delta\n")
+        self._write("newfile.txt", "brand new\n")
+        _git(self.src, "add", "-A")
+        _git(self.src, "commit", "--quiet", "-m", "delta")
+
+        co = self.cache.acquire_ref(
+            token="",
+            owner="acme",
+            repo="widget",
+            ref="main",
+            job_id="mirrorjob",
+            remote_url=self.src,
+            standalone=True,
+            mirror_bare=mirror,
+        )
+        self.assertIsNotNone(co)
+        # The delta (newer than the mirror) must be present — proves the GitHub
+        # top-up fetch ran on top of the mirror seed.
+        with open(os.path.join(co.path, "hello.txt")) as f:
+            self.assertEqual(f.read(), "hi patched via delta\n")
+        self.assertTrue(os.path.isfile(os.path.join(co.path, "newfile.txt")))
+
+        # --dissociate must leave the worktree self-contained: no alternates
+        # pointer into the (read-only) mirror.
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(co.path, ".git", "objects", "info", "alternates")
+            ),
+            "worktree must not keep an alternates pointer into the mirror",
+        )
+        # Prove it: git works after the mirror is deleted, with an empty HOME so
+        # nothing outside the checkout can satisfy the objects.
+        import shutil as _shutil
+
+        _shutil.rmtree(mirror)
+        proc = subprocess.run(
+            ["git", "-C", co.path, "log", "--oneline"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", ""), "HOME": "/nonexistent"},
+        )
+        self.assertIn("delta", proc.stdout)
+
+    def test_mirror_absent_path_falls_back_gracefully(self):
+        # A mirror_bare that doesn't exist must not break the checkout — it
+        # falls back to a plain GitHub fetch (no alternate written).
+        co = self.cache.acquire_ref(
+            token="",
+            owner="acme",
+            repo="widget",
+            ref="main",
+            job_id="nomirror",
+            remote_url=self.src,
+            standalone=True,
+            mirror_bare=os.path.join(self._tmp.name, "does-not-exist.git"),
+        )
+        self.assertIsNotNone(co)
+        with open(os.path.join(co.path, "hello.txt")) as f:
+            self.assertEqual(f.read(), "hi from main\n")
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(co.path, ".git", "objects", "info", "alternates")
+            )
+        )
+
+    def test_mirror_ignored_for_linked_worktree(self):
+        # mirror_bare only applies to standalone clones; a linked worktree
+        # (standalone=False) must ignore it and stay a normal worktree.
+        mirror = self._make_mirror()
+        co = self.cache.acquire_ref(
+            token="",
+            owner="acme",
+            repo="widget",
+            ref="main",
+            job_id="linkedmirror",
+            remote_url=self.src,
+            standalone=False,
+            mirror_bare=mirror,
+        )
+        self.assertIsNotNone(co)
+        self.assertTrue(os.path.isfile(os.path.join(co.path, ".git")))
+
     def test_apply_patch_and_collect_changes(self):
         co = self._acquire()
         patch = (

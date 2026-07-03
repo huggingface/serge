@@ -250,6 +250,9 @@ def build_task_job_manifest(
     clone_dir: str = "/tmp/serge-clones",
     uid: Optional[int] = None,
     gid: Optional[int] = None,
+    mirror_claim: Optional[str] = None,
+    mirror_subpath: Optional[str] = None,
+    mirror_mount: str = "/mnt/serge-mirror",
     ttl: int = _TTL_AFTER_FINISHED,
 ) -> dict:
     """Build the ``batch/v1`` Job manifest for one task runner pod (pure).
@@ -259,7 +262,14 @@ def build_task_job_manifest(
     the allowlisting egress gateway (injected as ``HTTPS_PROXY``/``HTTP_PROXY``);
     ``no_proxy`` keeps in-cluster traffic (serge's callback) off the proxy. The
     pod holds no API token (``automountServiceAccountToken: false``) — it creates
-    no sub-Jobs; the network firewall is the isolation boundary."""
+    no sub-Jobs; the network firewall is the isolation boundary.
+
+    When ``mirror_claim`` + ``mirror_subpath`` are given, the shared mirror PVC is
+    mounted **read-only** at ``mirror_mount`` via the per-repo ``subPath`` (so the
+    pod sees only its own repo's bare mirror, not the whole mirror), and
+    ``WEB_MIRROR_BARE`` points the runner at it as a fetch seed
+    (SERGE_SHARED_MIRROR_PLAN.md). Omitted → today's behaviour (clone from GitHub)."""
+    mount_mirror = bool(mirror_claim and mirror_subpath)
     if not image:
         raise K8sSandboxError(
             "kubernetes task backend requires a configured runner image "
@@ -273,6 +283,8 @@ def build_task_job_manifest(
         {"name": "SERGE_TASK_SPEC", "value": _SPEC_MOUNT_PATH},
         {"name": "WEB_CLONE_CACHE_DIR", "value": clone_dir},
     ]
+    if mount_mirror:
+        env.append({"name": "WEB_MIRROR_BARE", "value": mirror_mount})
     if proxy:
         for name in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
             env.append({"name": name, "value": proxy})
@@ -293,6 +305,17 @@ def build_task_job_manifest(
             {"name": "tmp", "mountPath": "/tmp"},
         ],
     }
+    if mount_mirror:
+        # Read-only, per-repo subPath: the pod sees only its own repo's bare
+        # mirror and cannot write to shared storage.
+        container["volumeMounts"].append(
+            {
+                "name": "mirror",
+                "mountPath": mirror_mount,
+                "subPath": mirror_subpath,
+                "readOnly": True,
+            }
+        )
     if memory:
         container["resources"] = {"limits": {"memory": memory}}
 
@@ -317,6 +340,16 @@ def build_task_job_manifest(
             {"name": "tmp", "emptyDir": {}},
         ],
     }
+    if mount_mirror:
+        pod_spec["volumes"].append(
+            {
+                "name": "mirror",
+                "persistentVolumeClaim": {
+                    "claimName": mirror_claim,
+                    "readOnly": True,
+                },
+            }
+        )
     if settings.service_account:
         pod_spec["serviceAccountName"] = settings.service_account
     if settings.node_selector:
@@ -404,6 +437,9 @@ def run_task_job(
     clone_dir: str = "/tmp/serge-clones",
     uid: Optional[int] = None,
     gid: Optional[int] = None,
+    mirror_claim: Optional[str] = None,
+    mirror_subpath: Optional[str] = None,
+    mirror_mount: str = "/mnt/serge-mirror",
     poll_interval: float = _DEFAULT_POLL_INTERVAL,
 ) -> tuple[int, str]:
     """Launch one task runner Job for ``spec`` and block until it terminates.
@@ -426,6 +462,9 @@ def run_task_job(
         clone_dir=clone_dir,
         uid=uid,
         gid=gid,
+        mirror_claim=mirror_claim,
+        mirror_subpath=mirror_subpath,
+        mirror_mount=mirror_mount,
     )
     _, core = _load_clients()
     try:
@@ -461,6 +500,9 @@ def create_task_job(
     clone_dir: str = "/tmp/serge-clones",
     uid: Optional[int] = None,
     gid: Optional[int] = None,
+    mirror_claim: Optional[str] = None,
+    mirror_subpath: Optional[str] = None,
+    mirror_mount: str = "/mnt/serge-mirror",
 ) -> tuple[str, str]:
     """Create the task Job + its per-job Secret and return ``(job_name,
     namespace)`` **without waiting** — the non-blocking launch path
@@ -487,6 +529,9 @@ def create_task_job(
         clone_dir=clone_dir,
         uid=uid,
         gid=gid,
+        mirror_claim=mirror_claim,
+        mirror_subpath=mirror_subpath,
+        mirror_mount=mirror_mount,
     )
     batch, core = _load_clients()
 

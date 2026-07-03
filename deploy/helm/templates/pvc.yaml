@@ -15,3 +15,26 @@ spec:
   storageClassName: {{ .Values.persistence.storageClass | quote }}
   {{- end }}
 {{- end }}
+{{- if .Values.mirror.enabled }}
+---
+# Shared git mirror cache (SERGE_SHARED_MIRROR_PLAN.md). serge mounts this
+# ReadWriteMany so the warmer keeps warm bare mirrors here; task/review pods
+# mount the same claim read-only (per-repo subPath) and use each mirror as a
+# fetch seed. Separate from the RWO -data PVC on purpose: jobs.db is a single
+# SQLite writer and must NOT live on a shared filesystem.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "name" . }}-mirror
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "labels.standard" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.mirror.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.mirror.size | quote }}
+  {{- if .Values.mirror.storageClass }}
+  storageClassName: {{ .Values.mirror.storageClass | quote }}
+  {{- end }}
+{{- end }}
