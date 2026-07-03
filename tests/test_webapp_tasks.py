@@ -704,6 +704,127 @@ class TaskLauncherTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         cleanup.assert_called_once_with("serge-task-x", "serge")
 
+    # --- review pods (REVIEW_EXECUTION) ----------------------------------
+    def _review_job(self, webapp):
+        job = webapp.Job(
+            id="rev123abc456",
+            user="octocat",
+            target_owner="acme",
+            target_repo="widgets",
+            target_number=7,
+            trigger_comment="@serge review",
+            llm_provider="hf",
+            llm_api_base="https://example.com/v1",
+            llm_model="model",
+            created_at=0,
+            status="running",
+            source="web",
+            kind="review",
+            callback_token="cbtok",
+        )
+        job.loop = None
+        with webapp._jobs_lock:
+            webapp._jobs[job.id] = job
+        return job
+
+    def test_launch_review_pod_kubernetes_is_nonblocking(self):
+        webapp = self._import_webapp(
+            REVIEW_EXECUTION="kubernetes", TASK_RUNNER_IMAGE="serge/runner:latest"
+        )
+        job = self._review_job(webapp)
+        req = webapp.ReviewRequest(
+            owner="acme",
+            repo="widgets",
+            number=7,
+            trigger_comment_id=0,
+            trigger_comment_body="@serge review",
+            commenter="octocat",
+        )
+        captured = {}
+
+        def fake_create(spec, opts, *, timeout):
+            captured["spec"] = spec
+            return "serge-task-rev", "serge"
+
+        with (
+            patch.object(webapp, "create_kubernetes", side_effect=fake_create),
+            patch.object(webapp, "_notify_task_finished") as notify,
+            patch.object(webapp, "_persist_terminal") as persist,
+        ):
+            webapp._launch_review_pod(job, webapp.cfg, req, "gh-token")
+
+        self.assertEqual(captured["spec"]["request_type"], "review")
+        self.assertEqual(captured["spec"]["github_token"], "gh-token")
+        # Non-blocking: still running, token live, not finalized.
+        self.assertEqual(job.status, "running")
+        self.assertIsNotNone(job.callback_token)
+        notify.assert_not_called()
+        persist.assert_not_called()
+        task = webapp._pod_tasks[job.id]
+        self.assertEqual(task.backend, "kubernetes")
+        self.assertEqual(task.job_name, "serge-task-rev")
+
+    def test_finalize_review_does_not_slack_notify(self):
+        # Reviews carry a ReviewRequest (no slack fields); finalize must persist
+        # but never call the task slack notifier.
+        webapp = self._import_webapp(REVIEW_EXECUTION="kubernetes")
+        job = self._review_job(webapp)
+        req = webapp.ReviewRequest(
+            owner="acme",
+            repo="widgets",
+            number=7,
+            trigger_comment_id=0,
+            trigger_comment_body="x",
+            commenter="octocat",
+        )
+        webapp._pod_tasks[job.id] = webapp._PodTask(
+            job=job, worker_cfg=webapp.cfg, req=req, backend="kubernetes"
+        )
+        with (
+            patch.object(webapp, "_notify_task_finished") as notify,
+            patch.object(webapp, "_persist_terminal") as persist,
+        ):
+            self.assertTrue(webapp._finalize_task(job.id))
+        notify.assert_not_called()
+        persist.assert_called_once()
+
+    def test_ingest_review_reconstructs_draft(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp(REVIEW_EXECUTION="kubernetes")
+        job = self._review_job(webapp)
+        # Encode a draft the way the review pod would.
+        draft = webapp.decode_draft(
+            '{"owner":"acme","repo":"widgets","number":7,"head_sha":"abc",'
+            '"summary":"looks fine","event":"COMMENT","comments":[]}'
+        )
+        from reviewbot.store import encode_draft
+
+        with patch.object(webapp, "_persist_terminal"), patch.object(
+            webapp, "_notify_task_finished"
+        ):
+            client = TestClient(webapp.app)
+            r = client.post(
+                f"/internal/tasks/{job.id}/events",
+                json={
+                    "terminal": {
+                        "status": "done",
+                        "result": {
+                            "draft": encode_draft(draft),
+                            "prompt_tokens": 100,
+                            "completion_tokens": 25,
+                        },
+                    }
+                },
+                headers={"Authorization": "Bearer cbtok"},
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(job.status, "done")
+        self.assertIsNotNone(job.draft)
+        self.assertEqual(job.draft.summary, "looks fine")
+        self.assertEqual(job.draft.prompt_tokens, 100)
+        self.assertEqual(job.draft.completion_tokens, 25)
+
     # --- POST /internal/tasks/{id}/events --------------------------------
     def test_ingest_rejects_missing_token(self):
         if TestClient is None:

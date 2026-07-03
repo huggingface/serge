@@ -1063,6 +1063,11 @@ def _run_review_worker(job: Job) -> None:
         worker_cfg = dataclasses.replace(
             worker_cfg, llm_max_input_tokens=job.llm_max_input_tokens
         )
+    if cfg.review_execution != "inprocess":
+        # Run the review in an isolated pod; it streams the draft back over the
+        # callback and serge publishes on the human's approval (Phase 3).
+        _launch_review_pod(job, worker_cfg, req, token)
+        return
     _execute_review(job, worker_cfg, gh, token, req, auto_publish=False)
 
 
@@ -1285,7 +1290,10 @@ def _finalize_task(job_id: str) -> bool:
         task.finalized = True
     job = task.job
     job.callback_token = None
-    _notify_task_finished(task.worker_cfg, task.req, job)
+    # Slack task-finished notification is task-only (reviews use the UI/SSE and
+    # carry a ReviewRequest, which has no notification fields).
+    if job.kind == "task":
+        _notify_task_finished(task.worker_cfg, task.req, job)
     _persist_terminal(job)
     return True
 
@@ -1496,6 +1504,126 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
 
     # Reached for docker (success or failure) and for any launch failure — but
     # NOT the kubernetes success path (which returned above). Finalize once.
+    _finalize_task(job.id)
+    _untrack_pod_task(job.id)
+
+
+def _launch_review_pod(
+    job: Job, worker_cfg: Config, req: ReviewRequest, token: str
+) -> None:
+    """Out-of-process launcher for a UI PR review (REVIEW_EXECUTION != inprocess,
+    SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 3). Mirrors :func:`_launch_task_pod`:
+    kubernetes is non-blocking (the watcher/callback reconcile), docker blocks.
+    The pod runs ``prepare_review`` and streams the draft back over the callback;
+    publish still happens in serge on the human's approval. ``token`` is the
+    installation token serge already minted for this repo."""
+
+    def emit(kind: str, text: str) -> None:
+        _push_event(job, kind, text)
+
+    def fail(message: str) -> None:
+        job.status = "error"
+        job.error = message
+        emit("step", "error")
+        emit("error", message)
+        emit("done", "")
+
+    task = _PodTask(
+        job=job,
+        worker_cfg=worker_cfg,
+        req=req,  # a ReviewRequest here; _finalize only needs it for notify
+        backend=cfg.review_execution,
+        deadline=time.monotonic() + (cfg.task_runner_timeout or 3600) + 60,
+    )
+    with _pod_tasks_lock:
+        _pod_tasks[job.id] = task
+
+    image = cfg.review_runner_image or cfg.task_runner_image
+    try:
+        if cfg.review_execution not in ("docker", "kubernetes"):
+            raise TaskError(
+                f"review_execution={cfg.review_execution!r} is not a launcher backend",
+                status_code=501,
+            )
+        if not image:
+            raise TaskError(
+                "REVIEW_RUNNER_IMAGE / TASK_RUNNER_IMAGE is not configured",
+                status_code=500,
+            )
+        if not cfg.task_callback_base_url:
+            raise TaskError("TASK_CALLBACK_BASE_URL is not configured", status_code=500)
+
+        callback_token = secrets.token_urlsafe(32)
+        job.callback_token = callback_token
+        spec = build_spec(
+            job_id=job.id,
+            request=dataclasses.asdict(req),
+            github_token=token,
+            request_type="review",
+            llm={
+                "api_base": worker_cfg.llm_api_base,
+                "api_key": worker_cfg.llm_api_key,
+                "model": worker_cfg.llm_model,
+                "bill_to": worker_cfg.llm_bill_to,
+                "stream": worker_cfg.llm_stream,
+            },
+            config=runner_config(worker_cfg),
+            callback_url=(
+                f"{cfg.task_callback_base_url}/internal/tasks/{job.id}/events"
+            ),
+            callback_token=callback_token,
+        )
+        emit("step", "launch")
+        emit("log", f"Launching review runner ({cfg.review_execution}: {image})…")
+
+        if cfg.review_execution == "kubernetes":
+            job_name, namespace = create_kubernetes(
+                spec,
+                K8sLaunchOptions(
+                    image=image,
+                    namespace=cfg.task_k8s_namespace,
+                    service_account=cfg.task_k8s_service_account,
+                    node_selector=parse_node_selector(cfg.task_k8s_node_selector),
+                    proxy=cfg.task_runner_proxy,
+                    no_proxy=cfg.task_runner_no_proxy,
+                    memory=cfg.task_runner_memory,
+                ),
+                timeout=cfg.task_runner_timeout,
+            )
+            with _pod_tasks_lock:
+                task.job_name = job_name
+                task.namespace = namespace
+            return  # watcher + callback own the rest
+
+        code, _out = launch_docker(
+            spec,
+            DockerLaunchOptions(
+                image=image,
+                network=cfg.task_runner_network,
+                proxy=cfg.task_runner_proxy,
+                memory=cfg.task_runner_memory,
+                name=f"serge-review-{job.id[:12]}",
+            ),
+            wait=True,
+            timeout=cfg.task_runner_timeout,
+        )
+        if job.status == "running":
+            log.warning(
+                "review %s runner exited (code=%s) with no terminal callback",
+                job.id,
+                code,
+            )
+            fail(f"review runner exited without reporting (exit code {code})")
+    except (TaskError, AppNotInstalledError, K8sSandboxError) as exc:
+        log.warning("review %s launch failed: %s", job.id, exc)
+        fail(str(exc))
+    except subprocess.TimeoutExpired:
+        log.warning("review %s runner timed out", job.id)
+        fail(f"review runner timed out after {cfg.task_runner_timeout}s")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("review launcher crashed for job %s", job.id)
+        fail(f"{type(exc).__name__}: review launch crashed (see server log)")
+
     _finalize_task(job.id)
     _untrack_pod_task(job.id)
 
@@ -2639,7 +2767,7 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
         job = _jobs.get(job_id)
     if (
         job is None
-        or job.kind != "task"
+        or job.kind not in ("task", "review")
         or not job.callback_token
         or not hmac.compare_digest(token, job.callback_token)
     ):
@@ -2655,7 +2783,17 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
     terminal = payload.get("terminal")
     if isinstance(terminal, dict):
         result = terminal.get("result")
-        if isinstance(result, dict):
+        if job.kind == "review":
+            # A review pod ships the draft (store.encode_draft) + token counts;
+            # rebuild job.draft so the existing UI publish flow works unchanged.
+            if isinstance(result, dict) and result.get("draft"):
+                draft = decode_draft(result["draft"])
+                if draft is not None:
+                    draft.prompt_tokens = int(result.get("prompt_tokens") or 0)
+                    draft.completion_tokens = int(result.get("completion_tokens") or 0)
+                    draft.truncated_chunks = int(result.get("truncated_chunks") or 0)
+                job.draft = draft
+        elif isinstance(result, dict):
             job.task_result = result
             try:
                 _store.save_task_result(job.id, _json.dumps(result))

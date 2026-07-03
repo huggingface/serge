@@ -86,6 +86,7 @@ def build_spec(
     callback_token: str,
     config: Optional[dict[str, Any]] = None,
     repo_remote_url: Optional[str] = None,
+    request_type: str = "task",
 ) -> dict[str, Any]:
     """Assemble the ``task.json`` payload the runner reads. ``request`` is a
     serialized :class:`reviewbot.tasks.TaskRequest`; ``llm`` is the per-repo
@@ -98,6 +99,7 @@ def build_spec(
         "job_id": job_id,
         "request": request,
         "github_token": github_token,
+        "request_type": request_type,
         "llm": llm,
         "config": config or {},
         "callback": {"url": callback_url, "token": callback_token},

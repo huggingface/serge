@@ -77,6 +77,9 @@ class RunnerSpec:
     job_id: str
     request: dict[str, Any]
     github_token: str
+    # "task" (write-capable /tasks flow) or "review" (read-only PR review). The
+    # pod entrypoint dispatches on this (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 3).
+    request_type: str = "task"
     llm: dict[str, Any] = field(default_factory=dict)
     # Resolved-worker-Config subset serge sends (see launcher.runner_config): the
     # per-task LLM caps + strict tool mode and the operator/repo normalize/review
@@ -98,6 +101,7 @@ class RunnerSpec:
             job_id=str(data["job_id"]),
             request=dict(data["request"]),
             github_token=str(data["github_token"]),
+            request_type=str(data.get("request_type") or "task"),
             llm=dict(data.get("llm") or {}),
             config=dict(data.get("config") or {}),
             callback=dict(data.get("callback") or {}),
@@ -405,6 +409,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.error("could not load task spec: %s", exc)
         return 2
 
+    if spec.request_type == "review":
+        # Read-only PR review pod (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 3).
+        # Imported lazily to avoid a task_runner <-> review_runner import cycle.
+        from .review_runner import run as run_review
+
+        return run_review(spec)
     return run(spec)
 
 
