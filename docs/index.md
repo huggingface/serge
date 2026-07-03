@@ -15,8 +15,8 @@ positions.
 
 | Mode | Use it when | Where it runs |
 | ---- | ----------- | ------------- |
-| [GitHub Action](github-action.md) | You want the fastest setup and per-repo control | GitHub Actions |
-| [GitHub App webhook](github-app.md) | You want a hosted reviewer across many repos | Your server |
+| [GitHub Action](github-action.md) | You want per-repo control via a workflow file | GitHub Actions |
+| [GitHub App webhook](github-app.md) | You want a hosted reviewer across many repos with no per-repo workflow | Your server |
 | [Web app](web-app.md) | You want to edit or discard LLM output before it reaches a PR | Your server |
 
 Start with [Getting started](getting-started.md), then use the guide for the

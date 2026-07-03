@@ -28,8 +28,10 @@ the default `GITHUB_TOKEN` is usually read-only on forked PRs. That means the
 Action cannot safely receive `LLM_API_KEY` or post review comments on forked
 PRs.
 
-For fork-heavy repositories, use the [GitHub App webhook](github-app.md) or
-[web app](web-app.md) mode.
+For fork-heavy repositories, or to avoid adding a workflow and secret to every
+repo, use the [GitHub App webhook](github-app.md) mode: once the App is
+installed, repos need no workflow file at all. (Forked PRs remain limited even
+in App mode — see that guide.)
 
 ## Next Steps
 

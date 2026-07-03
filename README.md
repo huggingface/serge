@@ -8,8 +8,8 @@ It can run as:
 
 | Mode | Best for |
 | ---- | -------- |
-| GitHub Action | Quick setup and per-repo CI control |
-| GitHub App webhook | Hosted automation across many repositories |
+| GitHub Action | Per-repo CI control via a workflow file |
+| GitHub App webhook | Hosted automation across many repos, no per-repo workflow |
 | Web app | Human-in-the-loop staged reviews before publishing |
 
 ## Quick Start

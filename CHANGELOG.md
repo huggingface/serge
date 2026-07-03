@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- GitHub App mode is documented as the zero-config default: installed repos need
+  no workflow file or secret, with instructions for overriding gating via an
+  explicit workflow and a note on the forked-PR limitation.
+
+### Fixed
+
+- The trigger gate now ignores comments authored by a bot, so the App never
+  reacts to its own output (no self-trigger loops in App mode).
+
 ## [0.1.0] - 2026-06-17
 
 First public release of `serge`, a GitHub-native AI code reviewer for any

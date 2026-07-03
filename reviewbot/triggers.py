@@ -28,6 +28,11 @@ def build_review_request(
     comment = payload.get("comment") or {}
     if mention_trigger not in (comment.get("body") or ""):
         return None
+    # In App mode the webhook sees every comment on installed repos, including
+    # ones the App itself (or any other bot) posts. Never react to a bot's
+    # comment — that would let a stray mention in our own output loop forever.
+    if (comment.get("user") or {}).get("type") == "Bot":
+        return None
     if comment.get("author_association") not in ("MEMBER", "OWNER", "COLLABORATOR"):
         return None
 

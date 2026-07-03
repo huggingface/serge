@@ -134,6 +134,31 @@ class TriggerTests(unittest.TestCase):
         assert req is not None
         self.assertIsNone(req.inline)
 
+    def test_build_review_request_rejects_bot_authored_comment(self) -> None:
+        # In App mode the webhook receives the App's own comments; a stray
+        # trigger phrase in bot output must not start a review loop.
+        payload = {
+            "action": "created",
+            "comment": {
+                "body": "@askserge please review",
+                "author_association": "MEMBER",
+                "id": 123,
+                "user": {"login": "serge[bot]", "type": "Bot"},
+            },
+            "issue": {
+                "pull_request": {
+                    "url": "https://api.github.com/repos/acme/project/pulls/7"
+                },
+                "state": "open",
+                "number": 7,
+            },
+            "repository": {"full_name": "acme/project"},
+        }
+
+        req = build_review_request("issue_comment", payload, "@askserge")
+
+        self.assertIsNone(req)
+
     def test_build_review_request_rejects_non_matching_trigger(self) -> None:
         payload = {
             "action": "created",
