@@ -564,15 +564,11 @@ def list_task_pods(namespace: Optional[str] = None) -> tuple[str, list[dict]]:
 
     ns = resolve_namespace(K8sSettings(namespace=namespace))
     _, core = _load_clients()
-    selector = (
-        "app.kubernetes.io/managed-by=serge,app.kubernetes.io/component=task"
-    )
+    selector = "app.kubernetes.io/managed-by=serge,app.kubernetes.io/component=task"
     try:
         pods = core.list_namespaced_pod(ns, label_selector=selector).items
     except ApiException as exc:
-        raise K8sSandboxError(
-            f"could not list task pods: {exc.reason or exc}"
-        ) from exc
+        raise K8sSandboxError(f"could not list task pods: {exc.reason or exc}") from exc
     out: list[dict] = []
     for pod in pods:
         meta = getattr(pod, "metadata", None)

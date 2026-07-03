@@ -671,12 +671,8 @@ class TaskLauncherTests(unittest.TestCase):
     def test_admin_pods_shows_just_launched_task_without_pod(self):
         if TestClient is None:
             self.skipTest("fastapi not installed")
-        webapp = self._import_webapp(
-            TASK_EXECUTION="kubernetes", WEB_ADMIN_USERS="dev"
-        )
-        self._register_task(
-            webapp, backend="kubernetes", job_name="serge-task-new"
-        )
+        webapp = self._import_webapp(TASK_EXECUTION="kubernetes", WEB_ADMIN_USERS="dev")
+        self._register_task(webapp, backend="kubernetes", job_name="serge-task-new")
         # No pod in the cluster yet (just created).
         with patch.object(webapp, "list_task_pods", return_value=("serge", [])):
             client = TestClient(webapp.app)
@@ -687,12 +683,8 @@ class TaskLauncherTests(unittest.TestCase):
     def test_admin_pods_docker_backend_lists_tracked(self):
         if TestClient is None:
             self.skipTest("fastapi not installed")
-        webapp = self._import_webapp(
-            TASK_EXECUTION="docker", WEB_ADMIN_USERS="dev"
-        )
-        self._register_task(
-            webapp, backend="docker", job_name="serge-task-dkr"
-        )
+        webapp = self._import_webapp(TASK_EXECUTION="docker", WEB_ADMIN_USERS="dev")
+        self._register_task(webapp, backend="docker", job_name="serge-task-dkr")
         client = TestClient(webapp.app)
         data = client.get("/admin/pods/data").json()
         self.assertEqual(data["backend"], "docker")
@@ -701,9 +693,7 @@ class TaskLauncherTests(unittest.TestCase):
     def test_admin_pods_kill(self):
         if TestClient is None:
             self.skipTest("fastapi not installed")
-        webapp = self._import_webapp(
-            TASK_EXECUTION="kubernetes", WEB_ADMIN_USERS="dev"
-        )
+        webapp = self._import_webapp(TASK_EXECUTION="kubernetes", WEB_ADMIN_USERS="dev")
         with patch.object(webapp, "cleanup_task_job") as cleanup:
             client = TestClient(webapp.app)
             r = client.post(

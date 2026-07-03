@@ -2377,7 +2377,7 @@ def admin_pods_data(request: Request) -> JSONResponse:
         for task in tracked:
             rows.append(_pod_row(None, task))
 
-    rows.sort(key=lambda r: (r["start_epoch"] or 0), reverse=True)
+    rows.sort(key=lambda r: r["start_epoch"] or 0, reverse=True)
     return JSONResponse({"pods": rows, "backend": backend, "error": error})
 
 
