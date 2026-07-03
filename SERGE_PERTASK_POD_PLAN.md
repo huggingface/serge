@@ -1,20 +1,33 @@
 # Plan: one pod per task (whole LLM loop + normalize in-pod)
 
-Status: **All four phases built + deployed to prod (2026-07-02, release rev 19,
-image `sha-0f77376`).** Phase 1 proven locally; Phases 2–3 (launcher behind
-`TASK_EXECUTION`, docker + kubernetes backends, callback ingest, `serge-egress`
-Helm infra) and Phase 4 (deleted the dead normalize-Job code + Helm) landed with
-tests + `helm lint`. The runner-pod config-propagation gap found during Phase 4
-is **fixed** (see "Closed" below).
+Status: **COMPLETE — all four phases built, deployed to prod, and verified
+end-to-end (2026-07-03, release rev 20, image `sha-da3caca`).** Phase 1 proven
+locally; Phases 2–3 (launcher behind `TASK_EXECUTION`, docker + kubernetes
+backends, callback ingest, `serge-egress` Helm infra) and Phase 4 (deleted the
+dead normalize-Job code + Helm) landed with tests + `helm lint`. The runner-pod
+config-propagation gap found during Phase 4 is **fixed** (see "Closed" below).
 
 **Phase 3 live-cluster verification — network firewall DONE (2026-07-02).** From
 a real task-labeled pod (`serge.io/task-pod=true`) on prod: DNS resolves; git
 clone + `github.com` + `router.huggingface.co` succeed through the `serge-egress`
 proxy; `example.com` is 403-blocked; **direct egress bypassing the proxy is
 blocked** (the VPC-CNI NetworkPolicy is genuinely enforced); the serge callback
-Service is reachable via the NO_PROXY bypass. **Remaining: a full end-to-end task
-run** (real launcher → per-job Secret + Job → callback event stream → PR publish
-→ owner-referenced Secret GC) — deferred because it opens a real PR + spends LLM.
+Service is reachable via the NO_PROXY bypass.
+
+**Phase 3 full end-to-end DONE (2026-07-03).** A real `/tasks` run against
+`huggingface/transformers-test-ci` (dispatched via the in-VPC `aws-general-8-plus`
+runner) went green through the whole pipeline: launcher → per-job Secret + Job →
+in-pod checkout **through the proxy** → LLM edit → `make style`/checkers normalize
+→ **published PR** → callback event stream (200s) → owner-referenced Secret + Job
+GC'd. Checks (c) callback stream and (d) Secret GC confirmed.
+
+**Bug found + fixed by this verification:** the first e2e attempts errored at
+`could not check out …@main` after a 300s hang. Root cause: `CloneCache._env`
+was a curated env that dropped `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`, so the
+in-pod `git fetch` tried direct egress (blocked by the task-pod NetworkPolicy)
+and timed out. Fixed by passing the proxy vars through (serge PR #39); re-verified
+green. This is exactly the class of bug live verification exists to catch — the
+pod-per-task *infrastructure* was correct; a subprocess env leak defeated it.
 **Supersedes** `SERGE_PERTASK_AGENT_POD_PROPOSAL.md`, whose recommendation ("do
 not merge normalize into the agent pod, to preserve the deny-egress isolation")
 is reversed by an explicit operator decision: the per-task pod may reach the
@@ -88,13 +101,8 @@ own isolated Job.
 - Tests: task-Job/Secret builders, `run_task_job` orchestration, kubernetes
   dispatch. Full suite: **354 passing**.
 
-**Remaining (not code — verification / hardening):**
+**Remaining (not code — hardening / follow-ups):**
 
-- **Phase 3 full e2e (task run).** The network firewall is verified (above); what
-  remains is a real `/tasks` submission on prod to exercise the launcher →
-  per-job Secret + Job → callback event stream → PR publish, and confirm the
-  owner-referenced Secret is **GC'd** after the Job finishes. Deferred: it opens
-  a real PR + spends LLM, so it needs a safe target repo/issue + go-ahead.
 - **Wiz image trust (follow-up).** The three ghcr images (`serge`,
   `serge-task-runner`, `serge-egress`) fail the "Default image trust admission
   policy (Wiz CI/CD scan)" — currently **AUDIT-only** (non-blocking). Get them
