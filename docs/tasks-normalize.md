@@ -1,4 +1,7 @@
-# Normalize validation (in-loop)
+---
+title: Normalize validation (in-loop)
+nav_title: Normalize
+---
 
 When serge produces a fix through the [tasks flow](tasks-flow.md), the LLM
 proposes a logical patch — it does not run the target repo's build commands.

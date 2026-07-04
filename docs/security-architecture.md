@@ -1,4 +1,7 @@
-# Security architecture: isolating PR/fork code from the review host
+---
+title: "Security architecture: isolating PR/fork code from the review host"
+nav_title: Security architecture
+---
 
 ## Threat model
 
