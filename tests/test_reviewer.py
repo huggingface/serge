@@ -12,6 +12,8 @@ from reviewbot.reviewer import (
     _build_annotated_diff_chunks,
     _content_preview,
     _emit_chat_message,
+    _final_recovery_message,
+    _needs_final_salvage,
     _extract_json,
     _merge_chunk_event,
     _merge_chunk_summaries,
@@ -68,6 +70,34 @@ class EmitChatMessageTests(unittest.TestCase):
 
     def test_none_emit_is_a_noop(self) -> None:
         _emit_chat_message(None, "assistant", content="hi")  # must not raise
+
+
+class FinalSalvageTests(unittest.TestCase):
+    def test_empty_content_needs_salvage(self) -> None:
+        # The production failure: empty completion, finish_reason=None.
+        self.assertTrue(_needs_final_salvage(ChatResult(content="", finish_reason=None)))
+        self.assertTrue(
+            _needs_final_salvage(ChatResult(content="   \n", finish_reason=None))
+        )
+
+    def test_length_truncation_needs_salvage(self) -> None:
+        self.assertTrue(
+            _needs_final_salvage(ChatResult(content='{"partial', finish_reason="length"))
+        )
+
+    def test_good_answer_does_not_need_salvage(self) -> None:
+        self.assertFalse(
+            _needs_final_salvage(ChatResult(content='{"ok": true}', finish_reason="stop"))
+        )
+
+    def test_recovery_message_varies_by_cause(self) -> None:
+        empty = _final_recovery_message(ChatResult(content="", finish_reason=None))
+        truncated = _final_recovery_message(
+            ChatResult(content='{"partial', finish_reason="length")
+        )
+        self.assertIn("empty", empty)
+        self.assertIn("cut off", truncated)
+        self.assertNotEqual(empty, truncated)
 
 
 class AssistantToolCallDictTests(unittest.TestCase):

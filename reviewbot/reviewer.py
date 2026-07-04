@@ -656,6 +656,41 @@ _TRUNCATION_RECOVERY_MESSAGE = (
     "analysis, no explanation, no <think> block, no markdown fences. Keep it "
     "minimal so the whole answer fits within the output limit."
 )
+# An empty final answer (blank content, usually finish_reason=None) means the
+# model returned nothing parseable — often the provider truncated the stream on
+# a very large context. Re-ask once, tool-free, for just the JSON — same
+# recovery path as the length-truncation case, bounded by the same retry cap.
+_EMPTY_ANSWER_RECOVERY_MESSAGE = (
+    "Your previous reply was empty — no JSON object came through. Reply now "
+    "with ONLY the final JSON object the task requires: no analysis, no "
+    "explanation, no <think> block, no markdown fences."
+)
+
+
+def _needs_final_salvage(chat: ChatResult) -> bool:
+    """True when a tool-free final answer should be re-asked rather than
+    parsed: it either hit the output-token limit (``finish_reason="length"``)
+    or came back with blank content (commonly ``finish_reason=None`` when the
+    provider truncates the stream on a very large context)."""
+    return chat.finish_reason == "length" or not (chat.content or "").strip()
+
+
+def _final_recovery_message(chat: ChatResult) -> str:
+    blank = not (chat.content or "").strip()
+    return _EMPTY_ANSWER_RECOVERY_MESSAGE if blank else _TRUNCATION_RECOVERY_MESSAGE
+
+
+def _emit_final_salvage(
+    emit: Optional[Callable[[str, str], None]], chat: ChatResult, attempt: int
+) -> None:
+    if emit is None:
+        return
+    what = "empty" if not (chat.content or "").strip() else "truncated"
+    emit(
+        "log",
+        f"Final answer was {what} (finish_reason={chat.finish_reason}); re-asking "
+        f"for the JSON only (recovery {attempt}/{_MAX_TRUNCATION_RETRIES})",
+    )
 
 
 def _run_agentic_loop(
@@ -819,26 +854,21 @@ def _run_agentic_loop(
         )
 
         if not chat.tool_calls:
-            # Salvage a truncated final answer before anything else: the model
-            # ran out of output budget mid-JSON (reasoning ate it). Re-ask for
-            # the JSON only, tool-less and low-reasoning, instead of returning
-            # unparseable content that fails the whole task.
+            # Salvage a truncated OR empty final answer before anything else:
+            # the model either ran out of output budget mid-JSON
+            # (finish_reason="length", reasoning ate it) or returned nothing
+            # parseable at all (blank content — commonly finish_reason=None when
+            # the provider truncates a huge-context stream). Re-ask for the JSON
+            # only, tool-less and low-reasoning, instead of returning content
+            # that just fails the parse.
             if (
-                chat.finish_reason == "length"
+                _needs_final_salvage(chat)
                 and truncation_retries < _MAX_TRUNCATION_RETRIES
             ):
                 truncation_retries += 1
-                if emit is not None:
-                    emit(
-                        "log",
-                        "Final answer hit the output-token limit "
-                        f"(recovery {truncation_retries}/{_MAX_TRUNCATION_RETRIES}); "
-                        "re-asking for the JSON only",
-                    )
+                _emit_final_salvage(emit, chat, truncation_retries)
                 messages.append({"role": "assistant", "content": chat.content or None})
-                messages.append(
-                    {"role": "user", "content": _TRUNCATION_RECOVERY_MESSAGE}
-                )
+                messages.append({"role": "user", "content": _final_recovery_message(chat)})
                 force_json_only = True
                 continue
             if validate is None:
@@ -954,6 +984,25 @@ def _run_agentic_loop(
         if chat.completion_tokens is not None:
             metrics.completion_tokens += chat.completion_tokens
         _emit_metrics(emit, metrics)
+        _emit_chat_message(
+            emit,
+            "assistant",
+            content=chat.content,
+            reasoning_chars=chat.reasoning_chars,
+            finish_reason=chat.finish_reason,
+        )
+
+        # Salvage an empty/truncated forced-final answer before validating or
+        # returning it. This is the exact failure the budget-exhausted path used
+        # to die on: an empty completion (finish_reason=None) went straight to
+        # the parser and surfaced as "LLM returned unparseable output". Re-ask
+        # for the JSON only instead (bounded by _MAX_TRUNCATION_RETRIES).
+        if _needs_final_salvage(chat) and truncation_retries < _MAX_TRUNCATION_RETRIES:
+            truncation_retries += 1
+            _emit_final_salvage(emit, chat, truncation_retries)
+            messages.append({"role": "assistant", "content": chat.content or None})
+            messages.append({"role": "user", "content": _final_recovery_message(chat)})
+            continue
 
         # The verification gate must run on the forced final answer too —
         # exhausting the tool budget must not silently bypass validation (for
