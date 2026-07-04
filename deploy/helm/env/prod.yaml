@@ -61,7 +61,14 @@ envVars:
   LLM_MAX_TOKENS: "49152"
   TOOL_MAX_ITERATIONS: "30"
   TASK_LLM_MAX_TOKENS: "49152"
-  TASK_TOOL_MAX_ITERATIONS: "30"
+  # Tasks run in STRICT budget mode (every tool call counts, not just blind
+  # turns — see reviewer._run_tool_loop), to preserve output budget for the
+  # final patch JSON. 30 was too tight for a repo the size of transformers:
+  # the agent spent the whole budget exploring and never emitted a patch, so
+  # the forced tool-free final turn returned empty/unparseable output. Give
+  # large-repo fixes room to converge. Higher = more exploration but larger
+  # per-turn context (cost + latency); tune against the target repo.
+  TASK_TOOL_MAX_ITERATIONS: "80"
   # Normalize gate for /tasks. In the pod-per-task model the runner runs this
   # command in-process (formerly the separate normalize Job). Unset = gate is
   # skipped entirely, so it MUST be set. Argv is shlex-split; bash -lc runs the
