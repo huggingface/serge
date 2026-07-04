@@ -141,9 +141,10 @@ class Config:
     # "high". Leave empty to omit the parameter entirely.
     llm_reasoning_effort: Optional[str] = None
     # Public URL to install/configure the GitHub App that backs this
-    # deployment. Surfaced on the /help page as the "Install the app"
-    # link. Defaults to the Hugging Face Serge App; override per-deploy
-    # via WEB_GITHUB_APP_URL.
+    # deployment. Defaults to the Hugging Face Serge App; override
+    # per-deploy via WEB_GITHUB_APP_URL. (No longer surfaced in the UI
+    # since the in-app help page was replaced by a link to the docs
+    # site; retained for deployment config compatibility.)
     web_github_app_url: Optional[str] = "https://github.com/apps/sergereview"
 
     # --- Tasks flow (POST /tasks) -------------------------------------

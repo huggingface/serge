@@ -4,6 +4,10 @@ title: How It Works
 
 ## Full Review Flow
 
+A review starts from an ordinary PR comment that mentions the trigger:
+
+![@askserge trigger comment on a PR]({{ "/assets/trigger-comment.png" | relative_url }})
+
 ```text
 trigger comment -> gate event -> fetch PR -> annotate diff -> call LLM -> validate -> publish
 ```
@@ -20,6 +24,11 @@ trigger comment -> gate event -> fetch PR -> annotate diff -> call LLM -> valida
 7. Inline comments are validated against the real diff positions.
 8. Invalid comments are dropped.
 9. The review is published, or in web app mode stored as an editable draft.
+
+The published result is a normal GitHub review — a summary plus inline comments
+on the diff:
+
+![A published Serge review on GitHub]({{ "/assets/github-review.png" | relative_url }})
 
 ## Follow-Up Flow
 

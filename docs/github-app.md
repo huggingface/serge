@@ -7,6 +7,13 @@ GitHub App mode runs a webhook server that listens for trigger comments, calls
 the LLM, and posts reviews with a GitHub App installation token. It is useful
 when you want one hosted reviewer to serve many repositories.
 
+![serge GitHub App data flow]({{ "/assets/github-app-flow.png" | relative_url }})
+
+A maintainer mentions `@askserge` on a PR; GitHub delivers the comment to
+`POST /webhook`; serge verifies the signature, gates the event, fetches and
+reviews the PR against an OpenAI-compatible LLM, and publishes the review back
+through the GitHub API.
+
 ## Create the GitHub App
 
 In GitHub, open **Settings -> Developer settings -> GitHub Apps -> New GitHub

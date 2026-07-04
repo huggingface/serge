@@ -9,6 +9,9 @@ header_pages:
   - github-action.md
   - github-app.md
   - web-app.md
+  - web-app-tour.md
+  - tasks-flow.md
+  - architecture.md
   - configuration.md
 
 defaults:
