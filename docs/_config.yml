@@ -4,6 +4,12 @@ theme: minima
 repository_url: https://github.com/huggingface/serge
 repository_api_url: https://api.github.com/repos/huggingface/serge
 
+# Rewrite repo-relative .md links (e.g. [Tasks](tasks-flow.md)) to their built
+# .html URLs. GitHub Pages enables this automatically; listing it here makes a
+# plain local `jekyll serve` behave the same instead of 404ing on .md links.
+plugins:
+  - jekyll-relative-links
+
 header_pages:
   - getting-started.md
   - github-action.md
