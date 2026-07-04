@@ -84,7 +84,26 @@
 
     const es = new EventSource(`${apiBase}/stream`);
     es.onmessage = (e) => { try { append(JSON.parse(e.data)); } catch { append(e.data); } };
-    ["step", "tool", "error", "log"].forEach(kind => {
+    // A `message` event is a JSON payload of what the model emitted that turn
+    // (reviewer._emit_chat_message); render it as one readable line.
+    function fmtMessage(txt) {
+      let m;
+      try { m = JSON.parse(txt); } catch (_) { return txt; }
+      if (!m || typeof m !== "object") return txt;
+      if (m.role === "tool") return `tool ⟵ ${m.name || "?"}: ${m.content || ""}`;
+      const parts = [];
+      if (m.content) parts.push(m.content);
+      if (Array.isArray(m.tool_calls) && m.tool_calls.length)
+        parts.push("→ " + m.tool_calls.map(t => `${t.name}(${t.arguments || ""})`).join(", "));
+      if (!m.content && !(m.tool_calls && m.tool_calls.length)) parts.push("(no content)");
+      const meta = [];
+      if (m.finish_reason != null && m.finish_reason !== "stop") meta.push(`finish=${m.finish_reason}`);
+      if (m.reasoning_chars) meta.push(`reasoning=${m.reasoning_chars}c`);
+      let s = `${m.role || "assistant"}: ${parts.join(" ")}`;
+      if (meta.length) s += ` [${meta.join(", ")}]`;
+      return s;
+    }
+    ["step", "tool", "error", "log", "chat"].forEach(kind => {
       es.addEventListener(kind, (e) => {
         // The browser also fires a native "error" event (no .data) on a
         // dropped connection; ignore those here — es.onerror handles them.
@@ -99,6 +118,7 @@
           b.className = "error";
           b.style.whiteSpace = "pre-wrap";
         }
+        if (kind === "chat") { append(`💬 ${fmtMessage(txt)}`); return; }
         append(kind === "log" ? txt : `[${kind}] ${txt}`);
       });
     });

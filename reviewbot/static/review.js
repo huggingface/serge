@@ -168,6 +168,40 @@
   const consolePending = [];
   let consoleFlushScheduled = false;
 
+  // A `message` event carries a JSON payload of what the model emitted that
+  // turn (see reviewer._emit_chat_message). Render it as a readable line.
+  function formatMessageEvent(text) {
+    let m;
+    try {
+      m = JSON.parse(text);
+    } catch (_) {
+      return text;
+    }
+    if (!m || typeof m !== "object") return text;
+    if (m.role === "tool") {
+      return `tool ⟵ ${m.name || "?"}: ${m.content || ""}`;
+    }
+    const parts = [];
+    if (m.content) parts.push(m.content);
+    if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      parts.push(
+        "→ " +
+          m.tool_calls.map((t) => `${t.name}(${t.arguments || ""})`).join(", "),
+      );
+    }
+    if (!m.content && !(m.tool_calls && m.tool_calls.length)) {
+      parts.push("(no content)");
+    }
+    const meta = [];
+    if (m.finish_reason != null && m.finish_reason !== "stop") {
+      meta.push(`finish=${m.finish_reason}`);
+    }
+    if (m.reasoning_chars) meta.push(`reasoning=${m.reasoning_chars}c`);
+    let s = `${m.role || "assistant"}: ${parts.join(" ")}`;
+    if (meta.length) s += ` [${meta.join(", ")}]`;
+    return s;
+  }
+
   function flushConsole() {
     consoleFlushScheduled = false;
     if (consolePending.length === 0) return;
@@ -179,8 +213,10 @@
       let prefix = streamed || consoleAtLineStart ? "" : "\n";
       if (kind === "log") prefix += "› ";
       else if (kind === "tool") prefix += "⚙ ";
+      else if (kind === "chat") prefix += "💬 ";
       else if (kind === "error") prefix += "✗ ";
-      const body = prefix + text + (streamed ? "" : "\n");
+      const shown = kind === "chat" ? formatMessageEvent(text) : text;
+      const body = prefix + shown + (streamed ? "" : "\n");
       span.textContent = body;
       frag.appendChild(span);
       consoleAtLineStart = body.endsWith("\n");
@@ -669,6 +705,13 @@
         appendConsole("tool", JSON.parse(ev.data));
       } catch {
         appendConsole("tool", ev.data);
+      }
+    });
+    es.addEventListener("chat", (ev) => {
+      try {
+        appendConsole("chat", JSON.parse(ev.data));
+      } catch {
+        appendConsole("chat", ev.data);
       }
     });
     es.addEventListener("reasoning", (ev) => {
