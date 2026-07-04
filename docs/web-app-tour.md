@@ -32,7 +32,8 @@ run it:
 
 - **Pull request** — a PR URL or `owner/repo#123`.
 - **Trigger comment** — plays the role of the comment you'd post on GitHub;
-  mention `@askserge` plus any extra instructions for this run.
+  start it with `@askserge` (the trigger must be the first word), plus any extra
+  instructions for this run.
 - **Provider / Model** — pick the provider and model. For Hugging Face the model
   field becomes a dropdown of tool-capable models from the
   [HF Inference Providers](https://router.huggingface.co) router.

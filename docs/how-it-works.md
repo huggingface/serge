@@ -4,7 +4,8 @@ title: How It Works
 
 ## Full Review Flow
 
-A review starts from an ordinary PR comment that mentions the trigger:
+A review starts from an ordinary PR comment that begins with the trigger
+(`@askserge` must be the first word):
 
 ![@askserge trigger comment on a PR]({{ "/assets/trigger-comment.png" | relative_url }})
 
