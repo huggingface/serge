@@ -71,7 +71,7 @@ GitHub sends comment events to `POST /webhook`. A review starts only when:
 
 - the event is `issue_comment` or `pull_request_review_comment`;
 - the action is `created`;
-- the comment contains the configured trigger, default `@askserge`;
+- the comment starts with the configured trigger, default `@askserge` (first word);
 - the author association is `MEMBER`, `OWNER`, or `COLLABORATOR`;
 - the PR is open.
 

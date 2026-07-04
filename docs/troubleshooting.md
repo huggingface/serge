@@ -8,7 +8,7 @@ Check that:
 
 - the event is `issue_comment` or `pull_request_review_comment`;
 - the comment was newly created;
-- the comment contains `MENTION_TRIGGER`, default `@askserge`;
+- the comment **starts with** `MENTION_TRIGGER`, default `@askserge` (first word);
 - the commenter is a `MEMBER`, `OWNER`, or `COLLABORATOR`;
 - the issue comment is on an open PR, not a plain issue.
 

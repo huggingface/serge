@@ -28,7 +28,8 @@ permissions:
 jobs:
   review:
     if: |
-      contains(github.event.comment.body, '@askserge') &&
+      (startsWith(trim(github.event.comment.body), '@askserge ') ||
+       trim(github.event.comment.body) == '@askserge') &&
       (github.event.comment.author_association == 'MEMBER' ||
        github.event.comment.author_association == 'OWNER' ||
        github.event.comment.author_association == 'COLLABORATOR')
@@ -51,11 +52,14 @@ reproducible behavior.
 
 ## Triggering Reviews
 
-Comment on an open PR:
+Comment on an open PR with `@askserge` as the **first word**:
 
 ```text
 @askserge please review
 ```
+
+Mentioning `@askserge` elsewhere in the comment (for example when asking a
+maintainer how to trigger a re-review) does **not** start a review.
 
 You can add instructions after the trigger:
 
