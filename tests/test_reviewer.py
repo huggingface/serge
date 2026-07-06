@@ -35,7 +35,9 @@ class EmitChatMessageTests(unittest.TestCase):
             content="looking at the diff",
             reasoning_chars=42,
             finish_reason="tool_calls",
-            tool_calls=[ToolCall(id="t0", name="read_file", arguments='{"path":"a.py"}')],
+            tool_calls=[
+                ToolCall(id="t0", name="read_file", arguments='{"path":"a.py"}')
+            ],
         )
         self.assertEqual(len(events), 1)
         kind, text = events[0]
@@ -75,19 +77,25 @@ class EmitChatMessageTests(unittest.TestCase):
 class FinalSalvageTests(unittest.TestCase):
     def test_empty_content_needs_salvage(self) -> None:
         # The production failure: empty completion, finish_reason=None.
-        self.assertTrue(_needs_final_salvage(ChatResult(content="", finish_reason=None)))
+        self.assertTrue(
+            _needs_final_salvage(ChatResult(content="", finish_reason=None))
+        )
         self.assertTrue(
             _needs_final_salvage(ChatResult(content="   \n", finish_reason=None))
         )
 
     def test_length_truncation_needs_salvage(self) -> None:
         self.assertTrue(
-            _needs_final_salvage(ChatResult(content='{"partial', finish_reason="length"))
+            _needs_final_salvage(
+                ChatResult(content='{"partial', finish_reason="length")
+            )
         )
 
     def test_good_answer_does_not_need_salvage(self) -> None:
         self.assertFalse(
-            _needs_final_salvage(ChatResult(content='{"ok": true}', finish_reason="stop"))
+            _needs_final_salvage(
+                ChatResult(content='{"ok": true}', finish_reason="stop")
+            )
         )
 
     def test_recovery_message_varies_by_cause(self) -> None:

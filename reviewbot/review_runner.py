@@ -35,9 +35,7 @@ def build_review_request(spec: RunnerSpec) -> ReviewRequest:
     only the fields the dataclass declares. ``inline`` (webhook follow-up
     context) is left at its default — UI reviews never carry it."""
     fields = {f.name for f in dataclasses.fields(ReviewRequest)}
-    kwargs = {
-        k: v for k, v in spec.request.items() if k in fields and k != "inline"
-    }
+    kwargs = {k: v for k, v in spec.request.items() if k in fields and k != "inline"}
     return ReviewRequest(**kwargs)
 
 

@@ -501,8 +501,7 @@ class Config:
                 os.environ.get("TASK_K8S_NODE_SELECTOR") or ""
             ).strip()
             or None,
-            task_egress_name=(os.environ.get("TASK_EGRESS_NAME") or "").strip()
-            or None,
+            task_egress_name=(os.environ.get("TASK_EGRESS_NAME") or "").strip() or None,
             slack_bot_token=(
                 os.environ.get("SLACK_CIFEEDBACK_BOT_TOKEN")
                 or os.environ.get("CI_SLACK_BOT_TOKEN")

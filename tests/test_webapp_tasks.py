@@ -800,8 +800,9 @@ class TaskLauncherTests(unittest.TestCase):
         )
         from reviewbot.store import encode_draft
 
-        with patch.object(webapp, "_persist_terminal"), patch.object(
-            webapp, "_notify_task_finished"
+        with (
+            patch.object(webapp, "_persist_terminal"),
+            patch.object(webapp, "_notify_task_finished"),
         ):
             client = TestClient(webapp.app)
             r = client.post(

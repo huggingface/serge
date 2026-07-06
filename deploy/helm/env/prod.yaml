@@ -9,7 +9,7 @@
 
 image:
   # Bump to a newer sha-<commit> (pushed by CI on merge to main) or use latest.
-  tag: sha-09bcf3a
+  tag: sha-bc6c73d
 
 replicas: 1
 
@@ -112,7 +112,7 @@ taskExecution:
     # draft on the terminal callback. false = reviews run in-process in serge.
     reviewPods: true
     # transformers toolchain + serge (docker/Dockerfile.task-runner).
-    image: ghcr.io/huggingface/serge-task-runner:sha-09bcf3a
+    image: ghcr.io/huggingface/serge-task-runner:sha-bc6c73d
     # Wall-clock cap per task (matches the old in-process worker budget).
     timeout: 3600
     # The in-pod normalizer (make style / checkers over transformers) is
@@ -122,4 +122,4 @@ taskExecution:
     nodeSelector: "scheduling.cast.ai/node-template=default-by-castai"
     egress:
       # Self-built tinyproxy (docker/Dockerfile.egress-proxy).
-      image: ghcr.io/huggingface/serge-egress:sha-09bcf3a
+      image: ghcr.io/huggingface/serge-egress:sha-bc6c73d

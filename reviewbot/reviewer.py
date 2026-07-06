@@ -868,7 +868,9 @@ def _run_agentic_loop(
                 truncation_retries += 1
                 _emit_final_salvage(emit, chat, truncation_retries)
                 messages.append({"role": "assistant", "content": chat.content or None})
-                messages.append({"role": "user", "content": _final_recovery_message(chat)})
+                messages.append(
+                    {"role": "user", "content": _final_recovery_message(chat)}
+                )
                 force_json_only = True
                 continue
             if validate is None:
