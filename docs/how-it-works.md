@@ -15,7 +15,8 @@ trigger comment -> gate event -> fetch PR -> annotate diff -> call LLM -> valida
 
 1. A comment event arrives from GitHub Actions or a GitHub App webhook.
 2. The trigger gate checks the event type, action, comment author association,
-   trigger phrase, and PR state.
+   trigger phrase, and PR state, and drops comments authored by a bot so the
+   App never reacts to its own output.
 3. The reviewer fetches PR metadata and changed files.
 4. Each diff hunk is annotated with addressable line markers such as `[R 42]`
    for the new side and `[L 11]` for the old side.
