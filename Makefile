@@ -1,4 +1,4 @@
-.PHONY: format test
+.PHONY: format style test
 
 PYTHON ?= python3
 VENV ?= .venv
@@ -14,5 +14,9 @@ $(VENV)/.installed: pyproject.toml
 format: $(VENV)/.installed
 	$(RUFF) format reviewbot tests
 
+style: format
+	$(RUFF) check --fix reviewbot tests
+
 test: $(VENV)/.installed
 	$(VENV_PYTHON) -m pytest tests/
+
