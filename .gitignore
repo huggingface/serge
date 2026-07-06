@@ -20,3 +20,6 @@ dist/
 deploy/helm/serge-secrets.yaml
 # Env-specific overlay with internal cluster/infra identifiers — keep local only.
 deploy/helm/env/normalize.example.yaml
+
+# Jekyll build output when serving with --source docs from the repo root.
+_site/

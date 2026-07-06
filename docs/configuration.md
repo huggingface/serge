@@ -23,7 +23,7 @@ environment variables in server modes.
 
 | Env var | Action input | Default | Description |
 | ------- | ------------ | ------- | ----------- |
-| `MENTION_TRIGGER` | `mention_trigger` | `@askserge` | Phrase that triggers reviews. |
+| `MENTION_TRIGGER` | `mention_trigger` | `@askserge` | Trigger phrase; must be the first word of the comment. |
 | `REVIEW_EVENT` | `review_event` | `COMMENT` | Fallback review event when the model omits one. |
 | `MAX_DIFF_CHARS` | `max_diff_chars` | `200000` | Maximum diff characters sent to the LLM. |
 | `REVIEW_RULES_PATH` | `review_rules_path` | `.ai/review-rules.md` | Rules file read from the target repo default branch. |

@@ -47,13 +47,21 @@ from .github_auth import (
     user_is_org_member,
 )
 from .github_client import GitHubClient
-from .k8s_sandbox import K8sSandboxError, parse_node_selector
+from .k8s_sandbox import (
+    K8sSandboxError,
+    cleanup_task_job,
+    collect_task_result,
+    list_task_pods,
+    parse_node_selector,
+    poll_task_job,
+    sync_egress_allowlist,
+)
 from .launcher import (
     DockerLaunchOptions,
     K8sLaunchOptions,
     build_spec,
+    create_kubernetes,
     launch_docker,
-    launch_kubernetes,
     runner_config,
 )
 from .errors import format_github_http_error as _format_github_http_error
@@ -332,6 +340,11 @@ class Job:
     # opened the EventSource.
     history: list[dict[str, Any]] = field(default_factory=list)
     history_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Monotonic per-event id, stamped in _push_event and emitted as the SSE
+    # `id:` field. On reconnect the browser sends Last-Event-ID; the stream
+    # skips replay events at/below it so a dropped-and-reconnected client
+    # doesn't re-render the whole transcript (the "doubled lines" bug).
+    event_seq: int = 0
     # Running tally of "noisy" (token/reasoning) entries currently in
     # history. Lets _push_event do bounded-FIFO eviction in O(1) average
     # instead of scanning the full history on every streaming chunk.
@@ -503,12 +516,17 @@ def _run_webhook_review_worker(
             _push_event(job, kind, text)
 
         if req.inline is not None:
-            # Inline follow-up: a focused reply on the comment thread.
-            # There is no draft, so the page just streams the console.
+            # Inline follow-up: a focused reply on the comment thread. There is
+            # no draft, so the page just streams the console. Kept in-process for
+            # now (a small, distinct LLM+write path); podding it is future work.
             run_followup(worker_cfg, gh, req, chunk_callback=emit)
             job.status = "done"
             emit("step", "done")
             emit("done", "")
+        elif cfg.review_execution != "inprocess":
+            # Full review in a pod; serge auto-publishes on the callback
+            # (job.source == "webhook"). Returns fast for the k8s backend.
+            _launch_review_pod(job, worker_cfg, req, token)
         else:
             _execute_review(job, worker_cfg, gh, token, req, auto_publish=True)
     except _UnparseableLLMOutput as exc:
@@ -767,6 +785,55 @@ def _llm_bill_to_for_provider(provider: str) -> Optional[str]:
     return cfg.llm_bill_to if provider == _LLM_PROVIDER_HF else None
 
 
+def _egress_llm_bases() -> list[str]:
+    """Every LLM host a pod-based review might dial: the built-in provider
+    bases, the deployment default, and every provider_config's base (custom
+    included). Feeds the serge-egress allowlist so reviews reach their provider
+    through the egress firewall."""
+    bases = set(_LLM_PROVIDER_BASES.values())
+    if cfg.llm_api_base:
+        bases.add(cfg.llm_api_base)
+    try:
+        rows = _store.list_provider_configs()
+    except Exception:  # noqa: BLE001 - allowlist upkeep must never break serge
+        log.warning("egress allowlist: could not list provider configs", exc_info=True)
+        rows = []
+    for row in rows:
+        api_base = (row.get("api_base") or "").strip()
+        if api_base:
+            bases.add(api_base)
+        else:
+            provider = row.get("provider") or ""
+            if provider in _LLM_PROVIDER_BASES:
+                bases.add(_LLM_PROVIDER_BASES[provider])
+    return sorted(bases)
+
+
+def _sync_egress_allowlist() -> None:
+    """Keep the serge-egress proxy allowlist current with the configured LLM
+    hosts. No-op unless reviews/tasks run in kubernetes pods behind that proxy
+    (``task_egress_name`` set). Blocking (k8s I/O) and fail-soft."""
+    if not cfg.task_egress_name:
+        return
+    if "kubernetes" not in (cfg.task_execution, cfg.review_execution):
+        return
+    sync_egress_allowlist(
+        _egress_llm_bases(),
+        egress_name=cfg.task_egress_name,
+        namespace=cfg.task_k8s_namespace,
+    )
+
+
+def _spawn_egress_sync() -> None:
+    """Run the allowlist sync off the request/event loop — it does blocking k8s
+    calls and a Deployment rollout we don't want to wait on."""
+    if not cfg.task_egress_name:
+        return
+    threading.Thread(
+        target=_sync_egress_allowlist, name="egress-allowlist-sync", daemon=True
+    ).start()
+
+
 def _prune_store() -> None:
     """Keep only the most recent ``web_job_retention`` jobs globally.
     Called on each new submission so we don't need a background sweeper."""
@@ -790,8 +857,10 @@ def _push_event(job: Job, kind: str, text: str) -> None:
     """Thread-safe push from the worker thread into the job's queue.
     Also appends to the replay buffer so late SSE subscribers get the
     full transcript."""
-    event = {"kind": kind, "text": text, "ts": time.time()}
     with job.history_lock:
+        seq = job.event_seq
+        job.event_seq += 1
+        event = {"kind": kind, "text": text, "ts": time.time(), "seq": seq}
         job.history.append(event)
         if kind in _NOISY_KINDS:
             job.noisy_history_count += 1
@@ -1056,6 +1125,11 @@ def _run_review_worker(job: Job) -> None:
         worker_cfg = dataclasses.replace(
             worker_cfg, llm_max_input_tokens=job.llm_max_input_tokens
         )
+    if cfg.review_execution != "inprocess":
+        # Run the review in an isolated pod; it streams the draft back over the
+        # callback and serge publishes on the human's approval (Phase 3).
+        _launch_review_pod(job, worker_cfg, req, token)
+        return
     _execute_review(job, worker_cfg, gh, token, req, auto_publish=False)
 
 
@@ -1234,26 +1308,165 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         _persist_terminal(job)
 
 
+# ---------------------------------------------------------------------------
+# Non-blocking pod-task lifecycle (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 1).
+# The kubernetes backend launches the Job and returns immediately — no serge
+# thread is parked for the pod's lifetime. Terminal state arrives via the
+# callback (happy path) or the Job watcher (crash path); a single idempotent
+# finalize runs notify + persist exactly once, whichever trigger fires first.
+# The docker backend stays blocking (local/dev, low concurrency) and needs no
+# watcher — serge runs without kube exactly as before.
+# ---------------------------------------------------------------------------
+_POD_WATCH_INTERVAL = 5.0  # seconds between watcher polls
+# After a Job goes terminal we wait this long for an in-flight terminal callback
+# before declaring a crash — the runner POSTs its callback just before exiting.
+_POD_TERMINAL_GRACE = 12.0
+
+
+@dataclasses.dataclass
+class _PodTask:
+    job: Job
+    worker_cfg: Config
+    req: TaskRequest
+    backend: str  # "docker" | "kubernetes"
+    job_name: str = ""
+    namespace: str = ""
+    deadline: float = 0.0  # monotonic hard-timeout backstop
+    terminal_since: Optional[float] = None
+    finalized: bool = False
+
+
+_pod_tasks: dict[str, _PodTask] = {}
+_pod_tasks_lock = threading.Lock()
+
+
+def _finalize_task(job_id: str) -> bool:
+    """Run terminal notify + persist for a pod task exactly once. Safe to call
+    from the callback endpoint, the docker launcher thread, and the Job watcher
+    concurrently — the first caller wins. Returns True if it performed the
+    finalize."""
+    with _pod_tasks_lock:
+        task = _pod_tasks.get(job_id)
+        if task is None or task.finalized:
+            return False
+        task.finalized = True
+    job = task.job
+    job.callback_token = None
+    # Slack task-finished notification is task-only (reviews use the UI/SSE and
+    # carry a ReviewRequest, which has no notification fields).
+    if job.kind == "task":
+        _notify_task_finished(task.worker_cfg, task.req, job)
+    _persist_terminal(job)
+    return True
+
+
+def _untrack_pod_task(job_id: str) -> None:
+    with _pod_tasks_lock:
+        _pod_tasks.pop(job_id, None)
+
+
+def _reconcile_pod_task(task: _PodTask) -> None:
+    """Watcher step for one kubernetes pod task (runs in a worker thread).
+
+    Happy path: the callback already set a terminal status + finalized; here we
+    just reap the Job. Crash path: the Job reached a terminal state while serge's
+    job is still ``running`` and no callback landed within the grace window — mark
+    it errored, finalize, reap. Deletion is best-effort (``ttlSecondsAfterFinished``
+    on the Job is the backstop)."""
+    if task.backend != "kubernetes" or not task.job_name:
+        return  # docker, or k8s Job not created yet
+    job = task.job
+    now = time.monotonic()
+
+    if task.finalized:
+        cleanup_task_job(task.job_name, task.namespace)
+        _untrack_pod_task(job.id)
+        return
+
+    try:
+        outcome = poll_task_job(task.job_name, task.namespace)
+    except K8sSandboxError:
+        log.warning("watcher: could not poll task Job %s", task.job_name, exc_info=True)
+        if now > task.deadline:
+            _reconcile_crash(task, "task runner did not finish in time")
+        return
+
+    if outcome is None:
+        if now > task.deadline:
+            _reconcile_crash(task, "task runner did not finish in time")
+        return
+
+    # Job is terminal. If the callback already recorded a terminal status,
+    # finalize + reap. Otherwise give an in-flight callback the grace window
+    # before declaring a crash.
+    if job.status != "running":
+        _finalize_task(job.id)
+        cleanup_task_job(task.job_name, task.namespace)
+        _untrack_pod_task(job.id)
+        return
+    if task.terminal_since is None:
+        task.terminal_since = now
+        return
+    if now - task.terminal_since < _POD_TERMINAL_GRACE:
+        return
+    exit_code, tail = collect_task_result(task.job_name, task.namespace)
+    message = f"task runner exited without reporting (exit code {exit_code})"
+    if tail.strip():
+        # Surface the pod's log tail so the crash cause is visible on the job
+        # itself, without a live repro against the (already-reaped) pod.
+        message = f"{message}\n--- runner log tail ---\n{tail.strip()}"
+    _reconcile_crash(task, message)
+
+
+def _reconcile_crash(task: _PodTask, message: str) -> None:
+    """Mark a task errored (if still running), finalize, and reap its Job."""
+    job = task.job
+    if job.status == "running":
+        log.warning("task %s reconciled to error by watcher: %s", job.id, message)
+        job.status = "error"
+        job.error = message
+        _push_event(job, "step", "error")
+        _push_event(job, "error", message)
+        _push_event(job, "done", "")
+    _finalize_task(job.id)
+    if task.job_name:
+        cleanup_task_job(task.job_name, task.namespace)
+    _untrack_pod_task(job.id)
+
+
 def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
-    """Out-of-process launcher for the write-capable /tasks flow (Phase 2 of
-    SERGE_PERTASK_POD_PLAN.md).
+    """Out-of-process launcher for the write-capable /tasks flow.
 
-    Instead of running the agent loop in a serge thread (``_run_task_worker``),
     serge mints the short-lived GitHub installation token + a per-job callback
-    token, builds the task spec, and starts a per-task runner container. The
-    runner runs the whole loop + in-process normalize and streams every event
-    and the terminal outcome back to ``POST /internal/tasks/{id}/events``.
+    token, builds the task spec, and starts a per-task runner. The runner runs
+    the whole loop + in-process normalize and streams every event and the
+    terminal outcome back to ``POST /internal/tasks/{id}/events``.
 
-    This thread blocks on the container (block-in-pool, mirroring the in-process
-    pool — see the plan's "Launcher watch" open question) so a runner that dies
-    without ever reporting a terminal callback still reconciles to ``error``.
-    Terminal ``status``/``result`` for the happy path are set by the callback
-    ingest endpoint; this thread only handles launch failures + the crash sweep,
-    then notifies Slack and persists the terminal snapshot exactly like the
-    in-process worker."""
+    Kubernetes is **non-blocking**: the Job is created and this returns — the
+    callback (happy path) or the Job watcher (crash) reconciles + finalizes, so
+    concurrency is bounded by the cluster, not by the launcher pool. Docker stays
+    blocking (local/dev; no watcher needed), so serge runs without kube as
+    before. Terminal notify + persist run once via :func:`_finalize_task`."""
 
     def emit(kind: str, text: str) -> None:
         _push_event(job, kind, text)
+
+    def fail(message: str) -> None:
+        job.status = "error"
+        job.error = message
+        emit("step", "error")
+        emit("error", message)
+        emit("done", "")
+
+    task = _PodTask(
+        job=job,
+        worker_cfg=worker_cfg,
+        req=req,
+        backend=cfg.task_execution,
+        deadline=time.monotonic() + (cfg.task_runner_timeout or 3600) + 60,
+    )
+    with _pod_tasks_lock:
+        _pod_tasks[job.id] = task
 
     try:
         if cfg.task_execution not in ("docker", "kubernetes"):
@@ -1298,24 +1511,12 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             "log",
             f"Launching task runner ({cfg.task_execution}: {cfg.task_runner_image})…",
         )
-        # Both backends block until the runner pod/container exits; the runner
-        # POSTs its terminal callback (synchronously) before it exits, so by the
-        # time this returns the ingest endpoint has already recorded the outcome.
-        if cfg.task_execution == "docker":
-            code, _out = launch_docker(
-                spec,
-                DockerLaunchOptions(
-                    image=cfg.task_runner_image,
-                    network=cfg.task_runner_network,
-                    proxy=cfg.task_runner_proxy,
-                    memory=cfg.task_runner_memory,
-                    name=f"serge-task-{job.id[:12]}",
-                ),
-                wait=True,
-                timeout=cfg.task_runner_timeout,
-            )
-        else:  # kubernetes
-            code, _out = launch_kubernetes(
+
+        if cfg.task_execution == "kubernetes":
+            # Non-blocking: create the Job + Secret and return. The runner
+            # streams its outcome via the callback; the watcher reconciles a
+            # crash. No serge thread is parked for the pod's lifetime.
+            job_name, namespace = create_kubernetes(
                 spec,
                 K8sLaunchOptions(
                     image=cfg.task_runner_image,
@@ -1328,46 +1529,216 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
                 ),
                 timeout=cfg.task_runner_timeout,
             )
+            with _pod_tasks_lock:
+                task.job_name = job_name
+                task.namespace = namespace
+            emit(
+                "log",
+                f"Runner pod {job_name} created; waiting for it to schedule + "
+                "pull the image (can take ~1–2 min on a cold node)…",
+            )
+            return  # watcher + callback own the rest
+
+        # docker: blocking (local/dev path; low concurrency). Hold the pool
+        # thread until the container exits, then reconcile a crash + finalize.
+        code, _out = launch_docker(
+            spec,
+            DockerLaunchOptions(
+                image=cfg.task_runner_image,
+                network=cfg.task_runner_network,
+                proxy=cfg.task_runner_proxy,
+                memory=cfg.task_runner_memory,
+                name=f"serge-task-{job.id[:12]}",
+            ),
+            wait=True,
+            timeout=cfg.task_runner_timeout,
+        )
         if job.status == "running":
-            # Runner exited without a terminal callback → crashed / OOM /
-            # evicted before it could report. Reconcile to error.
             log.warning(
                 "task %s runner exited (code=%s) with no terminal callback",
                 job.id,
                 code,
             )
-            job.status = "error"
-            job.error = f"task runner exited without reporting (exit code {code})"
-            emit("step", "error")
-            emit("error", job.error)
-            emit("done", "")
+            fail(f"task runner exited without reporting (exit code {code})")
     except (TaskError, AppNotInstalledError, K8sSandboxError) as exc:
         log.warning("task %s launch failed: %s", job.id, exc)
-        job.status = "error"
-        job.error = str(exc)
-        emit("step", "error")
-        emit("error", job.error)
-        emit("done", "")
+        fail(str(exc))
     except subprocess.TimeoutExpired:
         log.warning(
             "task %s runner timed out after %ss", job.id, cfg.task_runner_timeout
         )
-        job.status = "error"
-        job.error = f"task runner timed out after {cfg.task_runner_timeout}s"
-        emit("step", "error")
-        emit("error", job.error)
-        emit("done", "")
+        fail(f"task runner timed out after {cfg.task_runner_timeout}s")
     except Exception as exc:  # noqa: BLE001
         log.exception("task launcher crashed for job %s", job.id)
+        fail(f"{type(exc).__name__}: task launch crashed (see server log)")
+
+    # Reached for docker (success or failure) and for any launch failure — but
+    # NOT the kubernetes success path (which returned above). Finalize once.
+    _finalize_task(job.id)
+    _untrack_pod_task(job.id)
+
+
+def _launch_review_pod(
+    job: Job, worker_cfg: Config, req: ReviewRequest, token: str
+) -> None:
+    """Out-of-process launcher for a UI PR review (REVIEW_EXECUTION != inprocess,
+    SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 3). Mirrors :func:`_launch_task_pod`:
+    kubernetes is non-blocking (the watcher/callback reconcile), docker blocks.
+    The pod runs ``prepare_review`` and streams the draft back over the callback;
+    publish still happens in serge on the human's approval. ``token`` is the
+    installation token serge already minted for this repo."""
+
+    def emit(kind: str, text: str) -> None:
+        _push_event(job, kind, text)
+
+    def fail(message: str) -> None:
         job.status = "error"
-        job.error = f"{type(exc).__name__}: task launch crashed (see server log)"
+        job.error = message
         emit("step", "error")
-        emit("error", job.error)
+        emit("error", message)
         emit("done", "")
-    finally:
-        job.callback_token = None
-        _notify_task_finished(worker_cfg, req, job)
-        _persist_terminal(job)
+
+    task = _PodTask(
+        job=job,
+        worker_cfg=worker_cfg,
+        req=req,  # a ReviewRequest here; _finalize only needs it for notify
+        backend=cfg.review_execution,
+        deadline=time.monotonic() + (cfg.task_runner_timeout or 3600) + 60,
+    )
+    with _pod_tasks_lock:
+        _pod_tasks[job.id] = task
+
+    image = cfg.review_runner_image or cfg.task_runner_image
+    try:
+        if cfg.review_execution not in ("docker", "kubernetes"):
+            raise TaskError(
+                f"review_execution={cfg.review_execution!r} is not a launcher backend",
+                status_code=501,
+            )
+        if not image:
+            raise TaskError(
+                "REVIEW_RUNNER_IMAGE / TASK_RUNNER_IMAGE is not configured",
+                status_code=500,
+            )
+        if not cfg.task_callback_base_url:
+            raise TaskError("TASK_CALLBACK_BASE_URL is not configured", status_code=500)
+
+        callback_token = secrets.token_urlsafe(32)
+        job.callback_token = callback_token
+        spec = build_spec(
+            job_id=job.id,
+            request=dataclasses.asdict(req),
+            github_token=token,
+            request_type="review",
+            llm={
+                "api_base": worker_cfg.llm_api_base,
+                "api_key": worker_cfg.llm_api_key,
+                "model": worker_cfg.llm_model,
+                "bill_to": worker_cfg.llm_bill_to,
+                "stream": worker_cfg.llm_stream,
+            },
+            config=runner_config(worker_cfg),
+            callback_url=(
+                f"{cfg.task_callback_base_url}/internal/tasks/{job.id}/events"
+            ),
+            callback_token=callback_token,
+        )
+        emit("step", "launch")
+        emit("log", f"Launching review runner ({cfg.review_execution}: {image})…")
+
+        if cfg.review_execution == "kubernetes":
+            job_name, namespace = create_kubernetes(
+                spec,
+                K8sLaunchOptions(
+                    image=image,
+                    namespace=cfg.task_k8s_namespace,
+                    service_account=cfg.task_k8s_service_account,
+                    node_selector=parse_node_selector(cfg.task_k8s_node_selector),
+                    proxy=cfg.task_runner_proxy,
+                    no_proxy=cfg.task_runner_no_proxy,
+                    memory=cfg.task_runner_memory,
+                ),
+                timeout=cfg.task_runner_timeout,
+            )
+            with _pod_tasks_lock:
+                task.job_name = job_name
+                task.namespace = namespace
+            emit(
+                "log",
+                f"Runner pod {job_name} created; waiting for it to schedule + "
+                "pull the image (can take ~1–2 min on a cold node)…",
+            )
+            return  # watcher + callback own the rest
+
+        code, _out = launch_docker(
+            spec,
+            DockerLaunchOptions(
+                image=image,
+                network=cfg.task_runner_network,
+                proxy=cfg.task_runner_proxy,
+                memory=cfg.task_runner_memory,
+                name=f"serge-review-{job.id[:12]}",
+            ),
+            wait=True,
+            timeout=cfg.task_runner_timeout,
+        )
+        if job.status == "running":
+            log.warning(
+                "review %s runner exited (code=%s) with no terminal callback",
+                job.id,
+                code,
+            )
+            fail(f"review runner exited without reporting (exit code {code})")
+    except (TaskError, AppNotInstalledError, K8sSandboxError) as exc:
+        log.warning("review %s launch failed: %s", job.id, exc)
+        fail(str(exc))
+    except subprocess.TimeoutExpired:
+        log.warning("review %s runner timed out", job.id)
+        fail(f"review runner timed out after {cfg.task_runner_timeout}s")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("review launcher crashed for job %s", job.id)
+        fail(f"{type(exc).__name__}: review launch crashed (see server log)")
+
+    _finalize_task(job.id)
+    _untrack_pod_task(job.id)
+
+
+def _webhook_publish_or_report(job: Job) -> None:
+    """serge-side GitHub write for a **webhook** review whose pod just reported
+    (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 4). Runs in a thread off the callback:
+    on success it auto-publishes the draft (no human in the loop); on error it
+    posts the failure comment. Kept in serge — a GitHub API call, not LLM work —
+    so the pod stays a pure LLM worker and the error/publish logic isn't
+    duplicated. Best-effort: a failure here is logged, never re-raised."""
+    task = _pod_tasks.get(job.id)
+    worker_cfg = task.worker_cfg if task else cfg
+    req = task.req if task else None
+    if not (cfg.github_app_id and cfg.github_private_key):
+        return
+    try:
+        iid = installation_id_for_repo(
+            cfg.github_app_id, cfg.github_private_key, job.target_owner, job.target_repo
+        )
+        token = installation_token(cfg.github_app_id, cfg.github_private_key, iid)
+        gh = GitHubClient(token)
+    except Exception:  # noqa: BLE001
+        log.warning("webhook publish: token mint failed for %s", job.id, exc_info=True)
+        return
+
+    if job.status == "error":
+        if isinstance(req, ReviewRequest):
+            _post_webhook_failure_comment(
+                gh, req, job.error or "review failed", raw_output=job.raw_llm_output
+            )
+        return
+    if job.draft is not None:
+        try:
+            # No edits: a webhook review auto-publishes exactly what the model
+            # produced (APPROVE may be downgraded inside publish_review).
+            job.published_draft = publish_review(worker_cfg, gh, job.draft)
+            job.status = "published"
+        except Exception:  # noqa: BLE001
+            log.exception("webhook auto-publish failed for job %s", job.id)
 
 
 def _notify_task_finished(worker_cfg: Config, req: TaskRequest, job: Job) -> None:
@@ -1460,6 +1831,36 @@ async def _start_clone_cache_gc() -> None:
                 log.exception("clone cache GC failed")
 
     asyncio.create_task(_loop())
+
+
+@app.on_event("startup")
+async def _start_pod_job_watcher() -> None:
+    """Reconcile non-blocking kubernetes task pods: detect a Job that finished
+    without a terminal callback (crash / OOM / eviction) and mark it errored,
+    and reap finished Jobs (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 1). A no-op for
+    docker/inprocess deployments (no kubernetes pod tasks are tracked), so it
+    never touches the kubernetes client unless a k8s task exists."""
+
+    async def _loop() -> None:
+        while True:
+            await asyncio.sleep(_POD_WATCH_INTERVAL)
+            with _pod_tasks_lock:
+                tasks = [t for t in _pod_tasks.values() if t.backend == "kubernetes"]
+            for task in tasks:
+                try:
+                    await asyncio.to_thread(_reconcile_pod_task, task)
+                except Exception:  # noqa: BLE001
+                    log.exception("pod job watcher failed for %s", task.job.id)
+
+    asyncio.create_task(_loop())
+
+
+@app.on_event("startup")
+async def _sync_egress_allowlist_on_start() -> None:
+    """Reconcile the serge-egress allowlist with the built-in + configured LLM
+    provider hosts at boot, so pod-based reviews reach any provider an admin has
+    set up. A no-op off the kubernetes backend (serge runs without kube)."""
+    _spawn_egress_sync()
 
 
 @app.middleware("http")
@@ -1611,7 +2012,6 @@ def _static_html(name: str) -> str:
         html = f.read()
     if name.endswith(".html"):
         html = html.replace("<!-- POWERED_BY -->", _powered_by_html())
-        html = html.replace("<!-- APP_INSTALL_LINK -->", _app_install_html())
     return html
 
 
@@ -1717,26 +2117,6 @@ def _build_badge_html() -> str:
     )
 
 
-def _app_install_html() -> str:
-    """Render the "install the GitHub App" link for the help page,
-    using WEB_GITHUB_APP_URL when set. Falls back to a hint pointing
-    operators at the env var so deployments without the variable still
-    get a useful page."""
-    url = (cfg.web_github_app_url or "").strip()
-    if not url:
-        return (
-            '<span class="hint">Ask your deployment admin for the App '
-            "install URL, or set <code>WEB_GITHUB_APP_URL</code> in the "
-            "server environment so this page can link to it.</span>"
-        )
-    escaped = _html.escape(url, quote=True)
-    return (
-        f'<a href="{escaped}" target="_blank" rel="noopener noreferrer">'
-        '<button class="primary" type="button">Install the GitHub App</button>'
-        "</a>"
-    )
-
-
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}  # the `serge` build stamp is added by middleware
@@ -1772,13 +2152,6 @@ def journal_page(request: Request) -> Response:
         f'<tbody id="journal-tbody">\n{_journal_rows_html(rows)}\n</tbody>',
     )
     return HTMLResponse(html)
-
-
-@app.get("/help")
-def help_page(request: Request) -> Response:
-    if not _current_user(request):
-        return RedirectResponse("/login", status_code=302)
-    return _serve_static("help.html")
 
 
 @app.get("/login")
@@ -2148,6 +2521,114 @@ def admin_page(request: Request) -> Response:
     return _serve_static("admin.html")
 
 
+@app.get("/admin/pods")
+def admin_pods_page(request: Request) -> Response:
+    if not _current_user(request):
+        return RedirectResponse("/login", status_code=302)
+    return _serve_static("admin_pods.html")
+
+
+def _pod_row(pod: Optional[dict], task: Optional["_PodTask"]) -> dict[str, Any]:
+    """One admin-pods table row, joining the live k8s pod (if any) with serge's
+    tracked task (if any). Either side may be absent: a just-launched task has no
+    pod yet; an orphan pod (serge restarted) has no tracked task."""
+    job = task.job if task else None
+    start_epoch = None
+    if pod and pod.get("start_epoch"):
+        start_epoch = pod["start_epoch"]
+    elif job is not None:
+        start_epoch = job.created_at
+    return {
+        "job_id": job.id if job else "",
+        "pod": (pod or {}).get("pod", ""),
+        "job_name": (pod or {}).get("job_name", "") or (task.job_name if task else ""),
+        "namespace": (task.namespace if task else "") or (cfg.task_k8s_namespace or ""),
+        "kind": (job.kind if job else "task"),
+        "repo": (f"{job.target_owner}/{job.target_repo}" if job else ""),
+        "number": (job.target_number if job else 0),
+        "user": (job.user if job else ""),
+        "status": (job.status if job else ""),  # serge's view of the job
+        "phase": (pod or {}).get("phase", ""),  # kubernetes pod phase
+        "node": (pod or {}).get("node", ""),
+        "backend": (task.backend if task else "kubernetes"),
+        "start_epoch": start_epoch,
+    }
+
+
+@app.get("/admin/pods/data")
+def admin_pods_data(request: Request) -> JSONResponse:
+    """Live pod-backed task jobs for the admin monitor. Kubernetes: the actual
+    running pods in the cluster, joined with serge's tracked tasks for repo/user
+    context (so orphans left by a serge restart still show up). Docker/inprocess:
+    serge's tracked tasks. Admin-only (it exposes cross-user activity + a kill
+    action)."""
+    user = _require_user(request)
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="admin_only")
+
+    with _pod_tasks_lock:
+        tracked = list(_pod_tasks.values())
+    by_job_name = {t.job_name: t for t in tracked if t.job_name}
+
+    rows: list[dict[str, Any]] = []
+    error: Optional[str] = None
+    backend = cfg.task_execution
+
+    if backend == "kubernetes":
+        try:
+            _ns, pods = list_task_pods(cfg.task_k8s_namespace)
+        except Exception as exc:  # noqa: BLE001 — surface, don't 500 the page
+            log.warning("admin/pods: could not list task pods: %s", exc)
+            error = str(exc)
+            pods = []
+        seen: set[str] = set()
+        for pod in pods:
+            rows.append(_pod_row(pod, by_job_name.get(pod["job_name"])))
+            if pod["job_name"]:
+                seen.add(pod["job_name"])
+        # Tracked k8s tasks whose pod hasn't shown up yet (just launched).
+        for task in tracked:
+            if (
+                task.backend == "kubernetes"
+                and task.job_name
+                and task.job_name not in seen
+            ):
+                rows.append(_pod_row(None, task))
+    else:
+        for task in tracked:
+            rows.append(_pod_row(None, task))
+
+    rows.sort(key=lambda r: r["start_epoch"] or 0, reverse=True)
+    return JSONResponse({"pods": rows, "backend": backend, "error": error})
+
+
+@app.post("/admin/pods/kill")
+async def admin_pods_kill(request: Request) -> JSONResponse:
+    """Delete a task Job (and its pod) by name. Admin-only + same-origin. The
+    watcher/TTL would eventually reap a finished Job; this is the manual stop for
+    a runaway one."""
+    _require_same_origin(request)
+    user = _require_user(request)
+    if not _is_admin(user):
+        raise HTTPException(status_code=403, detail="admin_only")
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid_json_body")
+    job_name = str(payload.get("job_name") or "").strip()
+    namespace = str(payload.get("namespace") or "").strip() or (
+        cfg.task_k8s_namespace or ""
+    )
+    if not job_name or not namespace:
+        raise HTTPException(status_code=400, detail="job_name_and_namespace_required")
+    log.info("admin %s killing task Job %s/%s", user, namespace, job_name)
+    try:
+        await asyncio.to_thread(cleanup_task_job, job_name, namespace)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("admin/pods kill failed for %s: %s", job_name, exc)
+        raise HTTPException(status_code=502, detail="kill_failed")
+    return JSONResponse({"ok": True})
+
+
 @app.get("/admin/providers")
 def admin_list_providers(request: Request) -> JSONResponse:
     _require_user(request)
@@ -2187,6 +2668,8 @@ async def admin_create_provider(request: Request) -> JSONResponse:
         fields["provider"],
         fields["repo_pattern"],
     )
+    # A new provider may introduce a new LLM host; keep the egress allowlist current.
+    _spawn_egress_sync()
     row = _store.get_provider_config(config_id)
     assert row is not None
     return JSONResponse(_provider_config_summary(row), status_code=201)
@@ -2224,6 +2707,8 @@ async def admin_update_provider(request: Request, config_id: str) -> JSONRespons
         fields["repo_pattern"],
         fields["api_key"] is not None,
     )
+    # The base URL may have changed; keep the egress allowlist current.
+    _spawn_egress_sync()
     row = _store.get_provider_config(config_id)
     assert row is not None
     return JSONResponse(_provider_config_summary(row))
@@ -2238,6 +2723,37 @@ def admin_delete_provider(request: Request, config_id: str) -> JSONResponse:
         raise HTTPException(status_code=404, detail="config_not_found")
     log.info("user %s deleted provider config %s", user, config_id)
     return JSONResponse({"status": "deleted"})
+
+
+# --- debug-only task cap -----------------------------------------------------
+# TASK_DEBUG_MAX_TASKS caps how many /tasks requests serge actually runs per
+# burst, so a *manual* retrigger of the nightly triage runs only a handful of
+# tasks instead of the whole batch (shorter crash-repro cycle). Requests over
+# the cap are accepted (HTTP 202) but no-op'd — no job, no runner pod. A gap of
+# _TASK_DEBUG_WINDOW seconds since the last request starts a fresh budget, so
+# each retriggered burst gets its own N. Unset/0 = no cap. Debug knob — not for
+# main; leave it out of prod once the crash is diagnosed.
+_TASK_DEBUG_WINDOW = 600.0
+_task_debug_lock = threading.Lock()
+_task_debug_state = {"count": 0, "last": 0.0}
+
+
+def _task_debug_over_cap() -> bool:
+    try:
+        cap = int(os.environ.get("TASK_DEBUG_MAX_TASKS") or 0)
+    except ValueError:
+        cap = 0
+    if cap <= 0:
+        return False
+    now = time.monotonic()
+    with _task_debug_lock:
+        if now - _task_debug_state["last"] > _TASK_DEBUG_WINDOW:
+            _task_debug_state["count"] = 0
+        _task_debug_state["last"] = now
+        if _task_debug_state["count"] >= cap:
+            return True
+        _task_debug_state["count"] += 1
+        return False
 
 
 @app.post("/tasks")
@@ -2263,6 +2779,22 @@ async def submit_task(request: Request) -> JSONResponse:
     owner, repo = claims.repository.split("/", 1)
     if not _GH_NAME_RE.match(owner) or not _GH_NAME_RE.match(repo):
         raise HTTPException(status_code=400, detail="bad_repository_claim")
+
+    if _task_debug_over_cap():
+        log.warning(
+            "task for %s/%s skipped by TASK_DEBUG_MAX_TASKS=%s",
+            owner,
+            repo,
+            os.environ.get("TASK_DEBUG_MAX_TASKS"),
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "skipped": True,
+                "reason": f"TASK_DEBUG_MAX_TASKS={os.environ.get('TASK_DEBUG_MAX_TASKS')} reached",
+                "repo": claims.repository,
+            },
+        )
 
     try:
         payload = await request.json()
@@ -2379,7 +2911,7 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
         job = _jobs.get(job_id)
     if (
         job is None
-        or job.kind != "task"
+        or job.kind not in ("task", "review")
         or not job.callback_token
         or not hmac.compare_digest(token, job.callback_token)
     ):
@@ -2395,7 +2927,17 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
     terminal = payload.get("terminal")
     if isinstance(terminal, dict):
         result = terminal.get("result")
-        if isinstance(result, dict):
+        if job.kind == "review":
+            # A review pod ships the draft (store.encode_draft) + token counts;
+            # rebuild job.draft so the existing UI publish flow works unchanged.
+            if isinstance(result, dict) and result.get("draft"):
+                draft = decode_draft(result["draft"])
+                if draft is not None:
+                    draft.prompt_tokens = int(result.get("prompt_tokens") or 0)
+                    draft.completion_tokens = int(result.get("completion_tokens") or 0)
+                    draft.truncated_chunks = int(result.get("truncated_chunks") or 0)
+                job.draft = draft
+        elif isinstance(result, dict):
             job.task_result = result
             try:
                 _store.save_task_result(job.id, _json.dumps(result))
@@ -2406,6 +2948,21 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
         if terminal.get("raw_llm_output"):
             job.raw_llm_output = str(terminal["raw_llm_output"])
         job.status = (terminal.get("status") or "error").strip() or "error"
+        # Webhook reviews have no human in the loop: serge auto-publishes the
+        # draft (or posts a failure comment) here, off the event loop. UI reviews
+        # stop at the draft for the human to publish (unchanged).
+        if job.kind == "review" and job.source == "webhook":
+            await asyncio.to_thread(_webhook_publish_or_report, job)
+        # Happy path: the runner reported a terminal outcome. Finalize now
+        # (notify + persist) — the non-blocking launcher no longer waits to do
+        # it. Idempotent: the Job watcher's later reap is a no-op. The watcher
+        # still reaps the k8s Job (TTL is the backstop).
+        _finalize_task(job_id)
+        # Signal the live SSE stream that the job is done so the page loads the
+        # draft (review) / result without a manual refresh — mirrors the final
+        # "done" the in-process worker emits. The pod streams events but its
+        # terminal outcome arrives as this callback, not an SSE "done".
+        _push_event(job, "done", "")
     else:
         _push_event(
             job,
@@ -2773,12 +3330,16 @@ async def review_stream(
         # the page. The draft is what matters once the job is done; the
         # remaining structural events still show clone/fetch/llm/tool
         # progress so the console isn't blank.
+        last_id = _last_event_id(request)
         finished = job.status in ("done", "error", "discarded", "published")
         with job.history_lock:
             if finished:
                 replay = [e for e in job.history if e["kind"] not in _NOISY_KINDS]
             else:
                 replay = list(job.history)
+        if last_id is not None:
+            # Reconnect: only replay events the client hasn't seen.
+            replay = [e for e in replay if e.get("seq", -1) > last_id]
         for event in replay:
             yield _sse_format(event)
         # If the job already finished while we were replaying, stop here.
@@ -2812,14 +3373,31 @@ async def review_stream(
     )
 
 
+def _last_event_id(request: Request) -> Optional[int]:
+    """The browser sends Last-Event-ID automatically when EventSource
+    reconnects. Return it as an int so the stream can resume just past it
+    instead of replaying the whole transcript (which doubled the console)."""
+    raw = request.headers.get("last-event-id")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _sse_format(event: dict[str, Any]) -> str:
     kind = event.get("kind", "log")
     text = event.get("text", "")
+    seq = event.get("seq")
+    # The `id:` lets the browser resume via Last-Event-ID after a dropped
+    # connection instead of replaying from the top (the doubled-lines bug).
+    id_line = f"id: {seq}\n" if seq is not None else ""
     # Use SSE event= for non-default kinds; "log" stays the default
     # message event so the browser handler doesn't need to special-case.
     if kind == "log":
-        return f"data: {_json_inline(text)}\n\n"
-    return f"event: {kind}\ndata: {_json_inline(text)}\n\n"
+        return f"{id_line}data: {_json_inline(text)}\n\n"
+    return f"{id_line}event: {kind}\ndata: {_json_inline(text)}\n\n"
 
 
 def _json_inline(s: str) -> str:
@@ -2967,6 +3545,57 @@ def task_info(request: Request, owner: str, repo: str, job_id: str) -> JSONRespo
     )
 
 
+@app.get("/tasks/{owner}/{repo}/{job_id}/status")
+def task_status(request: Request, owner: str, repo: str, job_id: str) -> JSONResponse:
+    """Machine-facing task status, authorized by GitHub Actions OIDC (same as
+    ``POST /tasks``) rather than a web session — so the caller that dispatched a
+    task can poll its terminal outcome. The ``/info`` sibling requires a browser
+    session; this one accepts the OIDC bearer the dispatcher already holds.
+
+    Authorized on the token's ``repository`` claim: a run can only read tasks it
+    could have dispatched for its own repo. Returns the job ``status``
+    (``running``/``published``/``no_fix``/``error``/…), the ``result`` (patch/PR
+    details on ``published``), and ``error`` — enough for the triage reconciler
+    to mark a group ``no_fix`` in the tracking issue instead of waiting on a PR
+    that never comes."""
+    if not cfg.task_api_enabled:
+        raise HTTPException(status_code=404, detail="tasks_api_disabled")
+
+    token = _bearer_token(request)
+    try:
+        claims = verify_token(
+            token,
+            issuer=cfg.task_oidc_issuer,
+            audience=cfg.task_oidc_audience,
+        )
+    except OIDCError as exc:
+        raise HTTPException(status_code=401, detail=f"oidc_verification_failed: {exc}")
+
+    # The OIDC repository claim is authoritative — the caller may only read tasks
+    # for the repo its token was minted for, and it must match the path.
+    if claims.repository.lower() != f"{owner}/{repo}".lower():
+        raise HTTPException(status_code=403, detail="repo_claim_mismatch")
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        job = _load_job_from_store(job_id)
+    if job is None or job.kind != "task":
+        raise HTTPException(status_code=404, detail="task_not_found")
+    if job.target_owner != owner or job.target_repo != repo:
+        raise HTTPException(status_code=404, detail="task_target_mismatch")
+
+    return JSONResponse(
+        {
+            "id": job.id,
+            "status": job.status,
+            "target": f"{job.target_owner}/{job.target_repo}",
+            "result": job.task_result,
+            "error": job.error,
+        }
+    )
+
+
 @app.get("/tasks/{owner}/{repo}/{job_id}/stream")
 async def task_stream(
     request: Request, owner: str, repo: str, job_id: str
@@ -2974,12 +3603,16 @@ async def task_stream(
     job = _get_task_job(request, owner, repo, job_id)
 
     async def generator():
+        last_id = _last_event_id(request)
         finished = job.status in ("done", "error", "discarded", "published")
         with job.history_lock:
             if finished:
                 replay = [e for e in job.history if e["kind"] not in _NOISY_KINDS]
             else:
                 replay = list(job.history)
+        if last_id is not None:
+            # Reconnect: only replay events the client hasn't seen.
+            replay = [e for e in replay if e.get("seq", -1) > last_id]
         for event in replay:
             yield _sse_format(event)
         if finished:

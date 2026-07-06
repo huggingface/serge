@@ -149,15 +149,22 @@ if [[ "${from_head}" -eq 1 ]]; then
     esac
   done
 
-  # Pin the tag in the primary values file (portable in-place edit). Only the
-  # single image.tag line is touched. image.tag lives in the base values file
-  # (prod.yaml), so we edit the first -f file; overlays layered after it do not
-  # carry serge's image.tag.
+  # Pin the tag in the primary values file (portable in-place edit). All three
+  # images are built from the same commit by docker.yml (serge, -task-runner,
+  # -egress, each tagged sha-<commit>), so they must move together. We rewrite:
+  #   * the top-level image.tag line (serge app), and
+  #   * the inline `ghcr.io/...:sha-<commit>` refs for the task-runner + egress
+  #     images (they carry a full image string, not an image.tag).
+  # image.tag lives in the base values file (prod.yaml), so we edit the first
+  # -f file; overlays layered after it do not carry serge's image refs.
   primary_values="${values_files[0]}"
   tmp_values="$(mktemp)"
-  sed -E "s|^([[:space:]]*tag:[[:space:]]*).*|\1${image_tag}|" "${primary_values}" > "${tmp_values}"
+  sed -E \
+    -e "s|^([[:space:]]*tag:[[:space:]]*).*|\1${image_tag}|" \
+    -e "s|(ghcr\.io/[^:[:space:]]+):sha-[0-9a-f]+|\1:${image_tag}|g" \
+    "${primary_values}" > "${tmp_values}"
   mv "${tmp_values}" "${primary_values}"
-  echo "Pinned image.tag: ${image_tag} in ${primary_values}"
+  echo "Pinned all images to ${image_tag} in ${primary_values}"
 fi
 
 current_context="$(kubectl config current-context)"

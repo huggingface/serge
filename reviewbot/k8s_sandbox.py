@@ -31,10 +31,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 log = logging.getLogger(__name__)
 
@@ -149,6 +151,114 @@ def _load_clients():
                 f"could not load kubernetes config (in-cluster or kubeconfig): {exc}"
             ) from exc
     return client.BatchV1Api(), client.CoreV1Api()
+
+
+# --- egress allowlist sync ---------------------------------------------------
+# The serge-egress proxy CONNECT-allows only the hosts in its tinyproxy filter
+# (rendered by helm as git + the default LLM host). But provider configs are
+# dynamic — an admin can add an OpenAI/Anthropic/custom-base provider on the
+# Settings page at any time, and pod-based reviews route their LLM call through
+# this proxy. So serge keeps the filter in sync with the configured LLM hosts.
+_EGRESS_FILTER_KEY = "filter"
+# Marks the last sync on the egress Deployment's pod template; changing it
+# triggers a rollout so tinyproxy re-reads its filter file on start.
+_EGRESS_SYNC_ANNOTATION = "serge.io/allowlist-synced-at"
+
+
+def _host_filter_regex(base: str) -> Optional[str]:
+    """ERE that matches exactly one host, for the tinyproxy allowlist. Accepts a
+    full URL or a bare host; returns ``None`` if no host can be parsed."""
+    raw = (base or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "https://" + raw
+    host = urllib.parse.urlparse(raw).hostname
+    if not host:
+        return None
+    return "^" + re.escape(host) + "$"
+
+
+def sync_egress_allowlist(
+    llm_bases: Iterable[str],
+    *,
+    egress_name: str,
+    namespace: Optional[str] = None,
+) -> bool:
+    """Ensure the ``serge-egress`` proxy allowlists every LLM host in
+    ``llm_bases`` (URLs or bare hosts). Additively unions the host regexes into
+    the proxy's tinyproxy filter ConfigMap; if anything was missing, patches the
+    ConfigMap and rollout-restarts the egress Deployment (both named
+    ``egress_name``) so tinyproxy re-reads the filter. Returns ``True`` when it
+    changed the allowlist.
+
+    Fail-soft by contract: any missing dependency or API error is logged and
+    swallowed (returns ``False``) so serge keeps serving — a stale allowlist
+    only affects reviews to not-yet-allowlisted LLM hosts, and never the app."""
+    if not egress_name:
+        return False
+    want = {rx for b in llm_bases if (rx := _host_filter_regex(b))}
+    if not want:
+        return False
+    try:
+        from kubernetes import client, config
+        from kubernetes.client.rest import ApiException
+    except ImportError:
+        log.warning("egress allowlist: kubernetes client unavailable; skipping sync")
+        return False
+
+    try:
+        try:
+            config.load_incluster_config()
+        except Exception:  # noqa: BLE001 - local kubeconfig (dev)
+            config.load_kube_config()
+        ns = resolve_namespace(K8sSettings(namespace=namespace))
+        core = client.CoreV1Api()
+        apps = client.AppsV1Api()
+
+        cm = core.read_namespaced_config_map(egress_name, ns)
+        current = (cm.data or {}).get(_EGRESS_FILTER_KEY, "") or ""
+        lines = [ln for ln in current.splitlines() if ln.strip()]
+        missing = sorted(want - set(lines))
+        if not missing:
+            return False
+
+        new_filter = "\n".join(lines + missing) + "\n"
+        core.patch_namespaced_config_map(
+            egress_name, ns, {"data": {_EGRESS_FILTER_KEY: new_filter}}
+        )
+        # tinyproxy reads its filter only at startup; roll the Deployment so the
+        # new pod picks up the patched ConfigMap.
+        apps.patch_namespaced_deployment(
+            egress_name,
+            ns,
+            {
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {_EGRESS_SYNC_ANNOTATION: str(time.time())}
+                        }
+                    }
+                }
+            },
+        )
+        log.info(
+            "egress allowlist: added %d LLM host(s) and rolled %s: %s",
+            len(missing),
+            egress_name,
+            ", ".join(missing),
+        )
+        return True
+    except ApiException as exc:
+        log.warning(
+            "egress allowlist sync failed (%s); reviews to newly-added LLM "
+            "hosts may be blocked until this succeeds",
+            getattr(exc, "reason", exc),
+        )
+        return False
+    except Exception:  # noqa: BLE001 - never let allowlist upkeep break serge
+        log.warning("egress allowlist sync failed", exc_info=True)
+        return False
 
 
 def _job_terminal(status) -> Optional[str]:
@@ -415,6 +525,59 @@ def run_task_job(
     without reporting. The Job (and, via ownerRef, the Secret) is always deleted
     on the way out. Raises :class:`K8sSandboxError` on infrastructure failure or
     timeout."""
+    job_name, namespace = create_task_job(
+        spec,
+        image=image,
+        settings=settings,
+        timeout=timeout,
+        proxy=proxy,
+        no_proxy=no_proxy,
+        memory=memory,
+        clone_dir=clone_dir,
+        uid=uid,
+        gid=gid,
+    )
+    _, core = _load_clients()
+    try:
+        deadline = time.monotonic() + timeout + poll_interval * 2
+        outcome: Optional[str] = None
+        while time.monotonic() < deadline:
+            outcome = poll_task_job(job_name, namespace)
+            if outcome is not None:
+                break
+            time.sleep(poll_interval)
+        if outcome is None:
+            raise K8sSandboxError(
+                f"task Job {job_name} did not finish within {timeout}s"
+            )
+
+        exit_code, tail = _collect_pod_result(core, namespace, job_name)
+        if outcome == "failed" and exit_code == 0:
+            exit_code = 1
+        return exit_code, tail
+    finally:
+        cleanup_task_job(job_name, namespace)
+
+
+def create_task_job(
+    spec: dict[str, Any],
+    *,
+    image: str,
+    settings: K8sSettings,
+    timeout: int,
+    proxy: Optional[str] = None,
+    no_proxy: Optional[str] = None,
+    memory: Optional[str] = None,
+    clone_dir: str = "/tmp/serge-clones",
+    uid: Optional[int] = None,
+    gid: Optional[int] = None,
+) -> tuple[str, str]:
+    """Create the task Job + its per-job Secret and return ``(job_name,
+    namespace)`` **without waiting** — the non-blocking launch path
+    (SERGE_ORCHESTRATOR_PODS_PLAN.md). The caller reconciles completion
+    out-of-band via :func:`poll_task_job` + a watcher, so no serge thread is
+    parked for the pod's lifetime. Raises :class:`K8sSandboxError` on failure
+    (the Job is cleaned up if the Secret create fails)."""
     from kubernetes.client.rest import ApiException
 
     namespace = resolve_namespace(settings)
@@ -459,33 +622,80 @@ def run_task_job(
         raise K8sSandboxError(
             f"could not create task Secret {secret_name}: {exc.reason or exc}"
         ) from exc
+    return job_name, namespace
 
+
+def poll_task_job(job_name: str, namespace: str) -> Optional[str]:
+    """Return the Job's terminal outcome (``"succeeded"``/``"failed"``) or
+    ``None`` if it is still running. A vanished Job (404 — deleted or TTL-GC'd)
+    counts as ``"failed"`` (terminal). Raises :class:`K8sSandboxError` on any
+    other API error."""
+    from kubernetes.client.rest import ApiException
+
+    batch, _ = _load_clients()
     try:
-        deadline = time.monotonic() + timeout + poll_interval * 2
-        outcome: Optional[str] = None
-        while time.monotonic() < deadline:
-            try:
-                status = batch.read_namespaced_job_status(job_name, namespace).status
-            except ApiException as exc:
-                raise K8sSandboxError(
-                    f"could not read task Job status: {exc.reason or exc}"
-                ) from exc
-            outcome = _job_terminal(status)
-            if outcome is not None:
-                break
-            time.sleep(poll_interval)
-        if outcome is None:
-            raise K8sSandboxError(
-                f"task Job {job_name} did not finish within {timeout}s"
-            )
+        status = batch.read_namespaced_job_status(job_name, namespace).status
+    except ApiException as exc:
+        if getattr(exc, "status", None) == 404:
+            return "failed"
+        raise K8sSandboxError(
+            f"could not read task Job status: {exc.reason or exc}"
+        ) from exc
+    return _job_terminal(status)
 
-        exit_code, tail = _collect_pod_result(core, namespace, job_name)
-        if outcome == "failed" and exit_code == 0:
-            exit_code = 1
-        return exit_code, tail
-    finally:
-        _delete_job(batch, job_name, namespace)
-        _delete_secret(core, secret_name, namespace)
+
+def collect_task_result(job_name: str, namespace: str) -> tuple[int, str]:
+    """``(exit_code, log_tail)`` for a terminated task Job pod. Best-effort: a
+    missing pod / unreadable logs yields ``(1, "")`` rather than raising, so the
+    watcher can always finish reconciling."""
+    _, core = _load_clients()
+    try:
+        return _collect_pod_result(core, namespace, job_name)
+    except K8sSandboxError:
+        return 1, ""
+
+
+def cleanup_task_job(job_name: str, namespace: str) -> None:
+    """Delete the task Job (+ its Secret via ownerRef). ``ttlSecondsAfterFinished``
+    on the Job is the backstop if this is ever missed."""
+    batch, core = _load_clients()
+    _delete_job(batch, job_name, namespace)
+    _delete_secret(core, job_name, namespace)
+
+
+def list_task_pods(namespace: Optional[str] = None) -> tuple[str, list[dict]]:
+    """List live task-runner pods in the cluster for the admin view
+    (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 2). Returns ``(namespace, pods)``
+    where each pod is a plain dict: ``pod`` (name), ``job_name`` (the owning
+    Job, from the auto-applied ``job-name`` label — used to join back to serge's
+    tracked task), ``phase``, ``node``, ``start_epoch``. Raises
+    :class:`K8sSandboxError` on API failure."""
+    from kubernetes.client.rest import ApiException
+
+    ns = resolve_namespace(K8sSettings(namespace=namespace))
+    _, core = _load_clients()
+    selector = "app.kubernetes.io/managed-by=serge,app.kubernetes.io/component=task"
+    try:
+        pods = core.list_namespaced_pod(ns, label_selector=selector).items
+    except ApiException as exc:
+        raise K8sSandboxError(f"could not list task pods: {exc.reason or exc}") from exc
+    out: list[dict] = []
+    for pod in pods:
+        meta = getattr(pod, "metadata", None)
+        st = getattr(pod, "status", None)
+        spec = getattr(pod, "spec", None)
+        labels = getattr(meta, "labels", None) or {}
+        start = getattr(st, "start_time", None)
+        out.append(
+            {
+                "pod": getattr(meta, "name", "") or "",
+                "job_name": labels.get("job-name", "") or "",
+                "phase": getattr(st, "phase", "") or "",
+                "node": getattr(spec, "node_name", "") or "",
+                "start_epoch": start.timestamp() if start else None,
+            }
+        )
+    return ns, out
 
 
 def _delete_secret(core, secret_name: str, namespace: str) -> None:

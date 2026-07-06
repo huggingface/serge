@@ -15,6 +15,7 @@
     <div class="right">
       <span id="target"></span>
       <span class="status-badge" id="status">running</span>
+      <a href="/admin/pods" class="secondary nav-link">Pods</a>
       <a href="/journal" class="secondary nav-link">Journal</a>
       <form method="post" action="/auth/logout" style="margin:0">
         <button type="submit" class="secondary">Sign out</button>
@@ -83,7 +84,55 @@
 
     const es = new EventSource(`${apiBase}/stream`);
     es.onmessage = (e) => { try { append(JSON.parse(e.data)); } catch { append(e.data); } };
-    ["step", "tool", "error", "log"].forEach(kind => {
+    // A `chat` event is a JSON payload of what the model emitted that turn
+    // (reviewer._emit_chat_message); render it human-readably.
+    function fmtAssistantContent(content) {
+      if (!content) return "";
+      let o;
+      try { o = JSON.parse(content); } catch (_) { return content; }
+      if (!o || typeof o !== "object") return content;
+      // Task patch answer: {title, body, patch}.
+      if ("patch" in o || "title" in o) {
+        const out = [];
+        if (o.title) out.push(`📝 ${o.title}`);
+        if (o.body) out.push(String(o.body));
+        const patch = String(o.patch || "").trim();
+        out.push(patch ? `⟶ patch: ${patch.split("\n").length} lines`
+                        : "⟶ no patch (no change proposed)");
+        return "\n   " + out.join("\n   ");
+      }
+      // Review answer: {summary, event, comments}.
+      if ("summary" in o || "comments" in o) {
+        const n = Array.isArray(o.comments) ? o.comments.length : 0;
+        const ev = o.event ? ` [${o.event}]` : "";
+        return `\n   ${o.summary || ""}${ev}\n   ⟶ ${n} inline comment${n === 1 ? "" : "s"}`;
+      }
+      return content;
+    }
+    function fmtMessage(txt) {
+      let m;
+      try { m = JSON.parse(txt); } catch (_) { return txt; }
+      if (!m || typeof m !== "object") return txt;
+      if (m.role === "tool") {
+        // Don't dump the (often large) tool output into the console; just
+        // note the tool and a size hint. Full result is in stored history.
+        const c = String(m.content || "");
+        const lines = c ? c.split("\n").length : 0;
+        const size = lines ? ` (${lines} line${lines === 1 ? "" : "s"})` : "";
+        return `tool ⟵ ${m.name || "?"}${size}`;
+      }
+      const meta = [];
+      if (m.finish_reason != null && m.finish_reason !== "stop") meta.push(`finish=${m.finish_reason}`);
+      if (m.reasoning_chars) meta.push(`reasoning=${m.reasoning_chars}c`);
+      const metaStr = meta.length ? ` [${meta.join(", ")}]` : "";
+      const calls = Array.isArray(m.tool_calls) && m.tool_calls.length
+        ? " → " + m.tool_calls.map(t => `${t.name}(${String(t.arguments || "").slice(0, 80)})`).join(", ")
+        : "";
+      const body = fmtAssistantContent(m.content);
+      if (!body && !calls) return `assistant: (thinking…)${metaStr}`;
+      return `assistant:${body ? " " + body : ""}${calls}${metaStr}`;
+    }
+    ["step", "tool", "error", "log", "chat"].forEach(kind => {
       es.addEventListener(kind, (e) => {
         // The browser also fires a native "error" event (no .data) on a
         // dropped connection; ignore those here — es.onerror handles them.
@@ -98,6 +147,7 @@
           b.className = "error";
           b.style.whiteSpace = "pre-wrap";
         }
+        if (kind === "chat") { append(`💬 ${fmtMessage(txt)}`); return; }
         append(kind === "log" ? txt : `[${kind}] ${txt}`);
       });
     });

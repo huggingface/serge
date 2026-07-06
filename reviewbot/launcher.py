@@ -86,6 +86,7 @@ def build_spec(
     callback_token: str,
     config: Optional[dict[str, Any]] = None,
     repo_remote_url: Optional[str] = None,
+    request_type: str = "task",
 ) -> dict[str, Any]:
     """Assemble the ``task.json`` payload the runner reads. ``request`` is a
     serialized :class:`reviewbot.tasks.TaskRequest`; ``llm`` is the per-repo
@@ -98,6 +99,7 @@ def build_spec(
         "job_id": job_id,
         "request": request,
         "github_token": github_token,
+        "request_type": request_type,
         "llm": llm,
         "config": config or {},
         "callback": {"url": callback_url, "token": callback_token},
@@ -252,4 +254,36 @@ def launch_kubernetes(
         uid=opts.uid,
         gid=opts.gid,
         poll_interval=poll_interval,
+    )
+
+
+def create_kubernetes(
+    spec: dict[str, Any],
+    opts: K8sLaunchOptions,
+    *,
+    timeout: int,
+) -> tuple[str, str]:
+    """Non-blocking launch: create the runner Job + Secret and return
+    ``(job_name, namespace)`` immediately (SERGE_ORCHESTRATOR_PODS_PLAN.md
+    Phase 1). The caller reconciles completion via the callback + a Job watcher,
+    so no serge thread is parked for the pod's lifetime. Delegates to
+    :func:`reviewbot.k8s_sandbox.create_task_job` (client imported lazily)."""
+    from .k8s_sandbox import K8sSettings, create_task_job
+
+    settings = K8sSettings(
+        namespace=opts.namespace,
+        service_account=opts.service_account,
+        node_selector=opts.node_selector,
+    )
+    return create_task_job(
+        spec,
+        image=opts.image,
+        settings=settings,
+        timeout=timeout,
+        proxy=opts.proxy,
+        no_proxy=opts.no_proxy,
+        memory=opts.memory,
+        clone_dir=opts.clone_dir,
+        uid=opts.uid,
+        gid=opts.gid,
     )

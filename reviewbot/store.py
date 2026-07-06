@@ -96,7 +96,9 @@ CREATE INDEX IF NOT EXISTS idx_provider_configs_repo
 
 
 # Kinds of SSE events worth persisting. Token/reasoning chunks blow up
-# the DB on big PRs and are useless after the fact.
+# the DB on big PRs and are useless after the fact. "chat" (per-turn
+# assistant content + tool I/O, already truncated in reviewer) IS kept:
+# it is what makes "unparseable output"-class failures diagnosable.
 PERSIST_EVENT_KINDS = frozenset(
     {
         "log",
@@ -105,6 +107,7 @@ PERSIST_EVENT_KINDS = frozenset(
         "error",
         "done",
         "metrics",
+        "chat",
     }
 )
 
@@ -720,6 +723,14 @@ def _encode_draft(draft: Optional[ReviewDraft]) -> Optional[str]:
         },
         ensure_ascii=False,
     )
+
+
+def encode_draft(draft: Optional[ReviewDraft]) -> Optional[str]:
+    """Public wrapper over :func:`_encode_draft` — the review pod serializes its
+    draft with this and serge reconstructs it via :func:`decode_draft`
+    (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 3). Note: token counts are NOT in this
+    payload (they travel separately in the terminal callback)."""
+    return _encode_draft(draft)
 
 
 def decode_draft(s: Optional[str]) -> Optional[ReviewDraft]:

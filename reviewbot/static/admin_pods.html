@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Serge · pods</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" type="image/png" href="/static/serge-logo.png">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="brand-row">
+      <a href="/" class="brand"><h1><img class="brand-logo" src="/static/serge-logo.png" alt=""> Serge</h1></a>
+      <!-- POWERED_BY -->
+    </div>
+    <div class="right">
+      <a href="/" class="secondary nav-link">New review</a>
+      <a href="/admin" class="secondary nav-link">Settings</a>
+      <a href="/admin/pods" class="secondary nav-link" aria-current="page">Pods</a>
+      <a href="/journal" class="secondary nav-link">Journal</a>
+      <a href="https://huggingface.github.io/serge/" class="secondary nav-link" target="_blank" rel="noopener noreferrer">Help</a>
+      <form method="post" action="/auth/logout" style="margin:0">
+        <button type="submit" class="secondary">Sign out</button>
+      </form>
+    </div>
+  </header>
+  <main>
+    <div id="error-banner"></div>
+    <section class="card">
+      <h2>Running pods
+        <span class="hint" id="pods-count"></span>
+        <span class="hint" id="pods-backend"></span>
+      </h2>
+      <p class="hint">
+        Live task-runner pods. Kubernetes shows the actual pods in the cluster
+        (joined with serge's view); docker/inprocess shows the tasks serge is
+        tracking. Auto-refreshes every 5s.
+      </p>
+      <div class="table-scroll">
+        <table class="jobs-list">
+          <thead>
+            <tr>
+              <th>Started</th>
+              <th>Kind</th>
+              <th>Repo</th>
+              <th>User</th>
+              <th>Job status</th>
+              <th>Pod phase</th>
+              <th>Node</th>
+              <th>Pod</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="pods-tbody"></tbody>
+        </table>
+      </div>
+      <p class="hint" id="pods-empty" hidden>No running pods.</p>
+    </section>
+  </main>
+  <script src="/static/admin_pods.js" defer></script>
+</body>
+</html>

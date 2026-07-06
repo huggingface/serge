@@ -28,7 +28,7 @@ inputs:
     required: false
     default: 'false'
   mention_trigger:
-    description: 'Phrase that must appear in a comment to trigger a review.'
+    description: 'Phrase that triggers reviews. Must be the first word of the comment.'
     required: false
     default: '@askserge'
   review_event:

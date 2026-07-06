@@ -159,6 +159,57 @@ class TriggerTests(unittest.TestCase):
 
         self.assertIsNone(req)
 
+    def test_build_review_request_accepts_trigger_after_leading_whitespace(
+        self,
+    ) -> None:
+        payload = {
+            "action": "created",
+            "comment": {
+                "body": "  @askserge please review",
+                "author_association": "MEMBER",
+                "id": 123,
+                "user": {"login": "reviewer"},
+            },
+            "issue": {
+                "pull_request": {
+                    "url": "https://api.github.com/repos/acme/project/pulls/7"
+                },
+                "state": "open",
+                "number": 7,
+            },
+            "repository": {"full_name": "acme/project"},
+        }
+
+        req = build_review_request("issue_comment", payload, "@askserge")
+
+        self.assertIsNotNone(req)
+
+    def test_build_review_request_rejects_mid_comment_trigger(self) -> None:
+        payload = {
+            "action": "created",
+            "comment": {
+                "body": (
+                    "Right, a maintainer need to trigger a new review with "
+                    "@askserge and it would review again"
+                ),
+                "author_association": "MEMBER",
+                "id": 123,
+                "user": {"login": "reviewer"},
+            },
+            "issue": {
+                "pull_request": {
+                    "url": "https://api.github.com/repos/acme/project/pulls/7"
+                },
+                "state": "open",
+                "number": 7,
+            },
+            "repository": {"full_name": "acme/project"},
+        }
+
+        req = build_review_request("issue_comment", payload, "@askserge")
+
+        self.assertIsNone(req)
+
     def test_build_review_request_rejects_non_matching_trigger(self) -> None:
         payload = {
             "action": "created",

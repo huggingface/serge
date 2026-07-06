@@ -656,6 +656,41 @@ _TRUNCATION_RECOVERY_MESSAGE = (
     "analysis, no explanation, no <think> block, no markdown fences. Keep it "
     "minimal so the whole answer fits within the output limit."
 )
+# An empty final answer (blank content, usually finish_reason=None) means the
+# model returned nothing parseable — often the provider truncated the stream on
+# a very large context. Re-ask once, tool-free, for just the JSON — same
+# recovery path as the length-truncation case, bounded by the same retry cap.
+_EMPTY_ANSWER_RECOVERY_MESSAGE = (
+    "Your previous reply was empty — no JSON object came through. Reply now "
+    "with ONLY the final JSON object the task requires: no analysis, no "
+    "explanation, no <think> block, no markdown fences."
+)
+
+
+def _needs_final_salvage(chat: ChatResult) -> bool:
+    """True when a tool-free final answer should be re-asked rather than
+    parsed: it either hit the output-token limit (``finish_reason="length"``)
+    or came back with blank content (commonly ``finish_reason=None`` when the
+    provider truncates the stream on a very large context)."""
+    return chat.finish_reason == "length" or not (chat.content or "").strip()
+
+
+def _final_recovery_message(chat: ChatResult) -> str:
+    blank = not (chat.content or "").strip()
+    return _EMPTY_ANSWER_RECOVERY_MESSAGE if blank else _TRUNCATION_RECOVERY_MESSAGE
+
+
+def _emit_final_salvage(
+    emit: Optional[Callable[[str, str], None]], chat: ChatResult, attempt: int
+) -> None:
+    if emit is None:
+        return
+    what = "empty" if not (chat.content or "").strip() else "truncated"
+    emit(
+        "log",
+        f"Final answer was {what} (finish_reason={chat.finish_reason}); re-asking "
+        f"for the JSON only (recovery {attempt}/{_MAX_TRUNCATION_RETRIES})",
+    )
 
 
 def _run_agentic_loop(
@@ -806,27 +841,35 @@ def _run_agentic_loop(
         if chat.completion_tokens is not None:
             metrics.completion_tokens += chat.completion_tokens
         _emit_metrics(emit, metrics)
+        # Log what the model emitted this turn (content + finish_reason +
+        # tool-call names). Captures the empty final turn behind
+        # "unparseable output" failures.
+        _emit_chat_message(
+            emit,
+            "assistant",
+            content=chat.content,
+            reasoning_chars=chat.reasoning_chars,
+            finish_reason=chat.finish_reason,
+            tool_calls=chat.tool_calls,
+        )
 
         if not chat.tool_calls:
-            # Salvage a truncated final answer before anything else: the model
-            # ran out of output budget mid-JSON (reasoning ate it). Re-ask for
-            # the JSON only, tool-less and low-reasoning, instead of returning
-            # unparseable content that fails the whole task.
+            # Salvage a truncated OR empty final answer before anything else:
+            # the model either ran out of output budget mid-JSON
+            # (finish_reason="length", reasoning ate it) or returned nothing
+            # parseable at all (blank content — commonly finish_reason=None when
+            # the provider truncates a huge-context stream). Re-ask for the JSON
+            # only, tool-less and low-reasoning, instead of returning content
+            # that just fails the parse.
             if (
-                chat.finish_reason == "length"
+                _needs_final_salvage(chat)
                 and truncation_retries < _MAX_TRUNCATION_RETRIES
             ):
                 truncation_retries += 1
-                if emit is not None:
-                    emit(
-                        "log",
-                        "Final answer hit the output-token limit "
-                        f"(recovery {truncation_retries}/{_MAX_TRUNCATION_RETRIES}); "
-                        "re-asking for the JSON only",
-                    )
+                _emit_final_salvage(emit, chat, truncation_retries)
                 messages.append({"role": "assistant", "content": chat.content or None})
                 messages.append(
-                    {"role": "user", "content": _TRUNCATION_RECOVERY_MESSAGE}
+                    {"role": "user", "content": _final_recovery_message(chat)}
                 )
                 force_json_only = True
                 continue
@@ -901,6 +944,7 @@ def _run_agentic_loop(
                     "content": result,
                 }
             )
+            _emit_chat_message(emit, "tool", content=result, tool_name=tc.name)
 
     # Iteration budget hit — force a final answer with tools disabled.
     # Only reachable when ``tool_max_iterations > 0`` and the model
@@ -942,6 +986,25 @@ def _run_agentic_loop(
         if chat.completion_tokens is not None:
             metrics.completion_tokens += chat.completion_tokens
         _emit_metrics(emit, metrics)
+        _emit_chat_message(
+            emit,
+            "assistant",
+            content=chat.content,
+            reasoning_chars=chat.reasoning_chars,
+            finish_reason=chat.finish_reason,
+        )
+
+        # Salvage an empty/truncated forced-final answer before validating or
+        # returning it. This is the exact failure the budget-exhausted path used
+        # to die on: an empty completion (finish_reason=None) went straight to
+        # the parser and surfaced as "LLM returned unparseable output". Re-ask
+        # for the JSON only instead (bounded by _MAX_TRUNCATION_RETRIES).
+        if _needs_final_salvage(chat) and truncation_retries < _MAX_TRUNCATION_RETRIES:
+            truncation_retries += 1
+            _emit_final_salvage(emit, chat, truncation_retries)
+            messages.append({"role": "assistant", "content": chat.content or None})
+            messages.append({"role": "user", "content": _final_recovery_message(chat)})
+            continue
 
         # The verification gate must run on the forced final answer too —
         # exhausting the tool budget must not silently bypass validation (for
@@ -1031,6 +1094,62 @@ def _emit_metrics(
         }
     )
     emit("metrics", payload)
+
+
+# Per-message log cap. Assistant turns are small (the model's own output),
+# but tool results can be large (a grepped file); truncate so the run log
+# stays debuggable without bloating the SQLite job store with the full
+# 500k-token context that already lives in the prompt.
+_LOG_MSG_MAX_CHARS = 2000
+
+
+def _emit_chat_message(
+    emit: Optional[Callable[[str, str], None]],
+    role: str,
+    *,
+    content: Optional[str] = None,
+    reasoning_chars: int = 0,
+    finish_reason: Optional[str] = None,
+    tool_calls: Optional[list[ToolCall]] = None,
+    tool_name: Optional[str] = None,
+) -> None:
+    """Record one chat turn in the run log as a ``message`` event.
+
+    Captures what the model actually emitted each turn — content,
+    reasoning length, finish_reason, tool-call names/args — plus truncated
+    tool results. Deliberately does NOT re-store the giant diff/user
+    context (it is the same every turn and already accounted for in the
+    metrics). This is what makes "LLM returned unparseable output"
+    failures diagnosable: the empty final turn (content="",
+    finish_reason=None) shows up here. Best-effort — never raises into the
+    agent loop."""
+    if emit is None:
+        return
+    payload: dict[str, Any] = {"role": role}
+    if content:
+        payload["content"] = (
+            content
+            if len(content) <= _LOG_MSG_MAX_CHARS
+            else content[:_LOG_MSG_MAX_CHARS]
+            + f"… [+{len(content) - _LOG_MSG_MAX_CHARS} chars truncated]"
+        )
+    if reasoning_chars:
+        payload["reasoning_chars"] = reasoning_chars
+    if finish_reason is not None:
+        payload["finish_reason"] = finish_reason
+    if tool_calls:
+        payload["tool_calls"] = [
+            {"name": tc.name, "arguments": _summarize_args_str(tc.arguments)}
+            for tc in tool_calls
+        ]
+    if tool_name:
+        payload["name"] = tool_name
+    try:
+        # kind "chat" (not "message"): "message" is the SSE default event type,
+        # which would double-fire the browser's onmessage handler.
+        emit("chat", json.dumps(payload))
+    except Exception:  # never let logging break a run
+        log.debug("failed to emit chat message", exc_info=True)
 
 
 def _assistant_tool_call_dict(tc: ToolCall) -> dict[str, Any]:

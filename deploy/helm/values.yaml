@@ -82,6 +82,19 @@ envVars:
 # via envFrom. Leave empty to manage everything through envVars/extraEnv.
 existingSecret: ""
 
+# Optional: have the chart render a provider-specific secret-sync CRD that
+# PRODUCES the `existingSecret` Secret above. Provider-neutral — supply
+# apiVersion/kind/spec from your env values (see env/prod.yaml for the Infisical
+# wiring used in production). Because serge consumes the Secret via envFrom, the
+# synced keys become env vars 1:1, so name them exactly as serge expects. Leave
+# disabled to manage the Secret yourself (a --secret-file apply or a standalone CR).
+externalSecret:
+  enabled: false
+  # apiVersion: secrets.infisical.com/v1alpha1
+  # kind: InfisicalSecret
+  name: ""          # name of the CRD object; "" -> defaults to "serge-secrets"
+  spec: {}
+
 extraEnv: []
 extraEnvFrom: []
 
@@ -120,6 +133,13 @@ taskExecution:
     podServiceAccount: ""
     # nodeSelector for the task pods, as "key=value,key2=value2".
     nodeSelector: ""
+    # Also run PR *reviews* in per-review pods (SERGE_ORCHESTRATOR_PODS_PLAN.md
+    # Phase 3/4), reusing this backend's egress proxy + RBAC + callback. When
+    # false, reviews run in-process in serge (default) even with task pods on.
+    reviewPods: false
+    # Optional slimmer image for review pods (reviews don't run `make fix-repo`).
+    # "" falls back to the task runner `image` above.
+    reviewImage: ""
     # Base URL the runner POSTs events + the terminal result back to. "" =
     # serge's in-cluster Service DNS (http://<release>.<ns>.svc.cluster.local).
     # The callback bypasses the egress proxy (see NO_PROXY in the ConfigMap).

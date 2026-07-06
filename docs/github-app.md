@@ -7,6 +7,13 @@ GitHub App mode runs a webhook server that listens for trigger comments, calls
 the LLM, and posts reviews with a GitHub App installation token. It is useful
 when you want one hosted reviewer to serve many repositories.
 
+![serge GitHub App data flow]({{ "/assets/github-app-flow.png" | relative_url }})
+
+A maintainer mentions `@askserge` on a PR; GitHub delivers the comment to
+`POST /webhook`; serge verifies the signature, gates the event, fetches and
+reviews the PR against an OpenAI-compatible LLM, and publishes the review back
+through the GitHub API.
+
 ## No Per-Repo Workflow Required
 
 This is the whole point of App mode: **installed repositories need no workflow
@@ -86,7 +93,7 @@ GitHub sends comment events to `POST /webhook`. A review starts only when:
 
 - the event is `issue_comment` or `pull_request_review_comment`;
 - the action is `created`;
-- the comment contains the configured trigger, default `@askserge`;
+- the comment starts with the configured trigger, default `@askserge` (first word);
 - the comment author is **not** a bot (the App's own comments are ignored);
 - the author association is `MEMBER`, `OWNER`, or `COLLABORATOR`;
 - the PR is open.

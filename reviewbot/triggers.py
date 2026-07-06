@@ -3,6 +3,18 @@ from typing import Optional
 from .reviewer import InlineCommentContext, ReviewRequest
 
 
+def _comment_starts_with_trigger(body: str, mention_trigger: str) -> bool:
+    """True when ``mention_trigger`` is the first word of ``body``.
+
+    Avoids accidental triggers when a comment merely *discusses* the trigger
+    phrase (e.g. "ask a maintainer to post @askserge to re-review").
+    """
+    stripped = (body or "").lstrip()
+    if not stripped:
+        return False
+    return stripped.split(None, 1)[0] == mention_trigger
+
+
 def build_review_request(
     event_name: str,
     payload: dict,
@@ -26,7 +38,7 @@ def build_review_request(
         return None
 
     comment = payload.get("comment") or {}
-    if mention_trigger not in (comment.get("body") or ""):
+    if not _comment_starts_with_trigger(comment.get("body") or "", mention_trigger):
         return None
     # In App mode the webhook sees every comment on installed repos, including
     # ones the App itself (or any other bot) posts. Never react to a bot's

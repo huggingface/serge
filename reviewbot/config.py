@@ -141,9 +141,10 @@ class Config:
     # "high". Leave empty to omit the parameter entirely.
     llm_reasoning_effort: Optional[str] = None
     # Public URL to install/configure the GitHub App that backs this
-    # deployment. Surfaced on the /help page as the "Install the app"
-    # link. Defaults to the Hugging Face Serge App; override per-deploy
-    # via WEB_GITHUB_APP_URL.
+    # deployment. Defaults to the Hugging Face Serge App; override
+    # per-deploy via WEB_GITHUB_APP_URL. (No longer surfaced in the UI
+    # since the in-app help page was replaced by a link to the docs
+    # site; retained for deployment config compatibility.)
     web_github_app_url: Optional[str] = "https://github.com/apps/sergereview"
 
     # --- Tasks flow (POST /tasks) -------------------------------------
@@ -179,9 +180,19 @@ class Config:
     #   "kubernetes"— launch a per-task runner Job (Phase 3).
     # The flag keeps the pod-per-task rollout reversible.
     task_execution: str = "inprocess"
+    # How PR reviews execute — same backends as ``task_execution``
+    # (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 3). "inprocess" runs the review loop
+    # in a serge thread (today's behaviour, no kube needed); "docker"/"kubernetes"
+    # run it in a per-review pod that streams the draft back over the callback.
+    # Defaults to "inprocess" so serge reviews without a cluster; podding is opt-in
+    # and reversible.
+    review_execution: str = "inprocess"
     # Runner image for the docker/kubernetes backends (reviewbot layered on
     # the repo toolchain — see docker/Dockerfile.task-runner).
     task_runner_image: Optional[str] = None
+    # Runner image for review pods. Reviews don't run ``make fix-repo``, so this
+    # can be a slimmer serge-base image; falls back to task_runner_image when unset.
+    review_runner_image: Optional[str] = None
     # Base URL the runner POSTs events + the terminal result back to
     # (``{base}/internal/tasks/{job_id}/events``). In k8s this is serge's
     # in-cluster Service URL; for docker-on-host it points at the serge host
@@ -240,6 +251,11 @@ class Config:
     # nodeSelector for the task Job pods, as "key=value,key2=value2"
     # (e.g. "scheduling.cast.ai/node-template=default-by-castai").
     task_k8s_node_selector: Optional[str] = None
+    # Name of the serge-egress ConfigMap + Deployment (both share this name).
+    # Set by helm to "<release>-egress". When set on the kubernetes backend,
+    # serge keeps the proxy's allowlist in sync with the configured LLM
+    # provider hosts (see webapp._sync_egress_allowlist). "" = never touch it.
+    task_egress_name: Optional[str] = None
     # Optional Slack notification for PRs created by the /tasks flow.
     # Defaults to the org-level CI feedback Slack secrets; the transformers CI
     # names remain supported as fallbacks.
@@ -296,6 +312,15 @@ class Config:
             raise RuntimeError(
                 "TASK_EXECUTION must be one of inprocess|docker|kubernetes, "
                 f"got {task_execution!r}"
+            )
+
+        review_execution = (
+            os.environ.get("REVIEW_EXECUTION") or "inprocess"
+        ).strip().lower() or "inprocess"
+        if review_execution not in ("inprocess", "docker", "kubernetes"):
+            raise RuntimeError(
+                "REVIEW_EXECUTION must be one of inprocess|docker|kubernetes, "
+                f"got {review_execution!r}"
             )
 
         oauth_client_id = os.environ.get("GITHUB_OAUTH_CLIENT_ID") or None
@@ -431,7 +456,10 @@ class Config:
             task_tool_max_iterations=(_int_env("TASK_TOOL_MAX_ITERATIONS", 0) or None),
             task_max_followups=_int_env("TASK_MAX_FOLLOWUPS", 5),
             task_execution=task_execution,
+            review_execution=review_execution,
             task_runner_image=(os.environ.get("TASK_RUNNER_IMAGE") or "").strip()
+            or None,
+            review_runner_image=(os.environ.get("REVIEW_RUNNER_IMAGE") or "").strip()
             or None,
             task_callback_base_url=(os.environ.get("TASK_CALLBACK_BASE_URL") or "")
             .strip()
@@ -474,6 +502,7 @@ class Config:
                 os.environ.get("TASK_K8S_NODE_SELECTOR") or ""
             ).strip()
             or None,
+            task_egress_name=(os.environ.get("TASK_EGRESS_NAME") or "").strip() or None,
             slack_bot_token=(
                 os.environ.get("SLACK_CIFEEDBACK_BOT_TOKEN")
                 or os.environ.get("CI_SLACK_BOT_TOKEN")

@@ -12,7 +12,28 @@ permissions:
   contents: read
 
 jobs:
+  # Lint the workflow files themselves first. actionlint statically checks
+  # ${{ }} expressions (incl. that functions like startsWith/contains exist),
+  # which catches errors that otherwise only surface as a startup failure with
+  # zero jobs run — e.g. the invalid trim() that broke ai-review.yml.
+  actionlint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Download actionlint
+        id: get_actionlint
+        run: bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.11/scripts/download-actionlint.bash) 1.7.11
+        shell: bash
+
+      - name: Lint workflow files
+        run: ${{ steps.get_actionlint.outputs.executable }} -color
+        shell: bash
+
   test:
+    needs: actionlint
     runs-on: ubuntu-latest
 
     steps:
@@ -34,6 +55,7 @@ jobs:
         run: make test
 
   helm:
+    needs: actionlint
     runs-on: ubuntu-latest
 
     steps:
