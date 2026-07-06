@@ -238,19 +238,25 @@ def run(spec: RunnerSpec) -> int:
     outcome was reported (published *or* no_fix — both are clean task
     completions), 1 when the task errored. The outcome detail is always sent to
     serge via the callback regardless of exit code."""
-    cfg = build_runner_config(spec)
-    req = build_task_request(spec)
+    # Construct the emitter first, from the spec's callback info alone, so any
+    # failure while assembling config/request/clients below still self-reports a
+    # terminal ``error`` callback instead of exiting silently ("exited without
+    # reporting"). Everything that can raise now lives inside the try.
     emitter = CallbackEmitter(
         spec.callback.get("url"), spec.callback.get("token"), spec.job_id
     )
-    clone_cache = CloneCache(cfg.web_clone_cache_dir)
-    gh = GitHubClient(spec.github_token)
+    clone_cache: Optional[CloneCache] = None
     checkout: Optional[Checkout] = None
 
     def emit(kind: str, text: str) -> None:
         emitter.emit(kind, text)
 
     try:
+        cfg = build_runner_config(spec)
+        req = build_task_request(spec)
+        clone_cache = CloneCache(cfg.web_clone_cache_dir)
+        gh = GitHubClient(spec.github_token)
+
         existing_diff: Optional[str] = None
         if req.mode == "existing_pr":
             emit("step", "resolve")
@@ -369,9 +375,10 @@ def run(spec: RunnerSpec) -> int:
         return _fail(emitter, format_github_http_error(exc))
     except Exception as exc:  # noqa: BLE001
         log.exception("task runner crashed for job %s", spec.job_id)
-        return _fail(emitter, f"{type(exc).__name__}: task crashed (see pod log)")
+        return _fail(emitter, f"task runner crashed: {_crash_detail(exc)}")
     finally:
-        clone_cache.release(checkout)
+        if clone_cache is not None:
+            clone_cache.release(checkout)
 
 
 def _fail(
@@ -382,6 +389,19 @@ def _fail(
     emitter.emit("done", "")
     emitter.finish("error", error=message, raw_llm_output=raw_llm_output)
     return 1
+
+
+def _crash_detail(exc: BaseException) -> str:
+    """A one-line cause plus the crashing frame — enough to see *why* a startup
+    exception fired in the job's ``error`` without needing the pod log."""
+    frame = ""
+    tb = exc.__traceback__
+    while tb is not None:  # walk to the innermost frame
+        code = tb.tb_frame.f_code
+        frame = f"{os.path.basename(code.co_filename)}:{tb.tb_lineno} in {code.co_name}"
+        tb = tb.tb_next
+    detail = f"{type(exc).__name__}: {exc}".strip()
+    return f"{detail} (at {frame})" if frame else detail
 
 
 # ---------------------------------------------------------------------------
@@ -409,13 +429,27 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.error("could not load task spec: %s", exc)
         return 2
 
-    if spec.request_type == "review":
-        # Read-only PR review pod (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 3).
-        # Imported lazily to avoid a task_runner <-> review_runner import cycle.
-        from .review_runner import run as run_review
+    try:
+        if spec.request_type == "review":
+            # Read-only PR review pod (SERGE_ORCHESTRATOR_PODS_PLAN.md Phase 3).
+            # Imported lazily to avoid a task_runner <-> review_runner cycle.
+            from .review_runner import run as run_review
 
-        return run_review(spec)
-    return run(spec)
+            return run_review(spec)
+        return run(spec)
+    except Exception as exc:  # noqa: BLE001
+        # Backstop: run()/run_review() self-report their own crashes, so this
+        # only fires if the emitter itself couldn't be built or the dispatch
+        # failed. Try once more to POST a terminal error so serge sees *why*
+        # rather than the opaque "exited without reporting (exit code 1)".
+        log.exception("task runner crashed unexpectedly for job %s", spec.job_id)
+        try:
+            CallbackEmitter(
+                spec.callback.get("url"), spec.callback.get("token"), spec.job_id
+            ).finish("error", error=f"task runner crashed: {_crash_detail(exc)}")
+        except Exception:  # noqa: BLE001
+            log.exception("could not report crash for job %s", spec.job_id)
+        return 1
 
 
 if __name__ == "__main__":  # pragma: no cover
