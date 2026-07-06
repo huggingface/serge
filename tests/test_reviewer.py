@@ -1,20 +1,111 @@
+import json
 import unittest
 
 from reviewbot.llm_client import ChatResult, ToolCall
 from reviewbot.patch import parse_patch
 from reviewbot.tools import ToolEnv
 from reviewbot.reviewer import (
+    _LOG_MSG_MAX_CHARS,
     _MAX_TRUNCATION_RETRIES,
     _UnparseableLLMOutput,
     _assistant_tool_call_dict,
     _build_annotated_diff_chunks,
     _content_preview,
+    _emit_chat_message,
+    _final_recovery_message,
+    _needs_final_salvage,
     _extract_json,
     _merge_chunk_event,
     _merge_chunk_summaries,
     _run_agentic_loop,
     _summarize_rejected_comments,
 )
+
+
+class EmitChatMessageTests(unittest.TestCase):
+    def _capture(self):
+        events: list[tuple[str, str]] = []
+        return events, (lambda kind, text: events.append((kind, text)))
+
+    def test_assistant_turn_records_content_and_tool_calls(self) -> None:
+        events, emit = self._capture()
+        _emit_chat_message(
+            emit,
+            "assistant",
+            content="looking at the diff",
+            reasoning_chars=42,
+            finish_reason="tool_calls",
+            tool_calls=[
+                ToolCall(id="t0", name="read_file", arguments='{"path":"a.py"}')
+            ],
+        )
+        self.assertEqual(len(events), 1)
+        kind, text = events[0]
+        # "chat", NOT "message": "message" is the SSE default event type.
+        self.assertEqual(kind, "chat")
+        payload = json.loads(text)
+        self.assertEqual(payload["role"], "assistant")
+        self.assertEqual(payload["content"], "looking at the diff")
+        self.assertEqual(payload["reasoning_chars"], 42)
+        self.assertEqual(payload["finish_reason"], "tool_calls")
+        self.assertEqual(payload["tool_calls"][0]["name"], "read_file")
+
+    def test_empty_final_turn_is_still_logged(self) -> None:
+        # The exact failure mode we need visible: an empty completion with
+        # finish_reason=None must produce a record (with no content key).
+        events, emit = self._capture()
+        _emit_chat_message(emit, "assistant", content="", finish_reason=None)
+        self.assertEqual(len(events), 1)
+        payload = json.loads(events[0][1])
+        self.assertEqual(payload["role"], "assistant")
+        self.assertNotIn("content", payload)
+        self.assertNotIn("finish_reason", payload)
+
+    def test_long_tool_result_is_truncated(self) -> None:
+        events, emit = self._capture()
+        big = "x" * (_LOG_MSG_MAX_CHARS + 500)
+        _emit_chat_message(emit, "tool", content=big, tool_name="grep")
+        payload = json.loads(events[0][1])
+        self.assertEqual(payload["name"], "grep")
+        self.assertLess(len(payload["content"]), len(big))
+        self.assertIn("truncated", payload["content"])
+
+    def test_none_emit_is_a_noop(self) -> None:
+        _emit_chat_message(None, "assistant", content="hi")  # must not raise
+
+
+class FinalSalvageTests(unittest.TestCase):
+    def test_empty_content_needs_salvage(self) -> None:
+        # The production failure: empty completion, finish_reason=None.
+        self.assertTrue(
+            _needs_final_salvage(ChatResult(content="", finish_reason=None))
+        )
+        self.assertTrue(
+            _needs_final_salvage(ChatResult(content="   \n", finish_reason=None))
+        )
+
+    def test_length_truncation_needs_salvage(self) -> None:
+        self.assertTrue(
+            _needs_final_salvage(
+                ChatResult(content='{"partial', finish_reason="length")
+            )
+        )
+
+    def test_good_answer_does_not_need_salvage(self) -> None:
+        self.assertFalse(
+            _needs_final_salvage(
+                ChatResult(content='{"ok": true}', finish_reason="stop")
+            )
+        )
+
+    def test_recovery_message_varies_by_cause(self) -> None:
+        empty = _final_recovery_message(ChatResult(content="", finish_reason=None))
+        truncated = _final_recovery_message(
+            ChatResult(content='{"partial', finish_reason="length")
+        )
+        self.assertIn("empty", empty)
+        self.assertIn("cut off", truncated)
+        self.assertNotEqual(empty, truncated)
 
 
 class AssistantToolCallDictTests(unittest.TestCase):

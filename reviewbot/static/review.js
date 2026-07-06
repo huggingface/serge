@@ -168,6 +168,73 @@
   const consolePending = [];
   let consoleFlushScheduled = false;
 
+  // A `message` event carries a JSON payload of what the model emitted that
+  // turn (see reviewer._emit_chat_message). Render it as a readable line.
+  function formatAssistantContent(content) {
+    if (!content) return "";
+    let o;
+    try {
+      o = JSON.parse(content);
+    } catch (_) {
+      return content;
+    }
+    if (!o || typeof o !== "object") return content;
+    // Task patch answer: {title, body, patch}.
+    if ("patch" in o || "title" in o) {
+      const out = [];
+      if (o.title) out.push(`📝 ${o.title}`);
+      if (o.body) out.push(String(o.body));
+      const patch = String(o.patch || "").trim();
+      out.push(
+        patch
+          ? `⟶ patch: ${patch.split("\n").length} lines`
+          : "⟶ no patch (no change proposed)",
+      );
+      return "\n   " + out.join("\n   ");
+    }
+    // Review answer: {summary, event, comments}.
+    if ("summary" in o || "comments" in o) {
+      const n = Array.isArray(o.comments) ? o.comments.length : 0;
+      const ev = o.event ? ` [${o.event}]` : "";
+      return `\n   ${o.summary || ""}${ev}\n   ⟶ ${n} inline comment${n === 1 ? "" : "s"}`;
+    }
+    return content;
+  }
+
+  function formatMessageEvent(text) {
+    let m;
+    try {
+      m = JSON.parse(text);
+    } catch (_) {
+      return text;
+    }
+    if (!m || typeof m !== "object") return text;
+    if (m.role === "tool") {
+      // Don't dump the (often large) tool output into the console; just note
+      // the tool and a size hint. Full result is in stored history.
+      const c = String(m.content || "");
+      const lines = c ? c.split("\n").length : 0;
+      const size = lines ? ` (${lines} line${lines === 1 ? "" : "s"})` : "";
+      return `tool ⟵ ${m.name || "?"}${size}`;
+    }
+    const meta = [];
+    if (m.finish_reason != null && m.finish_reason !== "stop") {
+      meta.push(`finish=${m.finish_reason}`);
+    }
+    if (m.reasoning_chars) meta.push(`reasoning=${m.reasoning_chars}c`);
+    const metaStr = meta.length ? ` [${meta.join(", ")}]` : "";
+    const calls =
+      Array.isArray(m.tool_calls) && m.tool_calls.length
+        ? " → " +
+          m.tool_calls
+            .map((t) => `${t.name}(${String(t.arguments || "").slice(0, 80)})`)
+            .join(", ")
+        : "";
+    const body = formatAssistantContent(m.content);
+    if (!body && !calls) return `assistant: (thinking…)${metaStr}`;
+    return `assistant:${body ? " " + body : ""}${calls}${metaStr}`;
+  }
+
   function flushConsole() {
     consoleFlushScheduled = false;
     if (consolePending.length === 0) return;
@@ -179,8 +246,10 @@
       let prefix = streamed || consoleAtLineStart ? "" : "\n";
       if (kind === "log") prefix += "› ";
       else if (kind === "tool") prefix += "⚙ ";
+      else if (kind === "chat") prefix += "💬 ";
       else if (kind === "error") prefix += "✗ ";
-      const body = prefix + text + (streamed ? "" : "\n");
+      const shown = kind === "chat" ? formatMessageEvent(text) : text;
+      const body = prefix + shown + (streamed ? "" : "\n");
       span.textContent = body;
       frag.appendChild(span);
       consoleAtLineStart = body.endsWith("\n");
@@ -669,6 +738,13 @@
         appendConsole("tool", JSON.parse(ev.data));
       } catch {
         appendConsole("tool", ev.data);
+      }
+    });
+    es.addEventListener("chat", (ev) => {
+      try {
+        appendConsole("chat", JSON.parse(ev.data));
+      } catch {
+        appendConsole("chat", ev.data);
       }
     });
     es.addEventListener("reasoning", (ev) => {
