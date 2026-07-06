@@ -206,6 +206,70 @@ class WebappTasksTests(unittest.TestCase):
         self.assertNotIn("skipped", results[1].json())
         self.assertTrue(results[2].json().get("skipped"))
 
+    def _seed_task_job(self, webapp, *, status="no_fix", repo="acme/widgets"):
+        owner, name = repo.split("/", 1)
+        webapp._store.insert_job(
+            id="task-status-1",
+            user="octocat",
+            target_owner=owner,
+            target_repo=name,
+            target_number=0,
+            trigger_comment="fix it",
+            llm_provider="hf",
+            llm_api_base=None,
+            llm_model="m",
+            created_at=1.0,
+            status=status,
+            source="task",
+            kind="task",
+            task_spec_json="{}",
+        )
+
+    def test_status_endpoint_oidc_returns_no_fix(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._seed_task_job(webapp, status="no_fix")
+        with patch.object(webapp, "verify_token", return_value=_Claims()):
+            client = TestClient(webapp.app)
+            r = client.get(
+                "/tasks/acme/widgets/task-status-1/status",
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["id"], "task-status-1")
+        self.assertEqual(body["status"], "no_fix")
+        self.assertEqual(body["target"], "acme/widgets")
+
+    def test_status_endpoint_rejects_foreign_repo_claim(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._seed_task_job(webapp, status="no_fix")
+        # A token minted for a different repo must not read acme/widgets tasks.
+        with patch.object(
+            webapp, "verify_token", return_value=_Claims(repository="evil/repo")
+        ):
+            client = TestClient(webapp.app)
+            r = client.get(
+                "/tasks/acme/widgets/task-status-1/status",
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertEqual(r.status_code, 403)
+
+    def test_status_endpoint_404_when_api_disabled(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp(task_api_enabled=False)
+        with patch.object(webapp, "verify_token", return_value=_Claims()):
+            client = TestClient(webapp.app)
+            r = client.get(
+                "/tasks/acme/widgets/task-status-1/status",
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertEqual(r.status_code, 404)
+
     def test_inprocess_execution_dispatches_to_worker(self):
         if TestClient is None:
             self.skipTest("fastapi not installed")

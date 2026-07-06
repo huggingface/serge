@@ -3545,6 +3545,57 @@ def task_info(request: Request, owner: str, repo: str, job_id: str) -> JSONRespo
     )
 
 
+@app.get("/tasks/{owner}/{repo}/{job_id}/status")
+def task_status(request: Request, owner: str, repo: str, job_id: str) -> JSONResponse:
+    """Machine-facing task status, authorized by GitHub Actions OIDC (same as
+    ``POST /tasks``) rather than a web session — so the caller that dispatched a
+    task can poll its terminal outcome. The ``/info`` sibling requires a browser
+    session; this one accepts the OIDC bearer the dispatcher already holds.
+
+    Authorized on the token's ``repository`` claim: a run can only read tasks it
+    could have dispatched for its own repo. Returns the job ``status``
+    (``running``/``published``/``no_fix``/``error``/…), the ``result`` (patch/PR
+    details on ``published``), and ``error`` — enough for the triage reconciler
+    to mark a group ``no_fix`` in the tracking issue instead of waiting on a PR
+    that never comes."""
+    if not cfg.task_api_enabled:
+        raise HTTPException(status_code=404, detail="tasks_api_disabled")
+
+    token = _bearer_token(request)
+    try:
+        claims = verify_token(
+            token,
+            issuer=cfg.task_oidc_issuer,
+            audience=cfg.task_oidc_audience,
+        )
+    except OIDCError as exc:
+        raise HTTPException(status_code=401, detail=f"oidc_verification_failed: {exc}")
+
+    # The OIDC repository claim is authoritative — the caller may only read tasks
+    # for the repo its token was minted for, and it must match the path.
+    if claims.repository.lower() != f"{owner}/{repo}".lower():
+        raise HTTPException(status_code=403, detail="repo_claim_mismatch")
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        job = _load_job_from_store(job_id)
+    if job is None or job.kind != "task":
+        raise HTTPException(status_code=404, detail="task_not_found")
+    if job.target_owner != owner or job.target_repo != repo:
+        raise HTTPException(status_code=404, detail="task_target_mismatch")
+
+    return JSONResponse(
+        {
+            "id": job.id,
+            "status": job.status,
+            "target": f"{job.target_owner}/{job.target_repo}",
+            "result": job.task_result,
+            "error": job.error,
+        }
+    )
+
+
 @app.get("/tasks/{owner}/{repo}/{job_id}/stream")
 async def task_stream(
     request: Request, owner: str, repo: str, job_id: str
