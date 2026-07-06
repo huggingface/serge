@@ -210,8 +210,12 @@
     }
     if (!m || typeof m !== "object") return text;
     if (m.role === "tool") {
-      const first = String(m.content || "").split("\n")[0].slice(0, 140);
-      return `tool ⟵ ${m.name || "?"}: ${first}`;
+      // Don't dump the (often large) tool output into the console; just note
+      // the tool and a size hint. Full result is in stored history.
+      const c = String(m.content || "");
+      const lines = c ? c.split("\n").length : 0;
+      const size = lines ? ` (${lines} line${lines === 1 ? "" : "s"})` : "";
+      return `tool ⟵ ${m.name || "?"}${size}`;
     }
     const meta = [];
     if (m.finish_reason != null && m.finish_reason !== "stop") {
