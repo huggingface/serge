@@ -1,5 +1,7 @@
 """GitHub-native AI code reviewer for any OpenAI-compatible LLM."""
 
+# This package is the serge reviewer.
+
 import functools as _functools
 import os as _os
 import subprocess as _subprocess
