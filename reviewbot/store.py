@@ -96,7 +96,9 @@ CREATE INDEX IF NOT EXISTS idx_provider_configs_repo
 
 
 # Kinds of SSE events worth persisting. Token/reasoning chunks blow up
-# the DB on big PRs and are useless after the fact.
+# the DB on big PRs and are useless after the fact. "chat" (per-turn
+# assistant content + tool I/O, already truncated in reviewer) IS kept:
+# it is what makes "unparseable output"-class failures diagnosable.
 PERSIST_EVENT_KINDS = frozenset(
     {
         "log",
@@ -105,6 +107,7 @@ PERSIST_EVENT_KINDS = frozenset(
         "error",
         "done",
         "metrics",
+        "chat",
     }
 )
 
