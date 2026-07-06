@@ -340,6 +340,11 @@ class Job:
     # opened the EventSource.
     history: list[dict[str, Any]] = field(default_factory=list)
     history_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Monotonic per-event id, stamped in _push_event and emitted as the SSE
+    # `id:` field. On reconnect the browser sends Last-Event-ID; the stream
+    # skips replay events at/below it so a dropped-and-reconnected client
+    # doesn't re-render the whole transcript (the "doubled lines" bug).
+    event_seq: int = 0
     # Running tally of "noisy" (token/reasoning) entries currently in
     # history. Lets _push_event do bounded-FIFO eviction in O(1) average
     # instead of scanning the full history on every streaming chunk.
@@ -852,8 +857,10 @@ def _push_event(job: Job, kind: str, text: str) -> None:
     """Thread-safe push from the worker thread into the job's queue.
     Also appends to the replay buffer so late SSE subscribers get the
     full transcript."""
-    event = {"kind": kind, "text": text, "ts": time.time()}
     with job.history_lock:
+        seq = job.event_seq
+        job.event_seq += 1
+        event = {"kind": kind, "text": text, "ts": time.time(), "seq": seq}
         job.history.append(event)
         if kind in _NOISY_KINDS:
             job.noisy_history_count += 1
@@ -3301,12 +3308,16 @@ async def review_stream(
         # the page. The draft is what matters once the job is done; the
         # remaining structural events still show clone/fetch/llm/tool
         # progress so the console isn't blank.
+        last_id = _last_event_id(request)
         finished = job.status in ("done", "error", "discarded", "published")
         with job.history_lock:
             if finished:
                 replay = [e for e in job.history if e["kind"] not in _NOISY_KINDS]
             else:
                 replay = list(job.history)
+        if last_id is not None:
+            # Reconnect: only replay events the client hasn't seen.
+            replay = [e for e in replay if e.get("seq", -1) > last_id]
         for event in replay:
             yield _sse_format(event)
         # If the job already finished while we were replaying, stop here.
@@ -3340,14 +3351,31 @@ async def review_stream(
     )
 
 
+def _last_event_id(request: Request) -> Optional[int]:
+    """The browser sends Last-Event-ID automatically when EventSource
+    reconnects. Return it as an int so the stream can resume just past it
+    instead of replaying the whole transcript (which doubled the console)."""
+    raw = request.headers.get("last-event-id")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _sse_format(event: dict[str, Any]) -> str:
     kind = event.get("kind", "log")
     text = event.get("text", "")
+    seq = event.get("seq")
+    # The `id:` lets the browser resume via Last-Event-ID after a dropped
+    # connection instead of replaying from the top (the doubled-lines bug).
+    id_line = f"id: {seq}\n" if seq is not None else ""
     # Use SSE event= for non-default kinds; "log" stays the default
     # message event so the browser handler doesn't need to special-case.
     if kind == "log":
-        return f"data: {_json_inline(text)}\n\n"
-    return f"event: {kind}\ndata: {_json_inline(text)}\n\n"
+        return f"{id_line}data: {_json_inline(text)}\n\n"
+    return f"{id_line}event: {kind}\ndata: {_json_inline(text)}\n\n"
 
 
 def _json_inline(s: str) -> str:
@@ -3502,12 +3530,16 @@ async def task_stream(
     job = _get_task_job(request, owner, repo, job_id)
 
     async def generator():
+        last_id = _last_event_id(request)
         finished = job.status in ("done", "error", "discarded", "published")
         with job.history_lock:
             if finished:
                 replay = [e for e in job.history if e["kind"] not in _NOISY_KINDS]
             else:
                 replay = list(job.history)
+        if last_id is not None:
+            # Reconnect: only replay events the client hasn't seen.
+            replay = [e for e in replay if e.get("seq", -1) > last_id]
         for event in replay:
             yield _sse_format(event)
         if finished:

@@ -170,6 +170,37 @@
 
   // A `message` event carries a JSON payload of what the model emitted that
   // turn (see reviewer._emit_chat_message). Render it as a readable line.
+  function formatAssistantContent(content) {
+    if (!content) return "";
+    let o;
+    try {
+      o = JSON.parse(content);
+    } catch (_) {
+      return content;
+    }
+    if (!o || typeof o !== "object") return content;
+    // Task patch answer: {title, body, patch}.
+    if ("patch" in o || "title" in o) {
+      const out = [];
+      if (o.title) out.push(`📝 ${o.title}`);
+      if (o.body) out.push(String(o.body));
+      const patch = String(o.patch || "").trim();
+      out.push(
+        patch
+          ? `⟶ patch: ${patch.split("\n").length} lines`
+          : "⟶ no patch (no change proposed)",
+      );
+      return "\n   " + out.join("\n   ");
+    }
+    // Review answer: {summary, event, comments}.
+    if ("summary" in o || "comments" in o) {
+      const n = Array.isArray(o.comments) ? o.comments.length : 0;
+      const ev = o.event ? ` [${o.event}]` : "";
+      return `\n   ${o.summary || ""}${ev}\n   ⟶ ${n} inline comment${n === 1 ? "" : "s"}`;
+    }
+    return content;
+  }
+
   function formatMessageEvent(text) {
     let m;
     try {
@@ -179,27 +210,25 @@
     }
     if (!m || typeof m !== "object") return text;
     if (m.role === "tool") {
-      return `tool ⟵ ${m.name || "?"}: ${m.content || ""}`;
-    }
-    const parts = [];
-    if (m.content) parts.push(m.content);
-    if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
-      parts.push(
-        "→ " +
-          m.tool_calls.map((t) => `${t.name}(${t.arguments || ""})`).join(", "),
-      );
-    }
-    if (!m.content && !(m.tool_calls && m.tool_calls.length)) {
-      parts.push("(no content)");
+      const first = String(m.content || "").split("\n")[0].slice(0, 140);
+      return `tool ⟵ ${m.name || "?"}: ${first}`;
     }
     const meta = [];
     if (m.finish_reason != null && m.finish_reason !== "stop") {
       meta.push(`finish=${m.finish_reason}`);
     }
     if (m.reasoning_chars) meta.push(`reasoning=${m.reasoning_chars}c`);
-    let s = `${m.role || "assistant"}: ${parts.join(" ")}`;
-    if (meta.length) s += ` [${meta.join(", ")}]`;
-    return s;
+    const metaStr = meta.length ? ` [${meta.join(", ")}]` : "";
+    const calls =
+      Array.isArray(m.tool_calls) && m.tool_calls.length
+        ? " → " +
+          m.tool_calls
+            .map((t) => `${t.name}(${String(t.arguments || "").slice(0, 80)})`)
+            .join(", ")
+        : "";
+    const body = formatAssistantContent(m.content);
+    if (!body && !calls) return `assistant: (thinking…)${metaStr}`;
+    return `assistant:${body ? " " + body : ""}${calls}${metaStr}`;
   }
 
   function flushConsole() {
