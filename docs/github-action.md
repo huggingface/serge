@@ -28,8 +28,8 @@ permissions:
 jobs:
   review:
     if: |
-      (startsWith(trim(github.event.comment.body), '@askserge ') ||
-       trim(github.event.comment.body) == '@askserge') &&
+      (startsWith(github.event.comment.body, '@askserge ') ||
+       github.event.comment.body == '@askserge') &&
       (github.event.comment.author_association == 'MEMBER' ||
        github.event.comment.author_association == 'OWNER' ||
        github.event.comment.author_association == 'COLLABORATOR')

@@ -106,10 +106,6 @@ envVars:
   MENTION_TRIGGER: "@askserge"
   REVIEW_EVENT: "COMMENT"
   TASK_API_ENABLED: "1"
-  # DEBUG (temporary): run only the first N /tasks per burst so a manual
-  # retrigger of the nightly triage is a short crash-repro cycle, not the whole
-  # batch. Remove once the runner-startup crash is diagnosed.
-  TASK_DEBUG_MAX_TASKS: "3"
   # Refuse to run PR-author subprocesses unless bubblewrap is available.
   # Requires the node to allow unprivileged user namespaces; if pods fail
   # to run reviews, switch to "auto".
