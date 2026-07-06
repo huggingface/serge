@@ -219,6 +219,71 @@ class TaskRunnerE2ETests(unittest.TestCase):
         self.assertEqual(sink.terminal["status"], "no_fix")
 
 
+class RunnerCrashReportingTests(unittest.TestCase):
+    """A crash *before* the agent loop (spec/config/clone) must still POST a
+    terminal ``error`` callback so serge shows *why* instead of the opaque
+    "task runner exited without reporting (exit code 1)"."""
+
+    def _spec(self, callback_url):
+        return task_runner.RunnerSpec(
+            job_id="job-crash-0001",
+            request={
+                "owner": "o",
+                "repo": "r",
+                "base_ref": "main",
+                "instruction": "x",
+                "context": "",
+            },
+            github_token="t",
+            llm={"api_base": "https://e/v1", "api_key": "k", "model": "m"},
+            callback={"url": callback_url, "token": "cb"},
+        )
+
+    def test_startup_crash_reports_terminal_error(self):
+        def _boom(_spec):
+            raise RuntimeError("checkout blew up on the big repo")
+
+        with _CallbackSink() as sink:
+            spec = self._spec(sink.url)
+            with patch.object(task_runner, "build_runner_config", _boom):
+                rc = task_runner.run(spec)
+
+        self.assertEqual(rc, 1)
+        self.assertIsNotNone(sink.terminal)
+        self.assertEqual(sink.terminal["status"], "error")
+        # The cause + the crashing frame are surfaced, not swallowed.
+        self.assertIn("RuntimeError", sink.terminal["error"])
+        self.assertIn("checkout blew up on the big repo", sink.terminal["error"])
+        self.assertIn("(at ", sink.terminal["error"])
+
+    def test_main_backstop_reports_when_run_escapes(self):
+        # If run() itself raises (e.g. couldn't even build the emitter), main's
+        # backstop still POSTs a terminal error from the spec's callback info.
+        boom = RuntimeError("run() escaped")
+        with _CallbackSink() as sink:
+            spec = self._spec(sink.url)
+            tmp = tempfile.mkdtemp()
+            self.addCleanup(lambda: subprocess.run(["rm", "-rf", tmp], check=False))
+            spec_path = os.path.join(tmp, "task.json")
+            with open(spec_path, "w") as fh:
+                json.dump(
+                    {
+                        "job_id": spec.job_id,
+                        "request": spec.request,
+                        "github_token": spec.github_token,
+                        "callback": spec.callback,
+                    },
+                    fh,
+                )
+            with patch.object(task_runner, "run", side_effect=boom):
+                rc = task_runner.main(["--spec", spec_path])
+
+        self.assertEqual(rc, 1)
+        self.assertIsNotNone(sink.terminal)
+        self.assertEqual(sink.terminal["status"], "error")
+        self.assertIn("run() escaped", sink.terminal["error"])
+
+
 class BuildRunnerConfigTests(unittest.TestCase):
     """The spec's resolved-config subset (per-task caps + operator normalize/
     review settings) must reach the in-pod Config; the LLM dict wins for provider

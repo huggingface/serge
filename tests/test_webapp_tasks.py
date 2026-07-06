@@ -172,6 +172,104 @@ class WebappTasksTests(unittest.TestCase):
         row = webapp._store.load(body["id"])
         self.assertEqual(row["kind"], "task")
 
+    def test_debug_max_tasks_caps_a_burst(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._seed_write_config(webapp)
+        webapp._task_debug_state.update(count=0, last=0.0)
+        submitted = []
+
+        def fake_submit(fn, job, worker_cfg, req):
+            submitted.append(job.id)
+
+        with (
+            patch.dict(os.environ, {"TASK_DEBUG_MAX_TASKS": "2"}),
+            patch.object(webapp, "verify_token", return_value=_Claims()),
+            patch.object(webapp._TASK_POOL, "submit", side_effect=fake_submit),
+        ):
+            client = TestClient(webapp.app)
+            results = [
+                client.post(
+                    "/tasks",
+                    json={"instruction": f"fix {i}", "context": ""},
+                    headers={"Authorization": "Bearer tok"},
+                )
+                for i in range(3)
+            ]
+
+        # All three are accepted (202); only the first two actually queue a
+        # worker — the third is a no-op skip.
+        self.assertEqual([r.status_code for r in results], [202, 202, 202])
+        self.assertEqual(len(submitted), 2)
+        self.assertNotIn("skipped", results[0].json())
+        self.assertNotIn("skipped", results[1].json())
+        self.assertTrue(results[2].json().get("skipped"))
+
+    def _seed_task_job(self, webapp, *, status="no_fix", repo="acme/widgets"):
+        owner, name = repo.split("/", 1)
+        webapp._store.insert_job(
+            id="task-status-1",
+            user="octocat",
+            target_owner=owner,
+            target_repo=name,
+            target_number=0,
+            trigger_comment="fix it",
+            llm_provider="hf",
+            llm_api_base=None,
+            llm_model="m",
+            created_at=1.0,
+            status=status,
+            source="task",
+            kind="task",
+            task_spec_json="{}",
+        )
+
+    def test_status_endpoint_oidc_returns_no_fix(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._seed_task_job(webapp, status="no_fix")
+        with patch.object(webapp, "verify_token", return_value=_Claims()):
+            client = TestClient(webapp.app)
+            r = client.get(
+                "/tasks/acme/widgets/task-status-1/status",
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["id"], "task-status-1")
+        self.assertEqual(body["status"], "no_fix")
+        self.assertEqual(body["target"], "acme/widgets")
+
+    def test_status_endpoint_rejects_foreign_repo_claim(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._seed_task_job(webapp, status="no_fix")
+        # A token minted for a different repo must not read acme/widgets tasks.
+        with patch.object(
+            webapp, "verify_token", return_value=_Claims(repository="evil/repo")
+        ):
+            client = TestClient(webapp.app)
+            r = client.get(
+                "/tasks/acme/widgets/task-status-1/status",
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertEqual(r.status_code, 403)
+
+    def test_status_endpoint_404_when_api_disabled(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp(task_api_enabled=False)
+        with patch.object(webapp, "verify_token", return_value=_Claims()):
+            client = TestClient(webapp.app)
+            r = client.get(
+                "/tasks/acme/widgets/task-status-1/status",
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertEqual(r.status_code, 404)
+
     def test_inprocess_execution_dispatches_to_worker(self):
         if TestClient is None:
             self.skipTest("fastapi not installed")
@@ -567,6 +665,10 @@ class TaskLauncherTests(unittest.TestCase):
 
         self.assertEqual(job.status, "error")
         self.assertIsNone(job.callback_token)
+        # The exit code AND the pod's log tail are surfaced on the job, so the
+        # crash cause is visible without a live repro against the reaped pod.
+        self.assertIn("exit code 1", job.error)
+        self.assertIn("boom", job.error)
         notify.assert_called_once()
         persist.assert_called_once()
         cleanup.assert_called_once_with("serge-task-xyz", "serge")

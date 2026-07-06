@@ -1409,10 +1409,13 @@ def _reconcile_pod_task(task: _PodTask) -> None:
         return
     if now - task.terminal_since < _POD_TERMINAL_GRACE:
         return
-    exit_code, _tail = collect_task_result(task.job_name, task.namespace)
-    _reconcile_crash(
-        task, f"task runner exited without reporting (exit code {exit_code})"
-    )
+    exit_code, tail = collect_task_result(task.job_name, task.namespace)
+    message = f"task runner exited without reporting (exit code {exit_code})"
+    if tail.strip():
+        # Surface the pod's log tail so the crash cause is visible on the job
+        # itself, without a live repro against the (already-reaped) pod.
+        message = f"{message}\n--- runner log tail ---\n{tail.strip()}"
+    _reconcile_crash(task, message)
 
 
 def _reconcile_crash(task: _PodTask, message: str) -> None:
@@ -2722,6 +2725,37 @@ def admin_delete_provider(request: Request, config_id: str) -> JSONResponse:
     return JSONResponse({"status": "deleted"})
 
 
+# --- debug-only task cap -----------------------------------------------------
+# TASK_DEBUG_MAX_TASKS caps how many /tasks requests serge actually runs per
+# burst, so a *manual* retrigger of the nightly triage runs only a handful of
+# tasks instead of the whole batch (shorter crash-repro cycle). Requests over
+# the cap are accepted (HTTP 202) but no-op'd — no job, no runner pod. A gap of
+# _TASK_DEBUG_WINDOW seconds since the last request starts a fresh budget, so
+# each retriggered burst gets its own N. Unset/0 = no cap. Debug knob — not for
+# main; leave it out of prod once the crash is diagnosed.
+_TASK_DEBUG_WINDOW = 600.0
+_task_debug_lock = threading.Lock()
+_task_debug_state = {"count": 0, "last": 0.0}
+
+
+def _task_debug_over_cap() -> bool:
+    try:
+        cap = int(os.environ.get("TASK_DEBUG_MAX_TASKS") or 0)
+    except ValueError:
+        cap = 0
+    if cap <= 0:
+        return False
+    now = time.monotonic()
+    with _task_debug_lock:
+        if now - _task_debug_state["last"] > _TASK_DEBUG_WINDOW:
+            _task_debug_state["count"] = 0
+        _task_debug_state["last"] = now
+        if _task_debug_state["count"] >= cap:
+            return True
+        _task_debug_state["count"] += 1
+        return False
+
+
 @app.post("/tasks")
 async def submit_task(request: Request) -> JSONResponse:
     """Machine-facing, write-capable endpoint: a GitHub Actions job posts an
@@ -2745,6 +2779,22 @@ async def submit_task(request: Request) -> JSONResponse:
     owner, repo = claims.repository.split("/", 1)
     if not _GH_NAME_RE.match(owner) or not _GH_NAME_RE.match(repo):
         raise HTTPException(status_code=400, detail="bad_repository_claim")
+
+    if _task_debug_over_cap():
+        log.warning(
+            "task for %s/%s skipped by TASK_DEBUG_MAX_TASKS=%s",
+            owner,
+            repo,
+            os.environ.get("TASK_DEBUG_MAX_TASKS"),
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "skipped": True,
+                "reason": f"TASK_DEBUG_MAX_TASKS={os.environ.get('TASK_DEBUG_MAX_TASKS')} reached",
+                "repo": claims.repository,
+            },
+        )
 
     try:
         payload = await request.json()
@@ -3490,6 +3540,57 @@ def task_info(request: Request, owner: str, repo: str, job_id: str) -> JSONRespo
             "llm_provider": job.llm_provider,
             "llm_base_url": job.llm_api_base,
             "llm_model": job.llm_model or "",
+            "error": job.error,
+        }
+    )
+
+
+@app.get("/tasks/{owner}/{repo}/{job_id}/status")
+def task_status(request: Request, owner: str, repo: str, job_id: str) -> JSONResponse:
+    """Machine-facing task status, authorized by GitHub Actions OIDC (same as
+    ``POST /tasks``) rather than a web session — so the caller that dispatched a
+    task can poll its terminal outcome. The ``/info`` sibling requires a browser
+    session; this one accepts the OIDC bearer the dispatcher already holds.
+
+    Authorized on the token's ``repository`` claim: a run can only read tasks it
+    could have dispatched for its own repo. Returns the job ``status``
+    (``running``/``published``/``no_fix``/``error``/…), the ``result`` (patch/PR
+    details on ``published``), and ``error`` — enough for the triage reconciler
+    to mark a group ``no_fix`` in the tracking issue instead of waiting on a PR
+    that never comes."""
+    if not cfg.task_api_enabled:
+        raise HTTPException(status_code=404, detail="tasks_api_disabled")
+
+    token = _bearer_token(request)
+    try:
+        claims = verify_token(
+            token,
+            issuer=cfg.task_oidc_issuer,
+            audience=cfg.task_oidc_audience,
+        )
+    except OIDCError as exc:
+        raise HTTPException(status_code=401, detail=f"oidc_verification_failed: {exc}")
+
+    # The OIDC repository claim is authoritative — the caller may only read tasks
+    # for the repo its token was minted for, and it must match the path.
+    if claims.repository.lower() != f"{owner}/{repo}".lower():
+        raise HTTPException(status_code=403, detail="repo_claim_mismatch")
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        job = _load_job_from_store(job_id)
+    if job is None or job.kind != "task":
+        raise HTTPException(status_code=404, detail="task_not_found")
+    if job.target_owner != owner or job.target_repo != repo:
+        raise HTTPException(status_code=404, detail="task_target_mismatch")
+
+    return JSONResponse(
+        {
+            "id": job.id,
+            "status": job.status,
+            "target": f"{job.target_owner}/{job.target_repo}",
+            "result": job.task_result,
             "error": job.error,
         }
     )
