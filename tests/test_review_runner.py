@@ -143,7 +143,26 @@ class ReviewRunnerTests(unittest.TestCase):
         code, emitter = self._run(prepare_side_effect=RuntimeError("boom"))
         self.assertEqual(code, 1)
         self.assertEqual(emitter.terminal["status"], "error")
+        # The runner pod is reaped as soon as it self-reports, so the crash
+        # cause must travel in the reported error itself — not "(see pod log)".
         self.assertIn("review crashed", emitter.terminal["error"])
+        self.assertIn("boom", emitter.terminal["error"])
+        self.assertNotIn("see pod log", emitter.terminal["error"])
+
+    def test_run_surfaces_llm_error(self):
+        from reviewbot.llm_client import LLMResponseError
+
+        exc = LLMResponseError(
+            429, "Too Many Requests", "https://router/v1/chat", "rate limit exceeded"
+        )
+        code, emitter = self._run(prepare_side_effect=exc)
+        self.assertEqual(code, 1)
+        self.assertEqual(emitter.terminal["status"], "error")
+        # The LLM endpoint's own status + body excerpt lands on the job, so a
+        # 429/400/auth failure is legible without the (reaped) pod log.
+        self.assertIn("429", emitter.terminal["error"])
+        self.assertIn("rate limit exceeded", emitter.terminal["error"])
+        self.assertNotIn("see pod log", emitter.terminal["error"])
 
 
 if __name__ == "__main__":
