@@ -86,5 +86,111 @@ class WebappAdminViewTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
 
 
+class ProviderTestEndpointTests(unittest.TestCase):
+    """POST /admin/providers/{id}/test makes one tiny inference call with the
+    stored key and reports the verdict, so an admin can catch a bad token
+    before a review fails on it."""
+
+    def _build(self):
+        sys.modules.pop("reviewbot.webapp", None)
+        env = {
+            "DEV_NO_AUTH": "1",
+            "GITHUB_APP_ID": "123",
+            "GITHUB_PRIVATE_KEY": "dummy-private-key",
+            "GITHUB_WEBHOOK_SECRET": "webhook-secret",
+            "LLM_API_KEY": "llm-token",
+            "LLM_BILL_TO": "huggingface",
+            "WEB_STORE_PATH": os.path.join(self.tmpdir, "jobs.db"),
+            "WEB_CLONE_CACHE_DIR": os.path.join(self.tmpdir, "clones"),
+        }
+        with patch.dict(os.environ, env, clear=True):
+            webapp = importlib.import_module("reviewbot.webapp")
+        return webapp, TestClient(webapp.app)
+
+    def setUp(self) -> None:
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def _insert_config(self, webapp, config_id="cfg-1"):
+        webapp._store.insert_provider_config(
+            id=config_id,
+            provider="hf",
+            api_key="hf-token",
+            api_base=None,
+            default_model="zai-org/GLM-5.2",
+            repo_pattern="huggingface/*",
+            allowed_users=[],
+            allowed_orgs=["huggingface"],
+            created_by="dev",
+        )
+        return config_id
+
+    def test_missing_config_is_404(self):
+        webapp, client = self._build()
+        r = client.post(
+            "/admin/providers/nope/test", headers={"Origin": "http://testserver"}
+        )
+        self.assertEqual(r.status_code, 404)
+
+    def test_valid_token_reports_ok(self):
+        webapp, client = self._build()
+        cfg_id = self._insert_config(webapp)
+
+        class _FakeClient:
+            def __init__(self, api_base, api_key, *, model=None, bill_to=None, **kw):
+                # The billing org must be forwarded so the test reproduces the
+                # exact permission a real review needs.
+                assert bill_to == "huggingface"
+                self.model = model
+
+            def complete(self, messages, **kw):
+                return object()
+
+        with patch.object(webapp, "ChatCompletionClient", _FakeClient):
+            r = client.post(
+                f"/admin/providers/{cfg_id}/test",
+                headers={"Origin": "http://testserver"},
+            )
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["model"], "zai-org/GLM-5.2")
+        self.assertIn("huggingface", data["message"])
+
+    def test_bad_token_surfaces_provider_error(self):
+        from reviewbot.llm_client import LLMResponseError
+
+        webapp, client = self._build()
+        cfg_id = self._insert_config(webapp)
+        exc = LLMResponseError(
+            403,
+            "Forbidden",
+            "https://router.huggingface.co/v1/chat/completions",
+            '{"error":"insufficient permissions to call Inference Providers '
+            'on behalf of org huggingface"}',
+        )
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                self.model = kw.get("model")
+
+            def complete(self, messages, **kw):
+                raise exc
+
+        with patch.object(webapp, "ChatCompletionClient", _FakeClient):
+            r = client.post(
+                f"/admin/providers/{cfg_id}/test",
+                headers={"Origin": "http://testserver"},
+            )
+        # A bad token is a verdict, not a server error.
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertFalse(data["ok"])
+        self.assertIn("403", data["error"])
+        self.assertIn("Inference Providers", data["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
