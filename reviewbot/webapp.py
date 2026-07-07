@@ -66,7 +66,7 @@ from .launcher import (
 )
 from .errors import format_github_http_error as _format_github_http_error
 from .errors import format_llm_error as _format_llm_error
-from .llm_client import LLMResponseError
+from .llm_client import ChatCompletionClient, LLMResponseError
 from .oidc import OIDCError, verify_token
 from .reviewer import (
     DraftComment,
@@ -2756,6 +2756,55 @@ def admin_delete_provider(request: Request, config_id: str) -> JSONResponse:
         raise HTTPException(status_code=404, detail="config_not_found")
     log.info("user %s deleted provider config %s", user, config_id)
     return JSONResponse({"status": "deleted"})
+
+
+@app.post("/admin/providers/{config_id}/test")
+def admin_test_provider(request: Request, config_id: str) -> JSONResponse:
+    """Exercise a saved provider config end-to-end so an admin can confirm the
+    token actually works *before* a review fails on it.
+
+    Resolves the endpoint/model/billing exactly as a real review would, then
+    makes one tiny chat-completion with the stored key (and, for HF, the
+    ``X-HF-Bill-To`` org header). A ``/models`` GET is not enough: the common
+    failure is a token that lists models fine but lacks permission to *call*
+    Inference Providers on behalf of the org — that only shows on a real
+    completion. Returns ``{ok: true, model}`` on success, or ``{ok: false,
+    error}`` carrying the provider's own message (e.g. the 403 "insufficient
+    permissions … on behalf of org …") so the fix is obvious. Always HTTP 200
+    — ``ok`` is the verdict; a bad token is an expected result, not a server
+    error."""
+    _require_same_origin(request)
+    user = _require_user(request)
+    row = _store.get_provider_config(config_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="config_not_found")
+    provider = row["provider"]
+    api_base = _api_base_for_provider(provider, custom_base=row.get("api_base"))
+    model = (
+        (row.get("default_model") or "").strip()
+        or _LLM_PROVIDER_DEFAULT_MODELS.get(provider)
+        or None
+    )
+    bill_to = _llm_bill_to_for_provider(provider)
+    client = ChatCompletionClient(
+        api_base, row["api_key"], model=model, bill_to=bill_to, stream=False
+    )
+    log.info("user %s testing provider config %s (%s)", user, config_id, provider)
+    try:
+        # max_tokens=1: we only need the request to be *accepted*; the auth/
+        # permission failure (401/403) fires before any tokens are generated.
+        client.complete(
+            [{"role": "user", "content": "ping"}], max_tokens=1, temperature=0.0
+        )
+    except LLMResponseError as exc:
+        return JSONResponse({"ok": False, "error": _format_llm_error(exc)})
+    except Exception as exc:  # noqa: BLE001 — surface any dial/timeout/discovery failure
+        return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    resolved = client.model or model or ""
+    message = "Token is valid and can run inference"
+    if bill_to:
+        message += f" (billed to {bill_to})"
+    return JSONResponse({"ok": True, "model": resolved, "message": message + "."})
 
 
 # --- debug-only task cap -----------------------------------------------------

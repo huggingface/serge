@@ -213,9 +213,19 @@
       tr.appendChild(tdUpdated);
 
       const tdActions = document.createElement("td");
+      const testBtn = document.createElement("button");
+      testBtn.type = "button";
+      testBtn.className = "secondary";
+      testBtn.textContent = "Test";
+      testBtn.title = "Run a tiny inference call with this token to check it works.";
+      const result = document.createElement("span");
+      result.className = "test-result";
+      result.style.marginLeft = "8px";
+      testBtn.addEventListener("click", () => testConfig(cfg, testBtn, result));
       const editBtn = document.createElement("button");
       editBtn.type = "button";
       editBtn.className = "secondary";
+      editBtn.style.marginLeft = "8px";
       editBtn.textContent = "Edit";
       editBtn.addEventListener("click", () => startEdit(cfg));
       const delBtn = document.createElement("button");
@@ -224,8 +234,10 @@
       delBtn.style.marginLeft = "8px";
       delBtn.textContent = "Delete";
       delBtn.addEventListener("click", () => deleteConfig(cfg));
+      tdActions.appendChild(testBtn);
       tdActions.appendChild(editBtn);
       tdActions.appendChild(delBtn);
+      tdActions.appendChild(result);
       tr.appendChild(tdActions);
 
       tbody.appendChild(tr);
@@ -246,6 +258,48 @@
       renderConfigs(data.configs || []);
     } catch (err) {
       showError(`Could not load configs — ${err.message}`);
+    }
+  }
+
+  async function testConfig(cfg, btn, result) {
+    clearError();
+    btn.disabled = true;
+    const prev = btn.textContent;
+    btn.textContent = "Testing…";
+    result.textContent = "";
+    result.removeAttribute("title");
+    try {
+      const r = await fetch(
+        `/admin/providers/${encodeURIComponent(cfg.id)}/test`,
+        { method: "POST" },
+      );
+      if (!r.ok) {
+        // Transport/auth failure (e.g. 404 config_not_found), not a token verdict.
+        showError(`Could not test — ${await errorMessage(r)}`);
+        result.textContent = "✗";
+        result.style.color = "var(--danger, #c0392b)";
+        return;
+      }
+      const data = await r.json();
+      if (data.ok) {
+        result.textContent = `✓ OK${data.model ? ` (${data.model})` : ""}`;
+        result.style.color = "var(--ok, #2e7d32)";
+        result.title = data.message || "Token is valid.";
+      } else {
+        // A bad token is an expected outcome — surface the provider's own
+        // error (the 403 / rate-limit / auth text) prominently.
+        result.textContent = "✗ failed";
+        result.style.color = "var(--danger, #c0392b)";
+        result.title = data.error || "Token check failed.";
+        showError(`Token check failed — ${data.error || "unknown error"}`);
+      }
+    } catch (err) {
+      showError(`Could not test — ${err.message}`);
+      result.textContent = "✗";
+      result.style.color = "var(--danger, #c0392b)";
+    } finally {
+      btn.disabled = false;
+      btn.textContent = prev;
     }
   }
 
