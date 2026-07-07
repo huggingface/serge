@@ -21,8 +21,12 @@ import logging
 import time
 from typing import Optional
 
+import requests
+
 from .clone_cache import Checkout, CloneCache
+from .errors import crash_detail, format_github_http_error, format_llm_error
 from .github_client import GitHubClient
+from .llm_client import LLMResponseError
 from .reviewer import ReviewRequest, _UnparseableLLMOutput, prepare_review
 from .store import encode_draft
 from .task_runner import CallbackEmitter, RunnerSpec, build_runner_config
@@ -106,11 +110,22 @@ def run(spec: RunnerSpec) -> int:
             raw_llm_output=getattr(exc, "content", None),
         )
         return 1
+    except LLMResponseError as exc:
+        # The runner pod is reaped right after it reports, so "(see pod log)"
+        # is a dead reference. Surface the LLM endpoint's own status + body
+        # excerpt (429 rate-limit, 400 bad schema, auth, …) on the job itself.
+        log.warning(
+            "LLM endpoint returned %d for review %s", exc.status_code, spec.job_id
+        )
+        emitter.finish("error", error=format_llm_error(exc))
+        return 1
+    except requests.HTTPError as exc:
+        log.warning("review %s GitHub API error: %s", spec.job_id, exc)
+        emitter.finish("error", error=format_github_http_error(exc))
+        return 1
     except Exception as exc:  # noqa: BLE001 — always report a terminal outcome
         log.exception("review runner crashed for job %s", spec.job_id)
-        emitter.finish(
-            "error", error=f"{type(exc).__name__}: review crashed (see pod log)"
-        )
+        emitter.finish("error", error=f"review crashed: {crash_detail(exc)}")
         return 1
     finally:
         if checkout is not None:

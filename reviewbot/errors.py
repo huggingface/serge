@@ -11,9 +11,25 @@ tokens are echoed — so they are safe to surface to callers.
 
 from __future__ import annotations
 
+import os
+
 import requests
 
 from .llm_client import LLMResponseError
+
+
+def crash_detail(exc: BaseException) -> str:
+    """A one-line cause plus the crashing frame — enough to see *why* an
+    exception fired in the job's ``error`` without needing the (already-reaped)
+    pod log. Used by both runner entrypoints for their catch-all handlers."""
+    frame = ""
+    tb = exc.__traceback__
+    while tb is not None:  # walk to the innermost frame
+        code = tb.tb_frame.f_code
+        frame = f"{os.path.basename(code.co_filename)}:{tb.tb_lineno} in {code.co_name}"
+        tb = tb.tb_next
+    detail = f"{type(exc).__name__}: {exc}".strip()
+    return f"{detail} (at {frame})" if frame else detail
 
 
 def format_llm_error(exc: LLMResponseError) -> str:
