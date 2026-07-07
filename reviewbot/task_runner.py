@@ -40,7 +40,7 @@ import requests
 from . import sandbox
 from .clone_cache import Checkout, CloneCache
 from .config import Config
-from .errors import format_github_http_error, format_llm_error
+from .errors import crash_detail, format_github_http_error, format_llm_error
 from .github_client import GitHubClient
 from .llm_client import LLMResponseError
 from .reviewer import _UnparseableLLMOutput
@@ -375,7 +375,7 @@ def run(spec: RunnerSpec) -> int:
         return _fail(emitter, format_github_http_error(exc))
     except Exception as exc:  # noqa: BLE001
         log.exception("task runner crashed for job %s", spec.job_id)
-        return _fail(emitter, f"task runner crashed: {_crash_detail(exc)}")
+        return _fail(emitter, f"task runner crashed: {crash_detail(exc)}")
     finally:
         if clone_cache is not None:
             clone_cache.release(checkout)
@@ -389,19 +389,6 @@ def _fail(
     emitter.emit("done", "")
     emitter.finish("error", error=message, raw_llm_output=raw_llm_output)
     return 1
-
-
-def _crash_detail(exc: BaseException) -> str:
-    """A one-line cause plus the crashing frame — enough to see *why* a startup
-    exception fired in the job's ``error`` without needing the pod log."""
-    frame = ""
-    tb = exc.__traceback__
-    while tb is not None:  # walk to the innermost frame
-        code = tb.tb_frame.f_code
-        frame = f"{os.path.basename(code.co_filename)}:{tb.tb_lineno} in {code.co_name}"
-        tb = tb.tb_next
-    detail = f"{type(exc).__name__}: {exc}".strip()
-    return f"{detail} (at {frame})" if frame else detail
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +433,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         try:
             CallbackEmitter(
                 spec.callback.get("url"), spec.callback.get("token"), spec.job_id
-            ).finish("error", error=f"task runner crashed: {_crash_detail(exc)}")
+            ).finish("error", error=f"task runner crashed: {crash_detail(exc)}")
         except Exception:  # noqa: BLE001
             log.exception("could not report crash for job %s", spec.job_id)
         return 1
