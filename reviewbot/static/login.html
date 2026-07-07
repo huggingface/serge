@@ -6,6 +6,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/static/serge-logo.png">
   <link rel="stylesheet" href="/static/styles.css">
+  <style>
+    .login-error {
+      margin: 0 0 1rem;
+      padding: .625rem .875rem;
+      border: 1px solid var(--danger);
+      border-radius: 6px;
+      background: rgba(220, 38, 38, .08);
+      color: var(--danger);
+    }
+  </style>
 </head>
 <body>
   <header class="bar">
@@ -17,11 +27,29 @@
   <main>
     <section class="card">
       <h2>Sign in</h2>
+      <p id="login-error" class="login-error" hidden></p>
       <p>You need to be on the allow-list to use this app. Sign in with GitHub to continue.</p>
       <p class="actions">
         <a href="/auth/login"><button class="primary">Sign in with GitHub</button></a>
       </p>
     </section>
   </main>
+  <script>
+    (function () {
+      var code = new URLSearchParams(window.location.search).get("error");
+      if (!code) return;
+      var messages = {
+        github_auth_failed:
+          "GitHub couldn't verify your sign-in. This is usually temporary — please try again in a moment.",
+        invalid_oauth_state:
+          "Your sign-in link expired or was already used. Please start again.",
+        not_allowed:
+          "Your GitHub account isn't on the allow-list for this app.",
+      };
+      var el = document.getElementById("login-error");
+      el.textContent = messages[code] || "Sign-in failed. Please try again.";
+      el.hidden = false;
+    })();
+  </script>
 </body>
 </html>
