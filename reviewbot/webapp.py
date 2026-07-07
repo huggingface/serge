@@ -2154,6 +2154,13 @@ def journal_page(request: Request) -> Response:
     return HTMLResponse(html)
 
 
+def _login_error(code: str) -> RedirectResponse:
+    """Bounce a failed sign-in back to the login page with a machine code
+    the static page turns into a human message. Beats a bare 500/JSON body
+    when GitHub rejects the OAuth roundtrip."""
+    return RedirectResponse(f"/login?error={code}", status_code=302)
+
+
 @app.get("/login")
 def login_page(request: Request) -> Response:
     if _current_user(request):
@@ -2199,7 +2206,7 @@ async def auth_callback(request: Request) -> Response:
     sess = _load_session(request)
     expected_state = sess.pop("oauth_state", None)
     if not code or not state or state != expected_state:
-        raise HTTPException(status_code=400, detail="invalid_oauth_state")
+        return _login_error("invalid_oauth_state")
 
     async with httpx.AsyncClient(timeout=30) as client:
         token_resp = await client.post(
@@ -2211,10 +2218,25 @@ async def auth_callback(request: Request) -> Response:
             },
             headers={"Accept": "application/json"},
         )
-        token_resp.raise_for_status()
-        token = token_resp.json().get("access_token")
+        if not token_resp.is_success:
+            log.warning(
+                "oauth token exchange failed: github returned %s: %s",
+                token_resp.status_code,
+                token_resp.text[:500],
+            )
+            return _login_error("github_auth_failed")
+        token_body = token_resp.json()
+        token = token_body.get("access_token")
         if not token:
-            raise HTTPException(status_code=400, detail="oauth_token_exchange_failed")
+            # GitHub answers 200 with an error payload for an expired/reused
+            # code or mismatched client credentials — the token is just absent.
+            log.warning(
+                "oauth token exchange returned no token: %s",
+                token_body.get("error_description")
+                or token_body.get("error")
+                or token_body,
+            )
+            return _login_error("github_auth_failed")
 
         user_resp = await client.get(
             "https://api.github.com/user",
@@ -2223,10 +2245,21 @@ async def auth_callback(request: Request) -> Response:
                 "Accept": "application/vnd.github+json",
             },
         )
-        user_resp.raise_for_status()
+        if not user_resp.is_success:
+            # A token GitHub just minted getting rejected here (typically
+            # 401 "Bad credentials") points at an OAuth App credential
+            # problem or a transient GitHub blip. Surface it cleanly and log
+            # GitHub's own message instead of throwing an unhandled 500.
+            log.warning(
+                "oauth /user lookup failed: github returned %s: %s",
+                user_resp.status_code,
+                user_resp.text[:500],
+            )
+            return _login_error("github_auth_failed")
         login = user_resp.json().get("login")
         if not isinstance(login, str) or not login:
-            raise HTTPException(status_code=400, detail="oauth_no_login")
+            log.warning("oauth /user succeeded but returned no login field")
+            return _login_error("github_auth_failed")
 
         # Always fetch orgs at login: even when web_allowed_orgs is
         # empty, the provider_configs table uses orgs to gate which API
@@ -2263,7 +2296,7 @@ async def auth_callback(request: Request) -> Response:
                     break
         if not verified_via_app:
             log.warning("denied login attempt by %s (orgs=%s)", login, orgs)
-            raise HTTPException(status_code=403, detail="user_not_allowed")
+            return _login_error("not_allowed")
         log.info(
             "user %s authorized via App membership lookup (orgs=%s)",
             login,
