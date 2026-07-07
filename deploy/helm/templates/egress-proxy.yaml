@@ -42,7 +42,35 @@ data:
     PidFile "/tmp/tinyproxy.pid"
     LogLevel Info
   filter: |
+    {{- /*
+      Helm's job here is only to GUARANTEE the base allowlist (allowDomains) is
+      always present. serge itself patches this same ConfigMap at runtime to add
+      configured LLM provider hosts (reviewbot/k8s_sandbox.py:sync_egress_allowlist),
+      additively and at any time. Because .data.filter is a single string, Helm
+      and serge would otherwise fight over its ownership under server-side apply:
+      Helm re-applying the base-only value onto serge's augmented value conflicts.
+
+      So on upgrade we read the LIVE filter via `lookup`, re-emit it verbatim, and
+      union the base domains in (appending any that are missing). This preserves
+      serge's runtime additions and makes Helm's applied value equal the live
+      value in steady state -> no SSA conflict.
+
+      NOTE: `lookup` returns nothing under `helm template` / `--dry-run` (no cluster
+      read), so a dry-run renders ONLY the base domains. The real `helm upgrade`
+      reads the live filter and preserves serge's additions.
+    */}}
+    {{- $out := list }}
+    {{- $existing := lookup "v1" "ConfigMap" .Release.Namespace $name }}
+    {{- if $existing }}
+    {{-   range (splitList "\n" (get ($existing.data | default dict) "filter" | default "")) }}
+    {{-     $line := trim . }}
+    {{-     if and $line (not (has $line $out)) }}{{ $out = append $out $line }}{{ end }}
+    {{-   end }}
+    {{- end }}
     {{- range $egress.allowDomains }}
+    {{-   if not (has . $out) }}{{ $out = append $out . }}{{ end }}
+    {{- end }}
+    {{- range $out }}
     {{ . }}
     {{- end }}
 ---
