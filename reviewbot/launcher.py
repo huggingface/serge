@@ -34,6 +34,9 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+# Pure helper (no kubernetes-client import side effect); safe at module load.
+from .k8s_sandbox import parse_node_selector
+
 log = logging.getLogger(__name__)
 
 _SPEC_MOUNT_PATH = "/etc/serge/task.json"
@@ -51,6 +54,11 @@ RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
     "task_normalize_timeout",
     "task_normalize_max_retries",
     "task_normalize_memory",
+    # issue #20 test gate — the runner pod gets no ConfigMap env, so the test
+    # command/timeout/retries must travel in the spec.
+    "task_test_command",
+    "task_test_timeout",
+    "task_test_max_retries",
     "task_max_followups",
     "review_rules_path",
     "helper_tools_path",
@@ -218,9 +226,83 @@ class K8sLaunchOptions:
     proxy: Optional[str] = None  # HTTPS_PROXY → serge-egress gateway ClusterIP
     no_proxy: Optional[str] = None  # hosts that skip the proxy (serge callback)
     memory: Optional[str] = None
+    # issue #20 GPU placement: schedule onto tainted GPU nodes and reserve GPUs.
+    tolerations: Optional[list[dict[str, Any]]] = None
+    gpu_resource: Optional[str] = None  # e.g. "nvidia.com/gpu"
+    gpu_count: Optional[int] = None
     uid: Optional[int] = None
     gid: Optional[int] = None
     clone_dir: str = "/tmp/serge-clones"
+
+
+@dataclass
+class GpuPlacement:
+    """Resolved per-task pod placement (issue #20). ``gpu_resource``/``gpu_count``
+    are ``None`` for a non-GPU task (which uses the global nodeSelector/memory)."""
+
+    node_selector: Optional[dict[str, str]] = None
+    tolerations: Optional[list[dict[str, Any]]] = None
+    gpu_resource: Optional[str] = None
+    gpu_count: Optional[int] = None
+    memory: Optional[str] = None
+
+
+class GpuPlacementError(ValueError):
+    """A task asked for a GPU flavor that has no configured placement profile."""
+
+
+def resolve_gpu_placement(
+    gpu: Optional[str],
+    profiles: Optional[dict[str, Any]],
+    *,
+    default_node_selector: Optional[dict[str, str]],
+    default_memory: Optional[str],
+) -> GpuPlacement:
+    """Resolve the pod placement for a task.
+
+    With no ``gpu`` flavor the task keeps the global (non-GPU) placement — the
+    deployment-wide ``TASK_K8S_NODE_SELECTOR`` + ``TASK_RUNNER_MEMORY``. With a
+    ``gpu`` flavor it must match a key in ``profiles`` (``TASK_K8S_GPU_PROFILES``);
+    an unmatched flavor raises :class:`GpuPlacementError` rather than silently
+    scheduling a GPU job on a CPU node. Each profile may set ``node_selector``
+    (a ``"k=v,..."`` string or a dict), ``tolerations`` (list), ``gpu_resource``
+    (default ``nvidia.com/gpu``), ``gpu_count`` (default 1), and ``memory``."""
+    if not gpu:
+        return GpuPlacement(node_selector=default_node_selector, memory=default_memory)
+    profile = (profiles or {}).get(gpu)
+    if not isinstance(profile, dict):
+        available = sorted((profiles or {}).keys())
+        raise GpuPlacementError(
+            f"no GPU placement profile configured for gpu={gpu!r} "
+            f"(TASK_K8S_GPU_PROFILES has: {available or 'none'})"
+        )
+    raw_selector = profile.get("node_selector")
+    if isinstance(raw_selector, dict):
+        node_selector: Optional[dict[str, str]] = {
+            str(k): str(v) for k, v in raw_selector.items()
+        } or None
+    else:
+        node_selector = parse_node_selector(raw_selector)
+    tolerations = profile.get("tolerations")
+    if tolerations is not None and not isinstance(tolerations, list):
+        raise GpuPlacementError(f"gpu profile {gpu!r} tolerations must be a list")
+    gpu_resource = str(profile.get("gpu_resource") or "nvidia.com/gpu")
+    try:
+        gpu_count = int(profile.get("gpu_count", 1))
+    except (TypeError, ValueError) as exc:
+        raise GpuPlacementError(
+            f"gpu profile {gpu!r} gpu_count must be an integer"
+        ) from exc
+    if gpu_count < 1:
+        raise GpuPlacementError(f"gpu profile {gpu!r} gpu_count must be >= 1")
+    memory = (profile.get("memory") or default_memory) or None
+    return GpuPlacement(
+        node_selector=node_selector,
+        tolerations=tolerations,
+        gpu_resource=gpu_resource,
+        gpu_count=gpu_count,
+        memory=memory,
+    )
 
 
 def launch_kubernetes(
@@ -241,6 +323,7 @@ def launch_kubernetes(
         namespace=opts.namespace,
         service_account=opts.service_account,
         node_selector=opts.node_selector,
+        tolerations=opts.tolerations,
     )
     return run_task_job(
         spec,
@@ -250,6 +333,8 @@ def launch_kubernetes(
         proxy=opts.proxy,
         no_proxy=opts.no_proxy,
         memory=opts.memory,
+        gpu_resource=opts.gpu_resource,
+        gpu_count=opts.gpu_count,
         clone_dir=opts.clone_dir,
         uid=opts.uid,
         gid=opts.gid,
@@ -274,6 +359,7 @@ def create_kubernetes(
         namespace=opts.namespace,
         service_account=opts.service_account,
         node_selector=opts.node_selector,
+        tolerations=opts.tolerations,
     )
     return create_task_job(
         spec,
@@ -283,6 +369,8 @@ def create_kubernetes(
         proxy=opts.proxy,
         no_proxy=opts.no_proxy,
         memory=opts.memory,
+        gpu_resource=opts.gpu_resource,
+        gpu_count=opts.gpu_count,
         clone_dir=opts.clone_dir,
         uid=opts.uid,
         gid=opts.gid,

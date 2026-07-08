@@ -58,10 +58,12 @@ from .k8s_sandbox import (
 )
 from .launcher import (
     DockerLaunchOptions,
+    GpuPlacementError,
     K8sLaunchOptions,
     build_spec,
     create_kubernetes,
     launch_docker,
+    resolve_gpu_placement,
     runner_config,
 )
 from .errors import format_github_http_error as _format_github_http_error
@@ -1513,6 +1515,27 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         )
 
         if cfg.task_execution == "kubernetes":
+            # issue #20 — pick the pod placement from the task's GPU flavor. No
+            # flavor keeps the global (non-GPU) placement; a flavor must match a
+            # configured profile (else fail loud rather than run a GPU test on a
+            # CPU node).
+            try:
+                placement = resolve_gpu_placement(
+                    req.gpu,
+                    cfg.task_k8s_gpu_profiles,
+                    default_node_selector=parse_node_selector(
+                        cfg.task_k8s_node_selector
+                    ),
+                    default_memory=cfg.task_runner_memory,
+                )
+            except GpuPlacementError as exc:
+                raise TaskError(str(exc), status_code=500) from exc
+            if req.gpu:
+                emit(
+                    "log",
+                    f"Scheduling on the {req.gpu} pool "
+                    f"({placement.gpu_count}× {placement.gpu_resource})…",
+                )
             # Non-blocking: create the Job + Secret and return. The runner
             # streams its outcome via the callback; the watcher reconciles a
             # crash. No serge thread is parked for the pod's lifetime.
@@ -1522,10 +1545,13 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
                     image=cfg.task_runner_image,
                     namespace=cfg.task_k8s_namespace,
                     service_account=cfg.task_k8s_service_account,
-                    node_selector=parse_node_selector(cfg.task_k8s_node_selector),
+                    node_selector=placement.node_selector,
+                    tolerations=placement.tolerations,
+                    gpu_resource=placement.gpu_resource,
+                    gpu_count=placement.gpu_count,
                     proxy=cfg.task_runner_proxy,
                     no_proxy=cfg.task_runner_no_proxy,
-                    memory=cfg.task_runner_memory,
+                    memory=placement.memory,
                 ),
                 timeout=cfg.task_runner_timeout,
             )

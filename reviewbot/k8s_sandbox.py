@@ -73,11 +73,14 @@ class K8sSettings:
 
     ``namespace`` defaults to the in-cluster namespace when unset;
     ``service_account`` is the task *pod's* SA (it holds no API token
-    regardless); ``node_selector`` pins the pods to a node pool."""
+    regardless); ``node_selector`` pins the pods to a node pool;
+    ``tolerations`` (issue #20) lets GPU task pods schedule onto tainted GPU
+    nodes (a list of v1.Toleration dicts)."""
 
     namespace: Optional[str] = None
     service_account: Optional[str] = None
     node_selector: Optional[dict] = None
+    tolerations: Optional[list] = None
 
 
 def parse_node_selector(raw: Optional[str]) -> Optional[dict]:
@@ -357,6 +360,8 @@ def build_task_job_manifest(
     proxy: Optional[str] = None,
     no_proxy: Optional[str] = None,
     memory: Optional[str] = None,
+    gpu_resource: Optional[str] = None,
+    gpu_count: Optional[int] = None,
     clone_dir: str = "/tmp/serge-clones",
     uid: Optional[int] = None,
     gid: Optional[int] = None,
@@ -403,8 +408,16 @@ def build_task_job_manifest(
             {"name": "tmp", "mountPath": "/tmp"},
         ],
     }
+    # Resource limits: memory and, for GPU tasks (issue #20), the GPU extended
+    # resource (e.g. ``nvidia.com/gpu: "2"``). An extended resource is declared
+    # only under ``limits``; the scheduler mirrors it as the request.
+    limits: dict = {}
     if memory:
-        container["resources"] = {"limits": {"memory": memory}}
+        limits["memory"] = memory
+    if gpu_resource and gpu_count:
+        limits[gpu_resource] = str(gpu_count)
+    if limits:
+        container["resources"] = {"limits": limits}
 
     pod_security: dict = {"seccompProfile": {"type": "RuntimeDefault"}}
     # The runner runs the repo's own build (``make fix-repo``), so we don't force
@@ -431,6 +444,8 @@ def build_task_job_manifest(
         pod_spec["serviceAccountName"] = settings.service_account
     if settings.node_selector:
         pod_spec["nodeSelector"] = dict(settings.node_selector)
+    if settings.tolerations:
+        pod_spec["tolerations"] = list(settings.tolerations)
 
     return {
         "apiVersion": "batch/v1",
@@ -511,6 +526,8 @@ def run_task_job(
     proxy: Optional[str] = None,
     no_proxy: Optional[str] = None,
     memory: Optional[str] = None,
+    gpu_resource: Optional[str] = None,
+    gpu_count: Optional[int] = None,
     clone_dir: str = "/tmp/serge-clones",
     uid: Optional[int] = None,
     gid: Optional[int] = None,
@@ -533,6 +550,8 @@ def run_task_job(
         proxy=proxy,
         no_proxy=no_proxy,
         memory=memory,
+        gpu_resource=gpu_resource,
+        gpu_count=gpu_count,
         clone_dir=clone_dir,
         uid=uid,
         gid=gid,
@@ -568,6 +587,8 @@ def create_task_job(
     proxy: Optional[str] = None,
     no_proxy: Optional[str] = None,
     memory: Optional[str] = None,
+    gpu_resource: Optional[str] = None,
+    gpu_count: Optional[int] = None,
     clone_dir: str = "/tmp/serge-clones",
     uid: Optional[int] = None,
     gid: Optional[int] = None,
@@ -594,6 +615,8 @@ def create_task_job(
         proxy=proxy,
         no_proxy=no_proxy,
         memory=memory,
+        gpu_resource=gpu_resource,
+        gpu_count=gpu_count,
         clone_dir=clone_dir,
         uid=uid,
         gid=gid,

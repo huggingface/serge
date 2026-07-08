@@ -9,8 +9,18 @@ diff (plus a PR title/body). serge applies the patch in a network-isolated
 worktree, then uploads the result through the GitHub Git Data API
 (``create_blob`` → ``create_tree`` → ``create_commit`` → ``create_ref`` →
 ``create_pull_request``). The installation token never enters the sandbox
-or a git remote. Verification of the fix is done by the caller's CI, not by
-serge — serge never runs the test suite.
+or a git remote.
+
+Verification is layered and **opt-in per deployment**:
+
+- Normalize gate (``task_normalize_command``): apply + run the repo normalizer,
+  feed failures back to the model (best-effort — infra failure accepts the
+  patch un-normalized; the caller's CI still catches it).
+- Target-test gate (issue #20; ``task_test_command`` + ``TaskRequest.tests``):
+  run the caller-declared tests on a GPU pod and **guarantee they pass before a
+  PR is opened** — a failure, or the test infra being unavailable, blocks the PR
+  (fail-closed). When neither is configured serge behaves as the original
+  stateless producer and verification is left to the caller's CI.
 
 See ``TASKS_FLOW_PLAN.md`` for the full design.
 """
@@ -69,6 +79,26 @@ _CANDIDATE_HEADING_RE = re.compile(
 
 VALID_MODES = ("new_pr", "existing_pr")
 
+# Canonical GPU flavors and the accepted aliases (issue #20 speaks of
+# "simple/multi"; the transformers CI runners are "single-gpu"/"multi-gpu").
+_GPU_FLAVORS = {
+    "single-gpu": "single-gpu",
+    "single": "single-gpu",
+    "simple": "single-gpu",
+    "multi-gpu": "multi-gpu",
+    "multi": "multi-gpu",
+}
+VALID_GPU_FLAVORS = ("single-gpu", "multi-gpu")
+
+# Caps + charset for the caller-declared pytest node-IDs. They are always passed
+# as argv (never a shell string), so the real hazard is a value that looks like
+# a pytest *option* (leading "-") smuggling flags into the test command, or a
+# control char corrupting the argv — reject both. Everything else a pytest
+# node-ID legitimately contains (``path::Class::test[param-id]``) is allowed.
+_MAX_TESTS = 200
+_MAX_TEST_ID_CHARS = 500
+_TEST_ID_BAD_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 
 class TaskError(Exception):
     """A task-level failure (bad request, guard violation, loop cap). The
@@ -93,6 +123,12 @@ class TaskRequest:
     slack_channel: Optional[str] = None
     slack_notify_pr_created: bool = True
     slack_notify_task_finished: bool = False
+    # issue #20 — caller-supplied, trusted intent (like ``instruction``):
+    # ``gpu`` is the normalized target flavor ("single-gpu"/"multi-gpu") that
+    # selects the GPU pod placement profile; ``tests`` is the list of pytest
+    # node-IDs the patch must pass before serge opens a PR (the hard gate).
+    gpu: Optional[str] = None
+    tests: list[str] = field(default_factory=list)
     # Resolved during processing (existing_pr): the PR's head branch.
     head_branch: Optional[str] = None
 
@@ -116,6 +152,11 @@ class TaskPlan:
     # the worktree already holds the applied + normalized result, so
     # :func:`publish_task` commits it directly instead of re-applying.
     worktree_prepared: bool = False
+    # issue #20 hard test gate: True when the task carried tests, a patch was
+    # produced, but those tests did not pass (or could not be run). When set,
+    # :func:`publish_task` refuses to open/append a PR — the tests are a
+    # guarantee, not advisory.
+    gate_failed: bool = False
 
 
 @dataclass
@@ -130,6 +171,10 @@ class TaskResult:
     url: Optional[str] = None
     commit_sha: Optional[str] = None
     changed_files: list[str] = field(default_factory=list)
+    # True when no PR was opened because the target tests did not pass (issue
+    # #20). Distinct from a plain ``no_change`` (the model proposed no fix): the
+    # console/journal can say *why* — "tests failed" vs "no fix proposed".
+    blocked: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -141,6 +186,7 @@ class TaskResult:
             "url": self.url,
             "commit_sha": self.commit_sha,
             "changed_files": self.changed_files,
+            "blocked": self.blocked,
         }
 
 
@@ -205,6 +251,9 @@ def build_task_request(
             "(e.g. 'serge/fix')"
         )
 
+    gpu = _validate_gpu(output.get("gpu"))
+    tests = _validate_tests(output.get("tests"))
+
     notifications = payload.get("notifications") or {}
     if not isinstance(notifications, dict):
         raise TaskError("notifications must be an object")
@@ -240,7 +289,59 @@ def build_task_request(
         slack_channel=slack_channel,
         slack_notify_pr_created=slack_notify_pr_created,
         slack_notify_task_finished=slack_notify_task_finished,
+        gpu=gpu,
+        tests=tests,
     )
+
+
+def _validate_gpu(raw: Any) -> Optional[str]:
+    """Normalize ``output.gpu`` to a canonical flavor, or ``None`` if unset."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise TaskError("output.gpu must be a string")
+    key = raw.strip().lower()
+    if not key:
+        return None
+    flavor = _GPU_FLAVORS.get(key)
+    if flavor is None:
+        raise TaskError(
+            f"output.gpu must be one of {VALID_GPU_FLAVORS} "
+            "(aliases: 'simple'/'single', 'multi')"
+        )
+    return flavor
+
+
+def _validate_tests(raw: Any) -> list[str]:
+    """Validate ``output.tests`` into a clean list of pytest node-IDs."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise TaskError("output.tests must be an array of strings")
+    if len(raw) > _MAX_TESTS:
+        raise TaskError(f"output.tests accepts at most {_MAX_TESTS} entries")
+    tests: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise TaskError("output.tests entries must be strings")
+        node_id = item.strip()
+        if not node_id:
+            raise TaskError("output.tests entries must be non-empty")
+        if len(node_id) > _MAX_TEST_ID_CHARS:
+            raise TaskError(
+                f"output.tests entries are capped at {_MAX_TEST_ID_CHARS} chars"
+            )
+        if node_id.startswith("-"):
+            raise TaskError(
+                f"output.tests entry {node_id!r} may not start with '-' "
+                "(it would be read as a pytest option)"
+            )
+        if _TEST_ID_BAD_CHARS_RE.search(node_id):
+            raise TaskError(
+                f"output.tests entry {node_id!r} contains control characters"
+            )
+        tests.append(node_id)
+    return tests
 
 
 def _notification_bool(
@@ -411,6 +512,97 @@ def _validate_patch(
     return None, True
 
 
+def _apply_only(
+    clone_cache: CloneCache,
+    checkout: Checkout,
+    content: Optional[str],
+) -> tuple[Optional[str], bool]:
+    """Apply the model's patch to a clean worktree without running a normalizer.
+
+    Used by the test gate when no ``task_normalize_command`` is configured but
+    the tests still need the patch applied before they can run. Mirrors the
+    apply half of :func:`_validate_patch`. Returns ``(feedback, applied)``."""
+    try:
+        result = _extract_json(content)
+    except ValueError:
+        return None, False
+    patch = result.get("patch")
+    if not isinstance(patch, str) or not patch.strip():
+        return None, False
+    clone_cache.reset_worktree(checkout)
+    try:
+        clone_cache.apply_patch(checkout, patch)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:1200]
+        return (
+            "Your patch was rejected — `git apply` could not apply it to a "
+            f"clean checkout:\n\n{stderr}\n\nReturn a corrected unified diff.",
+            False,
+        )
+    return None, True
+
+
+def _run_target_tests(
+    cfg: Config,
+    *,
+    checkout: Checkout,
+    tests: list[str],
+    emit: Callable[[str, str], None],
+) -> tuple[Optional[str], bool]:
+    """Run the caller-declared tests against the (already patched) worktree.
+
+    Returns ``(feedback, passed)``:
+
+    - ``passed`` is whether the test gate is satisfied.
+    - ``feedback`` is a non-empty correction string only when the tests **ran
+      and failed** (fed back to the model to fix). It is ``None`` both when the
+      tests pass and when the test infra could not run them — the caller
+      distinguishes those two ``None`` cases via ``passed``.
+
+    **Fail-closed:** infra unavailability yields ``passed=False`` so the caller
+    blocks the PR; we don't burn a corrective re-prompt re-hitting broken infra
+    (feedback is ``None``, so the loop accepts-and-blocks instead of retrying).
+    Only called when ``cfg.task_test_command`` is set and ``tests`` is non-empty.
+    """
+    command = list(cfg.task_test_command or []) + list(tests)
+    emit("step", "tests")
+    emit("log", f"Running {len(tests)} target test(s): {' '.join(command)}")
+    try:
+        returncode, tail = run_normalize(
+            command,
+            workdir=checkout.path,
+            write_root=checkout.path,
+            backend=cfg.task_sandbox_backend,
+            image=cfg.task_normalize_image,
+            mode=cfg.helper_sandbox,
+            timeout=cfg.task_test_timeout,
+            memory=cfg.task_normalize_memory,
+            # Tests download model weights from the HF hub; the pod's egress
+            # allowlist is the boundary (git + LLM + callback + HF hub).
+            network=True,
+        )
+    except NormalizeError as exc:
+        # Infra failure is NOT the model's fault, but the whole point of the
+        # gate is a guarantee — so we cannot accept the patch. Block the PR.
+        log.warning("test gate could not run: %s", exc)
+        emit("log", f"Target tests could not be run ({exc}); blocking the PR.")
+        return None, False
+
+    if returncode != 0:
+        cmd = " ".join(command)
+        msg = (
+            f"Your patch applied cleanly, but the target tests still fail "
+            f"(`{cmd}` exit {returncode}):\n\n{tail}\n\n"
+            "Revise the patch so these tests pass. Fix the ROOT CAUSE of the "
+            "failure — do NOT skip, xfail, or delete the failing test to make "
+            "it green."
+        )
+        return msg, False
+
+    emit("log", "Target tests passed.")
+    return None, True
+
+
 def _read_repo_conventions(cfg: Config, checkout: Checkout) -> str:
     """Read the repo's own conventions file (``cfg.review_rules_path``, e.g.
     ``.ai/review-rules.md``) from the task worktree, falling back to the
@@ -459,7 +651,53 @@ def prepare_task(
                 log.debug("chunk_callback raised; suppressing", exc_info=True)
 
     _emit("log", f"Preparing task for {req.repo_full_name} (base={req.base_ref})")
+
+    normalize_configured = bool(cfg.task_normalize_command)
+    tests_required = bool(cfg.task_test_command) and bool(req.tests)
+    if req.tests and not cfg.task_test_command:
+        _emit(
+            "log",
+            "Task carries target tests but TASK_TEST_COMMAND is not configured; "
+            "the test gate is disabled and the patch will NOT be test-verified.",
+        )
+
     tool_env = _make_tool_env(cfg, helper_tools=[])
+
+    # issue #20 — expose the task-only `run_tests` tool so the model can check a
+    # candidate patch against the target tests mid-loop (in addition to the hard
+    # gate on its final answer). The closure applies the candidate patch to a
+    # clean worktree, runs the tests, then resets — so browse tools and the
+    # final gate always start from base.
+    if tests_required and tool_env is not None:
+
+        def _run_tests_tool(patch: Optional[str]) -> str:
+            clone_cache.reset_worktree(checkout)
+            if patch and patch.strip():
+                try:
+                    clone_cache.apply_patch(checkout, patch)
+                except subprocess.CalledProcessError as exc:
+                    clone_cache.reset_worktree(checkout)
+                    stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[
+                        :1200
+                    ]
+                    return (
+                        "The candidate patch did not apply to a clean checkout:"
+                        f"\n\n{stderr}\n\nFix the diff and try again."
+                    )
+            feedback, passed = _run_target_tests(
+                cfg, checkout=checkout, tests=req.tests, emit=_emit
+            )
+            clone_cache.reset_worktree(checkout)
+            if passed:
+                return "Target tests PASSED."
+            if feedback is None:
+                return (
+                    "The target tests could not be run (test infrastructure "
+                    "unavailable). serge will not open a PR until they pass."
+                )
+            return feedback
+
+        tool_env.test_runner = _run_tests_tool
 
     llm = ChatCompletionClient(
         cfg.llm_api_base,
@@ -480,24 +718,53 @@ def prepare_task(
         instruction=req.instruction,
         context=req.context,
         existing_diff=existing_diff,
+        tests=req.tests,
     )
 
-    # Wire the normalize verification gate into the loop when configured. The
-    # closure records whether the accepted answer left the worktree prepared.
-    normalize_configured = bool(cfg.task_normalize_command)
-    outcome = {"prepared": False}
+    # Wire the verification gate into the loop. Two stacked checks on the
+    # model's final patch: the (best-effort) normalizer and the (hard,
+    # fail-closed) target-test gate. Either being configured wires the gate.
+    # The closure records whether the accepted answer left the worktree prepared
+    # and whether the target tests passed.
+    validate_configured = normalize_configured or tests_required
+    # tests_passed defaults True when there is no test gate to satisfy.
+    outcome = {"prepared": False, "tests_passed": not tests_required}
 
     def _validate(chat) -> Optional[str]:
-        feedback, prepared = _validate_patch(
-            cfg,
-            checkout=checkout,
-            clone_cache=clone_cache,
-            content=chat.content,
-            emit=_emit,
-        )
-        outcome["prepared"] = prepared
-        return feedback
+        # 1. Apply the patch (and run the normalizer when configured).
+        if normalize_configured:
+            feedback, applied = _validate_patch(
+                cfg,
+                checkout=checkout,
+                clone_cache=clone_cache,
+                content=chat.content,
+                emit=_emit,
+            )
+        else:
+            feedback, applied = _apply_only(clone_cache, checkout, chat.content)
+        if feedback is not None:
+            outcome["prepared"] = False
+            return feedback
+        outcome["prepared"] = applied
 
+        # 2. Hard test gate — only when a patch was actually applied.
+        if tests_required and applied:
+            tfeedback, passed = _run_target_tests(
+                cfg, checkout=checkout, tests=req.tests, emit=_emit
+            )
+            outcome["tests_passed"] = passed
+            if tfeedback is not None:
+                # Tests ran and failed: reset and feed the failure back so the
+                # model can correct the patch.
+                clone_cache.reset_worktree(checkout)
+                outcome["prepared"] = False
+                return tfeedback
+            # passed, or infra unavailable (accept-and-block): fall through.
+        return None
+
+    max_validation_retries = (
+        cfg.task_test_max_retries if tests_required else cfg.task_normalize_max_retries
+    )
     _emit("step", "llm")
     _emit("log", "Calling LLM to produce a patch…")
     chat, metrics = _run_agentic_loop(
@@ -510,8 +777,8 @@ def prepare_task(
         tool_env=tool_env,
         emit=_emit,
         final_force_message=_TASK_FORCE_FINAL_MESSAGE,
-        validate=_validate if normalize_configured else None,
-        max_validation_retries=cfg.task_normalize_max_retries,
+        validate=_validate if validate_configured else None,
+        max_validation_retries=max_validation_retries,
     )
     metrics_line = _format_aggregated_metrics(metrics)
     _emit("log", f"LLM done: {metrics_line}")
@@ -532,10 +799,20 @@ def prepare_task(
         patch = ""
 
     # If validation never accepted a prepared worktree (retries exhausted, or
-    # normalize not configured), make sure the worktree is clean so
-    # publish_task's own apply path starts from a pristine checkout.
-    if normalize_configured and not outcome["prepared"]:
+    # no gate configured), make sure the worktree is clean so publish_task's own
+    # apply path starts from a pristine checkout.
+    if validate_configured and not outcome["prepared"]:
         clone_cache.reset_worktree(checkout)
+
+    # Hard test gate: a patch was produced but its tests never passed (a real
+    # failure or the test infra being down). Refuse to open a PR.
+    gate_failed = bool(patch.strip()) and tests_required and not outcome["tests_passed"]
+    if gate_failed:
+        _emit(
+            "log",
+            "The target tests did not pass; per the test-gate guarantee, no PR "
+            "will be opened.",
+        )
 
     return TaskPlan(
         title=req.title or title,
@@ -546,6 +823,7 @@ def prepare_task(
         completion_tokens=metrics.completion_tokens,
         model=llm.model,
         worktree_prepared=outcome["prepared"],
+        gate_failed=gate_failed,
     )
 
 
@@ -761,6 +1039,19 @@ def publish_task(
     def _emit(kind: str, text: str) -> None:
         if emit is not None:
             emit(kind, text)
+
+    # Hard test gate (issue #20): the model produced a patch but the target
+    # tests did not pass (or could not be run). Do NOT open/append a PR — the
+    # tests are a guarantee. Keep the diagnostics (plan.body) for the console.
+    if plan.gate_failed:
+        _emit("log", "Targeted tests did not pass; no PR opened.")
+        msg = plan.body or "The proposed patch did not pass the target tests."
+        return TaskResult(
+            mode=req.mode,
+            no_change=True,
+            blocked=True,
+            message=f"Targeted tests did not pass; no PR opened.\n\n{msg}",
+        )
 
     if not plan.worktree_prepared and not plan.patch.strip():
         _emit("log", "LLM proposed no patch; nothing to commit")

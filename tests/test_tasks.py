@@ -17,6 +17,7 @@ from reviewbot.tasks import (
     TaskPlan,
     TaskRequest,
     _read_repo_conventions,
+    _run_target_tests,
     _selected_failure_context,
     _validate_patch,
     build_task_request,
@@ -165,6 +166,66 @@ class BuildTaskRequestTests(unittest.TestCase):
         with self.assertRaises(TaskError):
             build_task_request(
                 {"instruction": "x", "output": {"branch_prefix": "evil/x"}},
+                owner="a",
+                repo="b",
+            )
+
+    def test_gpu_flavor_normalized(self):
+        for raw, want in [
+            ("single-gpu", "single-gpu"),
+            ("simple", "single-gpu"),
+            ("single", "single-gpu"),
+            ("multi", "multi-gpu"),
+            ("MULTI-GPU", "multi-gpu"),
+        ]:
+            req = build_task_request(
+                {"instruction": "x", "output": {"gpu": raw}}, owner="a", repo="b"
+            )
+            self.assertEqual(req.gpu, want, raw)
+
+    def test_gpu_flavor_absent_is_none(self):
+        req = build_task_request({"instruction": "x"}, owner="a", repo="b")
+        self.assertIsNone(req.gpu)
+        self.assertEqual(req.tests, [])
+
+    def test_bad_gpu_flavor_rejected(self):
+        with self.assertRaises(TaskError):
+            build_task_request(
+                {"instruction": "x", "output": {"gpu": "tpu"}}, owner="a", repo="b"
+            )
+
+    def test_tests_parsed_and_trimmed(self):
+        req = build_task_request(
+            {
+                "instruction": "x",
+                "output": {"tests": ["  tests/a.py::t1 ", "tests/b.py::t2"]},
+            },
+            owner="a",
+            repo="b",
+        )
+        self.assertEqual(req.tests, ["tests/a.py::t1", "tests/b.py::t2"])
+
+    def test_tests_must_be_list(self):
+        with self.assertRaises(TaskError):
+            build_task_request(
+                {"instruction": "x", "output": {"tests": "tests/a.py::t"}},
+                owner="a",
+                repo="b",
+            )
+
+    def test_tests_reject_option_injection(self):
+        # A leading '-' would be read by pytest as an option, not a node-ID.
+        with self.assertRaises(TaskError):
+            build_task_request(
+                {"instruction": "x", "output": {"tests": ["-p no:cacheprovider"]}},
+                owner="a",
+                repo="b",
+            )
+
+    def test_tests_reject_control_chars(self):
+        with self.assertRaises(TaskError):
+            build_task_request(
+                {"instruction": "x", "output": {"tests": ["tests/a.py::t\nx"]}},
                 owner="a",
                 repo="b",
             )
@@ -399,6 +460,45 @@ class PublishTaskTests(unittest.TestCase):
         self.assertEqual(result.changed_files, ["hello.txt"])
         notify.assert_called_once()
 
+    def test_gate_failed_blocks_pr(self):
+        # issue #20: a patch that did not pass the target tests must NOT open a
+        # PR, even though worktree_prepared/patch are set.
+        co = self._checkout("main")
+        req = TaskRequest(
+            owner="acme",
+            repo="widget",
+            base_ref="main",
+            instruction="fix",
+            context="",
+            mode="new_pr",
+            gpu="single-gpu",
+            tests=["tests/a.py::t"],
+        )
+        plan = TaskPlan(
+            title="Fix hello",
+            body="root cause: …",
+            patch=self._PATCH,
+            worktree_prepared=True,
+            gate_failed=True,
+        )
+        gh = _FakeGH()
+        with patch("reviewbot.tasks.post_task_pr_created_notification") as notify:
+            result = publish_task(
+                self.cfg,
+                gh,
+                req,
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+        self.assertTrue(result.no_change)
+        self.assertTrue(result.blocked)
+        self.assertIn("tests did not pass", result.message)
+        self.assertIsNone(gh.created_pr)
+        self.assertEqual(gh.created_refs, [])
+        notify.assert_not_called()
+
     def test_new_pr_notification_uses_request_slack_channel(self):
         co = self._checkout("main")
         req = TaskRequest(
@@ -519,6 +619,67 @@ class PublishTaskTests(unittest.TestCase):
         # Sanity: the email the loop-cap counts by is the one stamped on
         # commits, so follow-ups are countable.
         self.assertTrue(SERGE_GIT_EMAIL)
+
+
+class RunTargetTestsTests(unittest.TestCase):
+    """The hard test gate (_run_target_tests, issue #20) against a real
+    worktree. `sh -c <script>` stands in for `pytest`; the node-IDs are
+    appended as argv (so the gate is fail-closed and never shell-interpolates)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = self._tmp.name
+        self.src = os.path.join(root, "src")
+        os.makedirs(self.src)
+        _git(self.src, "init", "--quiet", "-b", "main")
+        with open(os.path.join(self.src, "hello.txt"), "w") as f:
+            f.write("hi\n")
+        _git(self.src, "add", "-A")
+        _git(self.src, "commit", "--quiet", "-m", "main")
+        self.cache = CloneCache(os.path.join(root, "cache"))
+        self.co = self.cache.acquire_ref(
+            token="", owner="a", repo="b", ref="main", job_id="j", remote_url=self.src
+        )
+
+    def _cfg(self, **overrides):
+        base = dict(
+            helper_sandbox="off",
+            task_sandbox_backend="bwrap",
+            task_test_timeout=30,
+        )
+        base.update(overrides)
+        return _make_cfg(**base)
+
+    def _run(self, cfg, tests):
+        return _run_target_tests(
+            cfg, checkout=self.co, tests=tests, emit=lambda *a: None
+        )
+
+    def test_passing_tests_accept(self):
+        cfg = self._cfg(task_test_command=["sh", "-c", "exit 0"])
+        feedback, passed = self._run(cfg, ["tests/a.py::t"])
+        self.assertTrue(passed)
+        self.assertIsNone(feedback)
+
+    def test_failing_tests_feed_back(self):
+        cfg = self._cfg(task_test_command=["sh", "-c", "echo boom >&2; exit 1"])
+        feedback, passed = self._run(cfg, ["tests/a.py::t"])
+        self.assertFalse(passed)
+        self.assertIsNotNone(feedback)
+        self.assertIn("boom", feedback)
+        self.assertIn("ROOT CAUSE", feedback)
+
+    def test_infra_unavailable_is_fail_closed(self):
+        # docker backend with no image -> NormalizeError. Unlike the normalize
+        # gate (best-effort accept), the test gate blocks: passed=False, and
+        # feedback=None so the loop accepts-and-blocks rather than retrying.
+        cfg = self._cfg(
+            task_sandbox_backend="docker", task_test_command=["make", "test"]
+        )
+        feedback, passed = self._run(cfg, ["tests/a.py::t"])
+        self.assertFalse(passed)
+        self.assertIsNone(feedback)
 
 
 class ValidatePatchTests(unittest.TestCase):

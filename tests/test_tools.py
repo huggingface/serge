@@ -96,6 +96,33 @@ class _TempRepo(unittest.TestCase):
         self.env = ToolEnv(repo_root=self.repo_root)
 
 
+class RunTestsToolTests(_TempRepo):
+    """The task-only run_tests tool (issue #20): present only when a test_runner
+    is injected, and dispatched to that callable."""
+
+    def test_spec_absent_without_runner(self) -> None:
+        names = {s["function"]["name"] for s in build_tool_specs(self.env)}
+        self.assertNotIn("run_tests", names)
+
+    def test_spec_present_and_dispatches_with_runner(self) -> None:
+        seen = {}
+
+        def runner(patch):
+            seen["patch"] = patch
+            return "Target tests PASSED."
+
+        self.env.test_runner = runner
+        names = {s["function"]["name"] for s in build_tool_specs(self.env)}
+        self.assertIn("run_tests", names)
+        out = run_tool(self.env, "run_tests", {"patch": "diff --git a b"})
+        self.assertEqual(out, "Target tests PASSED.")
+        self.assertEqual(seen["patch"], "diff --git a b")
+
+    def test_run_tests_unavailable_without_runner(self) -> None:
+        out = run_tool(self.env, "run_tests", {})
+        self.assertIn("not available", out)
+
+
 class ResolvePathTests(_TempRepo):
     def test_read_file_returns_numbered_lines(self) -> None:
         out = run_tool(

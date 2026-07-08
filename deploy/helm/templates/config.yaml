@@ -34,6 +34,17 @@ data:
   {{- with $t.nodeSelector }}
   TASK_K8S_NODE_SELECTOR: {{ . | quote }}
   {{- end }}
+  {{- if $t.gpuProfiles }}
+  # issue #20 — per-task GPU placement profiles (flavor -> placement), consumed
+  # by serge at launch to schedule GPU task pods (config._parse_gpu_profiles).
+  TASK_K8S_GPU_PROFILES: {{ $t.gpuProfiles | toJson | quote }}
+  {{- end }}
+  {{- with $t.testCommand }}
+  # issue #20 — the hard test gate: argv the task's node-IDs are appended to.
+  TASK_TEST_COMMAND: {{ . | quote }}
+  TASK_TEST_TIMEOUT: {{ $t.testTimeout | quote }}
+  TASK_TEST_MAX_RETRIES: {{ $t.testMaxRetries | quote }}
+  {{- end }}
   {{- if $t.reviewPods }}
   # Run PR reviews in per-review pods too, reusing this backend's infra.
   REVIEW_EXECUTION: "kubernetes"

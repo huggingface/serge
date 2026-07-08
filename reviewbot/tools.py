@@ -24,7 +24,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -267,7 +267,44 @@ TOOL_SPECS: list[dict[str, Any]] = [
     },
 ]
 
-_BUILTIN_TOOL_NAMES = frozenset(spec["function"]["name"] for spec in TOOL_SPECS)
+# issue #20 — the task-only test tool. Not in TOOL_SPECS (reviews never get it);
+# added by build_tool_specs only when the ToolEnv carries a test_runner.
+RUN_TESTS_TOOL_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "run_tests",
+        "description": (
+            "Run this task's target failing test(s) to check whether a "
+            "candidate fix makes them pass. Pass your current candidate patch "
+            "(a unified diff, same format as the final `patch` field) as "
+            "`patch`; the tests run on a clean checkout with your patch applied, "
+            "then the checkout is reset. This is EXPENSIVE (it downloads models "
+            "and runs on a GPU) and slow — use it to confirm a fix you already "
+            "believe in, not to explore. serge also runs these tests as a hard "
+            "gate on your final answer: a patch whose tests do not pass will "
+            "NOT be turned into a pull request. Returns PASSED/FAILED and the "
+            "tail of the pytest output."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "description": (
+                        "Candidate unified diff to apply before running the "
+                        "tests. Omit to run against the unmodified base checkout."
+                    ),
+                },
+            },
+        },
+    },
+}
+
+_BUILTIN_TOOL_NAMES = frozenset(
+    [spec["function"]["name"] for spec in TOOL_SPECS]
+    + [RUN_TESTS_TOOL_SPEC["function"]["name"]]
+)
 
 
 @dataclass(frozen=True)
@@ -520,6 +557,8 @@ def _run_helper_install(helper: RepoHelperTool) -> HelperInstallResult:
 
 def build_tool_specs(env: "ToolEnv") -> list[dict[str, Any]]:
     specs = list(TOOL_SPECS)
+    if env.test_runner is not None:
+        specs.append(RUN_TESTS_TOOL_SPEC)
     for helper in env.helper_tools.values():
         properties: dict[str, Any] = {}
         if helper.allow_args:
@@ -557,6 +596,11 @@ class ToolEnv:
     helper_tools: dict[str, RepoHelperTool] = field(default_factory=dict)
     # Isolation policy for helper subprocesses; see reviewbot/sandbox.py.
     sandbox_mode: str = AUTO
+    # issue #20 — the task flow injects a callable that applies a candidate
+    # patch (its optional argument) to a clean worktree, runs the task's target
+    # tests, resets the worktree, and returns the result string. Set only for
+    # /tasks with tests configured; None for reviews (they never get run_tests).
+    test_runner: Optional[Callable[[Optional[str]], str]] = None
 
     def __post_init__(self) -> None:
         self.repo_root = os.path.realpath(self.repo_root)
@@ -577,6 +621,8 @@ def run_tool(env: ToolEnv, name: str, arguments: dict[str, Any]) -> str:
             return _grep(env, arguments)
         if name == "fetch_url":
             return _fetch_url(arguments)
+        if name == "run_tests":
+            return _run_tests(env, arguments)
         helper = env.helper_tools.get(name)
         if helper is not None:
             return _run_repo_helper(env, helper, arguments)
@@ -779,6 +825,19 @@ def _fetch_url(args: dict[str, Any]) -> str:
         if len(text) > MAX_FETCH_BODY_CHARS:
             body += f"\n[... truncated; full body was {len(text)} chars ...]"
     return _truncate("\n".join(header_lines) + "\n\n" + body)
+
+
+def _run_tests(env: ToolEnv, args: dict[str, Any]) -> str:
+    """Dispatch the task-only ``run_tests`` tool to the injected runner.
+
+    The runner (wired in :func:`reviewbot.tasks.prepare_task`) owns the
+    apply/reset/execute policy; this shim only validates the argument."""
+    if env.test_runner is None:
+        raise _ToolError("run_tests is not available for this task")
+    patch = args.get("patch")
+    if patch is not None and not isinstance(patch, str):
+        raise _ToolError("patch must be a string")
+    return env.test_runner(patch or None)
 
 
 def _resolve_helper_command(env: ToolEnv, raw: str) -> str:

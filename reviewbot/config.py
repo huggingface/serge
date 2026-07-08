@@ -1,10 +1,11 @@
+import json
 import logging
 import os
 import shlex
 import stat
 import tempfile
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from . import sandbox
 from .sandbox import normalize_mode as normalize_sandbox_mode
@@ -19,6 +20,24 @@ def _int_env(name: str, default: int) -> int:
     "") don't blow up int parsing."""
     raw = (os.environ.get(name) or "").strip()
     return int(raw) if raw else default
+
+
+def _parse_gpu_profiles(raw: Optional[str]) -> Optional[dict[str, Any]]:
+    """Parse ``TASK_K8S_GPU_PROFILES`` (JSON) into a flavor -> profile dict.
+
+    Returns ``None`` when unset/empty. Raises :class:`ValueError` when the value
+    is present but not a JSON object, so a deployment misconfiguration fails
+    loudly at startup rather than silently scheduling GPU tasks on CPU."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"TASK_K8S_GPU_PROFILES is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("TASK_K8S_GPU_PROFILES must be a JSON object")
+    return parsed
 
 
 def _load_private_key() -> Optional[str]:
@@ -256,6 +275,31 @@ class Config:
     # serge keeps the proxy's allowlist in sync with the configured LLM
     # provider hosts (see webapp._sync_egress_allowlist). "" = never touch it.
     task_egress_name: Optional[str] = None
+
+    # --- Post-LLM test gate (issue #20: run the target tests in the pod) ------
+    # After the patch applies + the normalizer passes, run the caller-declared
+    # tests (``TaskRequest.tests``) against the worktree and feed a failure back
+    # to the model so it corrects the patch. This is the **hard guarantee**: when
+    # a task carries tests and ``task_test_command`` is set, serge will NOT open
+    # a PR unless those tests pass (a failure, or the test infra being
+    # unavailable, blocks the PR — fail-closed, unlike the best-effort normalize
+    # gate). ``task_test_command`` is the argv the node-IDs are appended to
+    # (operator/repo config, never request-supplied), e.g. ``python -m pytest``.
+    # When unset the gate is skipped and serge behaves as before.
+    task_test_command: Optional[list[str]] = None
+    task_test_timeout: int = 3600
+    # Corrective re-prompts the model gets when the test gate rejects its patch
+    # (the loop budget while a test command is active). 0 = validate once.
+    task_test_max_retries: int = 2
+    # Per-task GPU placement profiles for the kubernetes task backend, keyed by
+    # the request's normalized ``gpu`` flavor ("single-gpu" / "multi-gpu").
+    # Parsed from ``TASK_K8S_GPU_PROFILES`` (JSON). Each value is a dict:
+    #   { "node_selector": "key=value,...", "tolerations": [ <v1.Toleration>, ],
+    #     "gpu_resource": "nvidia.com/gpu", "gpu_count": 1, "memory": "64Gi" }
+    # A task whose ``gpu`` names a profile here is scheduled on that pool with
+    # the GPU resources reserved; a task with no ``gpu`` uses the global
+    # (non-GPU) ``task_k8s_node_selector`` / ``task_runner_memory`` as today.
+    task_k8s_gpu_profiles: Optional[dict[str, Any]] = None
     # Optional Slack notification for PRs created by the /tasks flow.
     # Defaults to the org-level CI feedback Slack secrets; the transformers CI
     # names remain supported as fallbacks.
@@ -503,6 +547,14 @@ class Config:
             ).strip()
             or None,
             task_egress_name=(os.environ.get("TASK_EGRESS_NAME") or "").strip() or None,
+            task_test_command=(
+                shlex.split(os.environ.get("TASK_TEST_COMMAND") or "") or None
+            ),
+            task_test_timeout=_int_env("TASK_TEST_TIMEOUT", 3600),
+            task_test_max_retries=_int_env("TASK_TEST_MAX_RETRIES", 2),
+            task_k8s_gpu_profiles=_parse_gpu_profiles(
+                os.environ.get("TASK_K8S_GPU_PROFILES")
+            ),
             slack_bot_token=(
                 os.environ.get("SLACK_CIFEEDBACK_BOT_TOKEN")
                 or os.environ.get("CI_SLACK_BOT_TOKEN")

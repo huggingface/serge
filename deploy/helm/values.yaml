@@ -131,8 +131,28 @@ taskExecution:
     # ServiceAccount for the task *pods* (not serge). "" = namespace default;
     # the pod gets no API token regardless (automountServiceAccountToken=false).
     podServiceAccount: ""
-    # nodeSelector for the task pods, as "key=value,key2=value2".
+    # nodeSelector for the task pods, as "key=value,key2=value2". Used for
+    # tasks with no GPU flavor; GPU tasks use gpuProfiles below.
     nodeSelector: ""
+    # issue #20 — per-task GPU placement profiles, keyed by the request's
+    # `output.gpu` flavor ("single-gpu" / "multi-gpu"). A task that names a
+    # flavor is scheduled on that pool with the GPUs reserved; a task with no
+    # flavor uses `nodeSelector`/`memory` above. Rendered verbatim as JSON into
+    # TASK_K8S_GPU_PROFILES. Each profile:
+    #   node_selector: "k=v,..."   # GPU node pool label(s)
+    #   tolerations: [ { key, operator, value, effect }, ... ]  # GPU node taint
+    #   gpu_resource: nvidia.com/gpu
+    #   gpu_count: 1
+    #   memory: "64Gi"
+    # Empty = no GPU placement (GPU tasks are rejected with a clear error).
+    gpuProfiles: {}
+    # issue #20 — the hard test gate. When set (argv), serge appends the task's
+    # `output.tests` node-IDs and runs them in the pod after the patch applies;
+    # a PR is opened ONLY if they pass (a failure or infra outage blocks it).
+    # Empty = no test gate (verification stays in the caller's CI, as before).
+    testCommand: ""
+    testTimeout: 3600
+    testMaxRetries: 2
     # Also run PR *reviews* in per-review pods (SERGE_ORCHESTRATOR_PODS_PLAN.md
     # Phase 3/4), reusing this backend's egress proxy + RBAC + callback. When
     # false, reviews run in-process in serge (default) even with task pods on.
@@ -152,7 +172,11 @@ taskExecution:
       replicas: 1
       port: 3128
       # Host regexes the proxy permits CONNECT to (tinyproxy FilterExtended).
-      # Everything else is denied (FilterDefaultDeny).
+      # Everything else is denied (FilterDefaultDeny). NOTE (issue #20): when
+      # the test gate runs transformers GPU tests, the pod must also reach the
+      # HF hub to download model weights — add the hub + CDN hosts here (e.g.
+      # '^huggingface\.co$' and '(^|\.)hf\.co$'). serge unions the configured
+      # LLM provider hosts in at runtime, but weights hosts are static config.
       allowDomains:
         - '(^|\.)github\.com$'
         - '(^|\.)githubusercontent\.com$'

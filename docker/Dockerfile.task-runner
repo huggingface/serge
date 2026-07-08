@@ -19,6 +19,12 @@
 #     -t serge/task-runner:latest .
 #
 # Then point serge's launcher at it: TASK_RUNNER_IMAGE=serge/task-runner:latest
+#
+# GPU test gate (issue #20): to run the target GPU tests in-pod, build against a
+# CUDA-enabled transformers image (e.g. huggingface/transformers-pytorch-gpu or
+# transformers-all-latest-gpu) so torch+CUDA+pytest are present, and point the
+# GPU placement profiles' pods at that image. The pod requests the GPU via the
+# profile (nvidia.com/gpu); the cluster needs the NVIDIA device plugin.
 ARG BASE_IMAGE=huggingface/transformers-quality:latest
 FROM ${BASE_IMAGE}
 

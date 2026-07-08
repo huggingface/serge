@@ -110,6 +110,8 @@ Content-Type: application/json
 | `output.pr_number` | required for `existing_pr` | The serge-authored fix PR to push onto. |
 | `output.title` | optional | PR title. The LLM proposes one if omitted. |
 | `output.branch_prefix` | optional | `new_pr` branch prefix. Must live in the `serge/` namespace. Default `serge/fix`. |
+| `output.gpu` | optional | Target GPU flavor: `single-gpu` or `multi-gpu` (aliases `simple`/`single`, `multi`). Selects the GPU pod placement profile (`TASK_K8S_GPU_PROFILES`). Omit for a CPU task. |
+| `output.tests` | optional | Array of pytest node-IDs (e.g. `tests/models/x/test_y.py::TestZ::test_w`) the patch **must** pass. With `TASK_TEST_COMMAND` set, serge runs them in the pod and opens a PR only if they pass — see the test gate below. |
 
 Response `202`:
 
@@ -140,6 +142,35 @@ review pages use.
   class as a PR body). The prompt marks them untrusted, the model can only emit a
   patch, and the result is a PR a human reviews before merge.
 
+## GPU test gate (run the target tests before opening a PR)
+
+By default serge is a stateless patch producer and verification is left to the
+caller's CI *after* the PR exists. For integration/GPU failures you can instead
+have serge **prove the fix before opening a PR** (issue #20):
+
+1. The caller passes the failing `output.tests` (pytest node-IDs) and the
+   `output.gpu` flavor. Both are **trusted intent** (like `instruction`) — the
+   node-IDs are validated (no leading `-`, no control chars) and passed as argv,
+   never a shell string.
+2. serge launches the task's runner pod **on the matching GPU node pool**
+   (`TASK_K8S_GPU_PROFILES[output.gpu]` → nodeSelector + tolerations +
+   `nvidia.com/gpu` reservation). A `gpu` with no configured profile is rejected.
+3. Inside the pod, after the patch applies (and the normalizer passes), serge
+   runs `TASK_TEST_COMMAND` + the node-IDs. A failure is fed back to the model to
+   correct the patch (up to `TASK_TEST_MAX_RETRIES`). The model can also call the
+   `run_tests` tool mid-loop to check a candidate patch.
+4. **Fail-closed guarantee:** serge opens/appends a PR **only if those tests
+   pass**. A test failure *or* the test infra being unavailable blocks the PR;
+   the task ends `no_fix` with a "targeted tests did not pass" message.
+
+The GPU test pod must reach the HF hub to download model weights — add the hub
+hosts to the egress allowlist (`taskExecution.kubernetes.egress.allowDomains`,
+e.g. `^huggingface\.co$` and `(^|\.)hf\.co$`). GPU tasks therefore run under a
+slightly wider egress boundary than normal task pods (git + LLM + callback + HF
+hub); still no arbitrary internet. Build the runner image against a CUDA
+transformers base (see `docker/Dockerfile.task-runner`); the cluster needs the
+NVIDIA device plugin and a GPU node pool matching the profiles.
+
 ## Configuration
 
 | Env var | Default | Description |
@@ -152,3 +183,7 @@ review pages use.
 | `TASK_TOOL_MAX_ITERATIONS` | unset | Task-only tool-loop cap. Unset means tasks use `TOOL_MAX_ITERATIONS`; normal reviews are unchanged. |
 | `TASK_MAX_FOLLOWUPS` | `5` | Max serge-authored commits per fix branch. Set `0` to disable the cap. |
 | `TASK_MAX_WORKERS` | `2` | Concurrent task workers (separate pool from reviews). |
+| `TASK_TEST_COMMAND` | unset | Argv the request's `output.tests` node-IDs are appended to (e.g. `python -m pytest -q`). Unset = no test gate. Operator/repo config, never request-supplied. |
+| `TASK_TEST_TIMEOUT` | `3600` | Wall-clock cap (seconds) on one test-gate run. |
+| `TASK_TEST_MAX_RETRIES` | `2` | Corrective re-prompts when the tests reject the patch (the loop budget while the gate is active). |
+| `TASK_K8S_GPU_PROFILES` | unset | JSON map: GPU flavor → `{ node_selector, tolerations, gpu_resource, gpu_count, memory }`. Selects per-task GPU pod placement (kubernetes backend). |

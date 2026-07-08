@@ -170,6 +170,32 @@ class TaskJobManifestTests(unittest.TestCase):
         res = m["spec"]["template"]["spec"]["containers"][0]["resources"]
         self.assertEqual(res["limits"]["memory"], "4Gi")
 
+    def test_gpu_resources_and_tolerations(self):
+        # issue #20: GPU tasks reserve the extended resource and tolerate the
+        # GPU node taint.
+        tol = [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}]
+        m = self._job(
+            memory="64Gi",
+            gpu_resource="nvidia.com/gpu",
+            gpu_count=2,
+            settings=K8sSettings(
+                namespace="serge",
+                node_selector={"gpu": "a100"},
+                tolerations=tol,
+            ),
+        )
+        pod = m["spec"]["template"]["spec"]
+        limits = pod["containers"][0]["resources"]["limits"]
+        self.assertEqual(limits["memory"], "64Gi")
+        self.assertEqual(limits["nvidia.com/gpu"], "2")
+        self.assertEqual(pod["nodeSelector"], {"gpu": "a100"})
+        self.assertEqual(pod["tolerations"], tol)
+
+    def test_no_gpu_resource_without_count(self):
+        m = self._job()
+        self.assertNotIn("resources", m["spec"]["template"]["spec"]["containers"][0])
+        self.assertNotIn("tolerations", m["spec"]["template"]["spec"])
+
     def test_missing_image_raises(self):
         with self.assertRaises(K8sSandboxError):
             self._job(image="")
