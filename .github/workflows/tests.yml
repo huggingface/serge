@@ -25,7 +25,7 @@ jobs:
 
       - name: Download actionlint
         id: get_actionlint
-        run: bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/7617a8a40c817cf4e6e9541943c990b0c9c2df23/scripts/download-actionlint.bash) 1.7.11
+        run: bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/393031adb9afb225ee52ae2ccd7a5af5525e03e8/scripts/download-actionlint.bash) 1.7.11
         shell: bash
 
       - name: Lint workflow files
