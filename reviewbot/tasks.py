@@ -316,6 +316,45 @@ def format_pr_files_diff(files: list[dict[str, Any]], *, limit: int = 30000) -> 
 # ---------------------------------------------------------------------------
 # Agentic loop → patch (with in-loop normalize validation)
 # ---------------------------------------------------------------------------
+def _run_repo_normalizer(
+    cfg: Config,
+    checkout: Checkout,
+    emit: Callable[[str, str], None],
+) -> tuple[Optional[int], str]:
+    """Run the configured repo normalizer (``cfg.task_normalize_command``) over
+    the current worktree with its fixers enabled, writing any regenerated files
+    (e.g. transformers' ``modeling_*.py`` from ``modular_*.py``) back in place.
+
+    Returns ``(returncode, tail)``. ``returncode`` is ``None`` when the
+    normalizer could not run at all (sandbox unavailable / timeout / launch
+    failure) — infrastructure, not the patch's fault, which callers treat as a
+    best-effort pass. Assumes ``cfg.task_normalize_command`` is set."""
+    command = cfg.task_normalize_command
+    assert command is not None
+    emit("step", "normalize")
+    emit("log", f"Running the repo normalizer: `{' '.join(command)}`…")
+    try:
+        return run_normalize(
+            command,
+            workdir=checkout.path,
+            write_root=checkout.path,
+            backend=cfg.task_sandbox_backend,
+            image=cfg.task_normalize_image,
+            mode=cfg.helper_sandbox,
+            timeout=cfg.task_normalize_timeout,
+            memory=cfg.task_normalize_memory,
+        )
+    except NormalizeError as exc:
+        # Infrastructure problem (sandbox unavailable, timeout) — not the
+        # model's fault. Signal best-effort with a None returncode; CI still
+        # catches anything the normalizer would have.
+        log.warning("normalizer unavailable: %s", exc)
+        emit(
+            "log", f"Normalizer unavailable ({exc}); accepting the patch un-normalized."
+        )
+        return None, ""
+
+
 def _validate_patch(
     cfg: Config,
     *,
@@ -366,27 +405,10 @@ def _validate_patch(
             False,
         )
 
-    emit("step", "normalize")
-    emit("log", f"Validating the patch with `{' '.join(command)}`…")
-    try:
-        returncode, tail = run_normalize(
-            command,
-            workdir=checkout.path,
-            write_root=checkout.path,
-            backend=cfg.task_sandbox_backend,
-            image=cfg.task_normalize_image,
-            mode=cfg.helper_sandbox,
-            timeout=cfg.task_normalize_timeout,
-            memory=cfg.task_normalize_memory,
-        )
-    except NormalizeError as exc:
-        # Infrastructure problem (sandbox unavailable, timeout) — not the
-        # model's fault. Accept the applied patch best-effort rather than
-        # blaming the LLM; CI still catches anything the normalizer would have.
-        log.warning("normalizer unavailable during validation: %s", exc)
-        emit(
-            "log", f"Normalizer unavailable ({exc}); accepting the patch un-normalized."
-        )
+    returncode, tail = _run_repo_normalizer(cfg, checkout, emit)
+    if returncode is None:
+        # Normalizer could not run (infra) — accept the applied patch
+        # best-effort rather than blaming the LLM.
         return None, True
 
     if returncode != 0:
@@ -756,7 +778,9 @@ def publish_task(
     (:func:`_validate_patch`) already applied + normalized the worktree, so we
     just stage and commit it. Otherwise we apply ``plan.patch`` here (the path
     taken when no normalizer is configured, or when validation was abandoned
-    and left a clean checkout)."""
+    and left a clean checkout) and, if a normalizer *is* configured, re-run it
+    so regenerated files ride along — refusing to open a PR it rejects rather
+    than committing a raw, repo-inconsistent patch."""
 
     def _emit(kind: str, text: str) -> None:
         if emit is not None:
@@ -779,6 +803,30 @@ def publish_task(
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:800]
             raise TaskError(f"patch did not apply cleanly: {stderr}", status_code=422)
+
+        # When a normalizer is configured, the committed tree must satisfy it —
+        # most consequentially transformers' modular/generated-file coupling,
+        # where editing a ``modular_*.py`` must regenerate its ``modeling_*.py``.
+        # The in-loop gate (:func:`_validate_patch`) enforces that, but when its
+        # correction budget is exhausted prepare_task resets the worktree and we
+        # land here with only the raw LLM patch. Re-run the normalizer so any
+        # regenerated files ride along in the commit, and refuse rather than open
+        # a PR the repo's own consistency CI would immediately reject.
+        if cfg.task_normalize_command:
+            returncode, tail = _run_repo_normalizer(cfg, checkout, _emit)
+            if returncode not in (None, 0):
+                clone_cache.reset_worktree(checkout)
+                _emit("log", "Normalizer rejected the patch; not opening a PR.")
+                return TaskResult(
+                    mode=req.mode,
+                    no_change=True,
+                    message=(
+                        "The proposed patch does not pass the repository's "
+                        f"normalizer (exit {returncode}), so no PR was opened — "
+                        "the in-loop correction budget was exhausted before a "
+                        f"clean patch was found:\n\n{tail}"
+                    ),
+                )
 
     clone_cache.stage_all(checkout)
     changes = clone_cache.collect_changes(checkout)

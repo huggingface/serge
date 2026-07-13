@@ -521,6 +521,130 @@ class PublishTaskTests(unittest.TestCase):
         self.assertTrue(SERGE_GIT_EMAIL)
 
 
+class PublishFallbackNormalizeTests(unittest.TestCase):
+    """When validation's correction budget is exhausted, publish_task lands on
+    the raw-apply fallback. With a normalizer configured it must re-run it so
+    regenerated files (e.g. transformers' modeling_*.py) ride along, and refuse
+    to open a PR the normalizer rejects — never commit a raw, un-normalized
+    patch. Uses the bwrap backend + sandbox off so the command runs directly."""
+
+    _PATCH = (
+        "diff --git a/hello.txt b/hello.txt\n"
+        "--- a/hello.txt\n"
+        "+++ b/hello.txt\n"
+        "@@ -1 +1 @@\n"
+        "-hi from main\n"
+        "+hi patched\n"
+    )
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = self._tmp.name
+        self.src = os.path.join(root, "src")
+        os.makedirs(self.src)
+        _git(self.src, "init", "--quiet", "-b", "main")
+        with open(os.path.join(self.src, "hello.txt"), "w") as f:
+            f.write("hi from main\n")
+        _git(self.src, "add", "-A")
+        _git(self.src, "commit", "--quiet", "-m", "main commit")
+        self.cache = CloneCache(os.path.join(root, "cache"))
+
+    def _checkout(self):
+        return self.cache.acquire_ref(
+            token="",
+            owner="acme",
+            repo="widget",
+            ref="main",
+            job_id="abcd1234",
+            remote_url=self.src,
+        )
+
+    def _req(self):
+        return TaskRequest(
+            owner="acme",
+            repo="widget",
+            base_ref="main",
+            instruction="fix",
+            context="",
+            mode="new_pr",
+        )
+
+    def _cfg(self, **overrides):
+        base = dict(helper_sandbox="off", task_sandbox_backend="bwrap")
+        base.update(overrides)
+        return _make_cfg(**base)
+
+    def test_fallback_reruns_normalizer_and_ships_regenerated_files(self):
+        # A raw patch (worktree_prepared=False) whose normalizer regenerates an
+        # extra file: the commit must include BOTH the patched and generated
+        # files, mirroring transformers' modular_*.py -> modeling_*.py flow.
+        co = self._checkout()
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", "echo generated > extra.txt"],
+            task_normalize_timeout=30,
+        )
+        plan = TaskPlan(title="Fix hello", body="desc", patch=self._PATCH)
+        gh = _FakeGH()
+        with patch("reviewbot.tasks.post_task_pr_created_notification"):
+            result = publish_task(
+                cfg,
+                gh,
+                self._req(),
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+        self.assertFalse(result.no_change)
+        self.assertEqual(sorted(result.changed_files), ["extra.txt", "hello.txt"])
+        self.assertIsNotNone(gh.created_pr)
+
+    def test_fallback_refuses_when_normalizer_rejects(self):
+        # Normalizer exits non-zero on the raw patch -> no PR, worktree reset.
+        co = self._checkout()
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", "echo boom >&2; exit 3"],
+            task_normalize_timeout=30,
+        )
+        plan = TaskPlan(title="Fix hello", body="desc", patch=self._PATCH)
+        gh = _FakeGH()
+        result = publish_task(
+            cfg,
+            gh,
+            self._req(),
+            plan,
+            checkout=co,
+            clone_cache=self.cache,
+            job_id="abcd1234",
+        )
+        self.assertTrue(result.no_change)
+        self.assertIsNone(gh.created_pr)
+        self.assertIn("normalizer", result.message.lower())
+        self.assertIn("exit 3", result.message)
+        # Worktree restored to the pristine checkout.
+        self.assertEqual(self.cache.collect_changes(co), [])
+
+    def test_no_normalizer_configured_commits_raw_patch(self):
+        # Without a normalizer the fallback still commits the raw patch as-is.
+        co = self._checkout()
+        cfg = self._cfg()  # no task_normalize_command
+        plan = TaskPlan(title="Fix hello", body="desc", patch=self._PATCH)
+        gh = _FakeGH()
+        with patch("reviewbot.tasks.post_task_pr_created_notification"):
+            result = publish_task(
+                cfg,
+                gh,
+                self._req(),
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+        self.assertFalse(result.no_change)
+        self.assertEqual(result.changed_files, ["hello.txt"])
+
+
 class ValidatePatchTests(unittest.TestCase):
     """The in-loop verification gate (_validate_patch), against a real
     worktree. Runs with the bwrap backend + sandbox off so the normalize
