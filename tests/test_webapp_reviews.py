@@ -126,6 +126,73 @@ class WebappReviewsTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["default_max_input_tokens"], 2000000)
 
+    def test_review_models_lists_matched_config_models(self):
+        client = TestClient(self.webapp.app)
+        self.webapp._store.insert_provider_config(
+            id="c-openai",
+            provider="openai",
+            api_key="sk-stored",
+            api_base=None,
+            default_model=None,
+            repo_pattern="acme/api",
+            allowed_users=["dev"],
+            allowed_orgs=[],
+            created_by="admin",
+        )
+        seen = {}
+
+        class _FakeClient:
+            def __init__(self, api_base, api_key, *, bill_to=None, **kw):
+                seen["api_base"] = api_base
+                seen["api_key"] = api_key
+
+            def list_models(self):
+                return ["gpt-4o", "o3"]
+
+        with (
+            patch.object(self.webapp, "_effective_user_orgs_for_repo", return_value=[]),
+            patch.object(self.webapp, "ChatCompletionClient", _FakeClient),
+        ):
+            r = client.get("/reviews/models", params={"owner": "acme", "repo": "api"})
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["models"], ["gpt-4o", "o3"])
+        # The matched config's key is used server-side and never leaks to the UI.
+        self.assertEqual(seen["api_key"], "sk-stored")
+        self.assertEqual(seen["api_base"], "https://api.openai.com/v1")
+        self.assertNotIn("api_key", data)
+
+    def test_review_models_no_match_returns_empty(self):
+        client = TestClient(self.webapp.app)
+        with patch.object(
+            self.webapp, "_effective_user_orgs_for_repo", return_value=[]
+        ):
+            r = client.get("/reviews/models", params={"owner": "no", "repo": "match"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["models"], [])
+
+    def test_review_models_fetch_error_is_a_verdict(self):
+        client = TestClient(self.webapp.app)
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            def list_models(self):
+                raise RuntimeError("Failed to list models (status 401).")
+
+        with (
+            patch.object(self.webapp, "_effective_user_orgs_for_repo", return_value=[]),
+            patch.object(self.webapp, "ChatCompletionClient", _FakeClient),
+        ):
+            r = client.get(
+                "/reviews/models", params={"owner": "acme", "repo": "widgets"}
+            )
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["models"], [])
+        self.assertIn("401", data["error"])
+
     # --- effective_draft (single source of truth for what gets posted) ---
     def _sample_draft(self, **overrides):
         kwargs = dict(

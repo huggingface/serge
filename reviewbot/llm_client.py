@@ -188,6 +188,35 @@ class ChatCompletionClient:
             return self.model
         return self._discover_model()
 
+    def list_models(self, timeout: int = 15) -> list[str]:
+        """Model ids the endpoint's ``/models`` route advertises, sorted
+        case-insensitively and de-duplicated. Works against any OpenAI-compatible
+        base (OpenAI, Anthropic's shim, HF Router, vLLM, …). Raises RuntimeError
+        on a non-OK response or unparseable body so callers can surface why."""
+        models_url = f"{self._api_base_v1()}/models"
+        response = requests.get(models_url, headers=self._headers(), timeout=timeout)
+        if not response.ok:
+            raise RuntimeError(
+                f"Failed to list models from {models_url} (status {response.status_code})."
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Failed to parse {models_url} response as JSON."
+            ) from exc
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            return []
+        ids = {
+            entry["id"]
+            for entry in data
+            if isinstance(entry, dict)
+            and isinstance(entry.get("id"), str)
+            and entry["id"]
+        }
+        return sorted(ids, key=str.lower)
+
     # Optional sampling parameters a model may reject/deprecate outright.
     # Each is safe to drop on a 400 — the server falls back to its own
     # default — so retrying without it keeps the review alive. Ordered

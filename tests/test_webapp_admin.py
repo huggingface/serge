@@ -192,5 +192,124 @@ class ProviderTestEndpointTests(unittest.TestCase):
         self.assertIn("Inference Providers", data["error"])
 
 
+class ProviderModelsEndpointTests(unittest.TestCase):
+    """POST /admin/providers/models lists a keyed provider's models for the
+    admin form dropdown — using the typed key, or the stored key of the config
+    being edited. A bad token / no-/models endpoint is a verdict, not a 500."""
+
+    def _build(self):
+        sys.modules.pop("reviewbot.webapp", None)
+        env = {
+            "DEV_NO_AUTH": "1",
+            "GITHUB_APP_ID": "123",
+            "GITHUB_PRIVATE_KEY": "dummy-private-key",
+            "GITHUB_WEBHOOK_SECRET": "webhook-secret",
+            "LLM_API_KEY": "llm-token",
+            "WEB_STORE_PATH": os.path.join(self.tmpdir, "jobs.db"),
+            "WEB_CLONE_CACHE_DIR": os.path.join(self.tmpdir, "clones"),
+        }
+        with patch.dict(os.environ, env, clear=True):
+            webapp = importlib.import_module("reviewbot.webapp")
+        return webapp, TestClient(webapp.app)
+
+    def setUp(self) -> None:
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def test_typed_key_lists_models(self):
+        webapp, client = self._build()
+        seen = {}
+
+        class _FakeClient:
+            def __init__(self, api_base, api_key, *, bill_to=None, **kw):
+                seen["api_base"] = api_base
+                seen["api_key"] = api_key
+                seen["bill_to"] = bill_to
+
+            def list_models(self):
+                return ["gpt-4o", "o3"]
+
+        with patch.object(webapp, "ChatCompletionClient", _FakeClient):
+            r = client.post(
+                "/admin/providers/models",
+                json={"provider": "openai", "api_key": "sk-typed"},
+                headers={"Origin": "http://testserver"},
+            )
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["models"], ["gpt-4o", "o3"])
+        self.assertEqual(seen["api_key"], "sk-typed")
+        self.assertEqual(seen["api_base"], "https://api.openai.com/v1")
+        # Non-HF providers never forward a billing org.
+        self.assertIsNone(seen["bill_to"])
+
+    def test_blank_key_falls_back_to_stored_config_key(self):
+        webapp, client = self._build()
+        webapp._store.insert_provider_config(
+            id="cfg-openai",
+            provider="openai",
+            api_key="sk-stored",
+            api_base=None,
+            default_model=None,
+            repo_pattern="acme/*",
+            allowed_users=[],
+            allowed_orgs=["acme"],
+            created_by="dev",
+        )
+        seen = {}
+
+        class _FakeClient:
+            def __init__(self, api_base, api_key, **kw):
+                seen["api_key"] = api_key
+
+            def list_models(self):
+                return ["gpt-4o"]
+
+        with patch.object(webapp, "ChatCompletionClient", _FakeClient):
+            r = client.post(
+                "/admin/providers/models",
+                json={"provider": "openai", "config_id": "cfg-openai"},
+                headers={"Origin": "http://testserver"},
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["ok"])
+        self.assertEqual(seen["api_key"], "sk-stored")
+
+    def test_missing_key_is_400(self):
+        webapp, client = self._build()
+        r = client.post(
+            "/admin/providers/models",
+            json={"provider": "openai"},
+            headers={"Origin": "http://testserver"},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["detail"], "api_key_required")
+
+    def test_fetch_error_is_a_verdict_not_500(self):
+        webapp, client = self._build()
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            def list_models(self):
+                raise RuntimeError("Failed to list models (status 401).")
+
+        with patch.object(webapp, "ChatCompletionClient", _FakeClient):
+            r = client.post(
+                "/admin/providers/models",
+                json={"provider": "anthropic", "api_key": "sk-bad"},
+                headers={"Origin": "http://testserver"},
+            )
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertFalse(data["ok"])
+        self.assertIn("401", data["error"])
+        self.assertEqual(data["models"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
