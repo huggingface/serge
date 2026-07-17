@@ -41,7 +41,7 @@ from .reviewer import (
     _UnparseableLLMOutput,
 )
 from .slack_tool import post_task_pr_created_notification
-from .verify import VerifyOutcome, run_gpu_verify
+from .verify import VerifyOutcome, run_gpu_verify, should_retry
 
 log = logging.getLogger(__name__)
 
@@ -131,6 +131,11 @@ class TaskResult:
     url: Optional[str] = None
     commit_sha: Optional[str] = None
     changed_files: list[str] = field(default_factory=list)
+    # Set when the GPU verify gate ran (see verify.py). ``verify_verdict`` drives
+    # the retry-with-tracebacks loop; ``verify_tracebacks`` is the feedback fed
+    # to the next LLM round. Not persisted in ``to_json`` (tracebacks are large).
+    verify_verdict: Optional[str] = None
+    verify_tracebacks: dict[str, str] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -142,6 +147,7 @@ class TaskResult:
             "url": self.url,
             "commit_sha": self.commit_sha,
             "changed_files": self.changed_files,
+            "verify_verdict": self.verify_verdict,
         }
 
 
@@ -703,18 +709,19 @@ def _make_verify_gate(
     plan: TaskPlan,
     job_id: str,
     emit_fn: Callable[[str, str], None],
-) -> Optional[Callable[[str, str], "tuple[bool, str]"]]:
-    """Build the pre-PR GPU verify gate, or ``None`` when disabled/inapplicable.
+) -> Optional[Callable[[str, str], VerifyOutcome]]:
+    """Build the pre-PR GPU verify gate, or ``None`` when disabled.
 
-    Returns a callback ``(base_sha, candidate_sha) -> (open_pr, message)``: it
-    runs the targeted tests on GPU and only permits the PR when the verdict is
-    `fixed`. Only wired for ``new_pr`` (follow-up commits on an existing PR keep
-    the current behavior)."""
-    if not cfg.verify_on_gpu or req.mode != "new_pr":
+    Returns a callback ``(base_sha, candidate_sha) -> VerifyOutcome``: it runs
+    the targeted tests on GPU (baseline must be red, candidate should be green).
+    The caller (:func:`_commit_changes`) opens the PR / keeps the follow-up
+    commit only when ``outcome.is_fixed``. Wired for both ``new_pr`` and
+    ``existing_pr``."""
+    if not cfg.verify_on_gpu:
         return None
     block = _select_failure_block(req, plan)
 
-    def _gate(base_sha: str, candidate_sha: str) -> tuple[bool, str]:
+    def _gate(base_sha: str, candidate_sha: str) -> VerifyOutcome:
         outcome = run_gpu_verify(
             gh,
             owner=req.owner,
@@ -734,8 +741,12 @@ def _make_verify_gate(
         )
         if outcome.is_fixed:
             emit_fn("log", f"GPU verify: fixed ✓ ({outcome.run_url or 'run'})")
-            return True, ""
-        return False, _verify_failure_message(outcome)
+        else:
+            emit_fn(
+                "log",
+                f"GPU verify: {outcome.verdict} — not accepting ({outcome.run_url or ''})",
+            )
+        return outcome
 
     return _gate
 
@@ -750,10 +761,15 @@ def _commit_changes(
     body: str,
     job_id: str,
     emit_fn: Callable[[str, str], None],
-    verify: Optional[Callable[[str, str], "tuple[bool, str]"]] = None,
+    verify: Optional[Callable[[str, str], VerifyOutcome]] = None,
 ) -> TaskResult:
     """Commit a set of worktree changes via the Git Data API and open/update
-    a PR. ``changes`` must be non-empty. Never pushes to a non-serge branch."""
+    a PR. ``changes`` must be non-empty. Never pushes to a non-serge branch.
+
+    When ``verify`` is given (opt-in GPU gate), the candidate commit is created
+    and made fetchable, the tests are run on GPU, and the PR is opened / the
+    follow-up commit is kept only on a ``fixed`` verdict; otherwise the branch is
+    torn down (new_pr) or rolled back to its previous head (existing_pr)."""
     changed_files = [c.path for c in changes]
     emit_fn(
         "log",
@@ -777,8 +793,34 @@ def _commit_changes(
             tree_sha=tree_sha,
             parents=[parent_sha],
         )
+        # Move the branch forward so the candidate commit is fetchable by the
+        # verify workflow, then gate. On a non-fixed verdict, roll the branch
+        # back to its previous head so the follow-up commit is undone.
         gh.update_ref(owner, repo, f"heads/{head_branch}", commit_sha)
         emit_fn("log", f"Pushed commit {commit_sha[:8]} to {head_branch}")
+        if verify is not None:
+            outcome = verify(parent_sha, commit_sha)
+            if not outcome.is_fixed:
+                try:
+                    gh.update_ref(
+                        owner, repo, f"heads/{head_branch}", parent_sha, force=True
+                    )
+                except Exception:  # noqa: BLE001 — best-effort rollback
+                    emit_fn(
+                        "log", f"Could not roll {head_branch} back to {parent_sha[:8]}"
+                    )
+                emit_fn(
+                    "log", "GPU verify did not confirm the fix; follow-up reverted."
+                )
+                return TaskResult(
+                    mode=req.mode,
+                    no_change=True,
+                    pr_number=req.pr_number,
+                    commit_sha=commit_sha,
+                    message=_verify_failure_message(outcome),
+                    verify_verdict=outcome.verdict,
+                    verify_tracebacks=outcome.tracebacks,
+                )
         return TaskResult(
             mode=req.mode,
             pr_number=req.pr_number,
@@ -808,8 +850,8 @@ def _commit_changes(
     # opening the PR. `parent_sha` is the baseline-red reference. On a non-`fixed`
     # verdict, tear the branch down and return without a PR.
     if verify is not None:
-        open_pr, message = verify(parent_sha, commit_sha)
-        if not open_pr:
+        outcome = verify(parent_sha, commit_sha)
+        if not outcome.is_fixed:
             try:
                 gh.delete_ref(owner, repo, f"heads/{branch}")
             except Exception:  # noqa: BLE001 — cleanup is best-effort
@@ -819,7 +861,9 @@ def _commit_changes(
                 mode=req.mode,
                 no_change=True,
                 commit_sha=commit_sha,
-                message=message,
+                message=_verify_failure_message(outcome),
+                verify_verdict=outcome.verdict,
+                verify_tracebacks=outcome.tracebacks,
             )
 
     # Open as a draft, then immediately mark ready-for-review. The
@@ -951,3 +995,91 @@ def publish_task(
         emit_fn=_emit,
         verify=_make_verify_gate(cfg, gh, req, plan, job_id, _emit),
     )
+
+
+def _format_verify_feedback(result: TaskResult) -> str:
+    """Markdown feedback for the next LLM round: the failures the previous
+    candidate's GPU verify still produced."""
+    lines = [
+        "## Your previous patch did NOT fix the tests (GPU verification)",
+        "",
+        f"A previous candidate was run on GPU; the verdict was "
+        f"`{result.verify_verdict}`. With that patch applied, the targeted tests "
+        "below still fail. Produce a NEW patch that makes them pass — do not "
+        "repeat the same change; use the tracebacks to find the real cause.",
+        "",
+    ]
+    for nodeid, tb in list(result.verify_tracebacks.items())[:5]:
+        lines.append(f"### {nodeid}")
+        lines.append("```")
+        lines.append((tb or "")[-2000:])
+        lines.append("```")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _with_verify_feedback(req: TaskRequest, feedback: str) -> TaskRequest:
+    """A copy of ``req`` with GPU-verify feedback appended to its context, so the
+    next LLM round sees the failures its previous patch still produced."""
+    return dataclasses.replace(req, context=f"{req.context}\n\n{feedback}")
+
+
+def prepare_and_publish_candidate(
+    cfg: Config,
+    gh: GitHubClient,
+    candidate_req: TaskRequest,
+    *,
+    checkout: Checkout,
+    clone_cache: CloneCache,
+    existing_diff: Optional[str],
+    job_id: str,
+    emit: Callable[[str, str], None],
+) -> TaskResult:
+    """Prepare (LLM) then publish one candidate group.
+
+    When the opt-in GPU verify gate rejects the patch with a retryable verdict
+    (``not_fixed``/``broke_others``), re-prepare with the fresh tracebacks
+    appended and re-publish, up to ``cfg.verify_max_rounds`` extra rounds. This
+    is the single place the retry loop lives, so both the in-process worker and
+    the per-task pod get it by calling this instead of prepare_task+publish_task.
+
+    Publishing exceptions (e.g. a patch that won't apply, ``TaskError`` 422)
+    propagate unchanged so the caller's candidate loop can move on."""
+    rounds = cfg.verify_max_rounds if cfg.verify_on_gpu else 0
+    req_i = candidate_req
+    result: Optional[TaskResult] = None
+    for attempt in range(rounds + 1):
+        if attempt > 0:
+            # Start each retry from a pristine worktree.
+            clone_cache.reset_worktree(checkout)
+        plan = prepare_task(
+            cfg,
+            req_i,
+            checkout=checkout,
+            clone_cache=clone_cache,
+            existing_diff=existing_diff,
+            chunk_callback=emit,
+        )
+        result = publish_task(
+            cfg,
+            gh,
+            req_i,
+            plan,
+            checkout=checkout,
+            clone_cache=clone_cache,
+            job_id=job_id,
+            emit=emit,
+        )
+        if attempt < rounds and should_retry(result.verify_verdict or ""):
+            emit(
+                "log",
+                f"GPU verify: {result.verify_verdict}; re-prompting with tracebacks "
+                f"(round {attempt + 2}/{rounds + 1})",
+            )
+            req_i = _with_verify_feedback(
+                candidate_req, _format_verify_feedback(result)
+            )
+            continue
+        return result
+    assert result is not None  # rounds >= 0 guarantees at least one iteration
+    return result

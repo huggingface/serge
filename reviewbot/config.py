@@ -274,6 +274,9 @@ class Config:
     verify_machine_type: str = "aws-g5-12xlarge-cache"
     verify_poll_timeout: int = 2400
     verify_poll_interval: int = 30
+    # Extra LLM rounds after the first when GPU verify says the patch didn't fix
+    # the tests: re-prompt with the fresh tracebacks. 0 = verify once, no retry.
+    verify_max_rounds: int = 2
     # Optional Slack notification for PRs created by the /tasks flow.
     # Defaults to the org-level CI feedback Slack secrets; the transformers CI
     # names remain supported as fallbacks.
@@ -535,6 +538,7 @@ class Config:
             ).strip(),
             verify_poll_timeout=_int_env("VERIFY_POLL_TIMEOUT", 2400),
             verify_poll_interval=_int_env("VERIFY_POLL_INTERVAL", 30),
+            verify_max_rounds=_int_env("VERIFY_MAX_ROUNDS", 2),
             slack_bot_token=(
                 os.environ.get("SLACK_CIFEEDBACK_BOT_TOKEN")
                 or os.environ.get("CI_SLACK_BOT_TOKEN")

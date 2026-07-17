@@ -86,8 +86,7 @@ from .tasks import (
     TaskRequest,
     build_task_request,
     format_pr_files_diff,
-    prepare_task,
-    publish_task,
+    prepare_and_publish_candidate,
     resolve_existing_pr,
     task_candidate_requests,
 )
@@ -1200,22 +1199,14 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
                     "log",
                     f"Starting candidate {index}/{len(candidate_reqs)} in a fresh LLM cycle",
                 )
-            plan = prepare_task(
-                worker_cfg,
-                candidate_req,
-                checkout=checkout,
-                clone_cache=_clone_cache,
-                existing_diff=existing_diff,
-                chunk_callback=emit,
-            )
             try:
-                attempt_result = publish_task(
+                attempt_result = prepare_and_publish_candidate(
                     worker_cfg,
                     gh,
                     candidate_req,
-                    plan,
                     checkout=checkout,
                     clone_cache=_clone_cache,
+                    existing_diff=existing_diff,
                     job_id=job.id,
                     emit=emit,
                 )

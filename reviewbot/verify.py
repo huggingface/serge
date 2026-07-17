@@ -39,11 +39,24 @@ _SINGLE_GPU = "aws-g5-4xlarge-cache"
 
 # Verdicts produced workflow-side (serge-verify-verdict). Only `fixed` opens a PR.
 FIXED = "fixed"
+NOT_FIXED = "not_fixed"
+BROKE_OTHERS = "broke_others"
+ALREADY_PASSING = "already_passing"
+ERROR = "error"
 # Orchestration-level verdicts produced here when the workflow can't be run/read.
 NO_TARGETS = "no_targets"
 DISPATCH_FAILED = "dispatch_failed"
 TIMEOUT = "timeout"
 NO_RESULT = "no_result"
+
+# Verdicts where re-prompting the LLM with the fresh failures is worth another
+# round. `already_passing` (nothing to fix), infra errors and `error` are NOT
+# retried — another LLM turn can't change them.
+_RETRYABLE = frozenset({NOT_FIXED, BROKE_OTHERS})
+
+
+def should_retry(verdict: str) -> bool:
+    return verdict in _RETRYABLE
 
 
 @dataclass

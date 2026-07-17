@@ -74,6 +74,7 @@ RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
     "verify_machine_type",
     "verify_poll_timeout",
     "verify_poll_interval",
+    "verify_max_rounds",
 )
 
 
