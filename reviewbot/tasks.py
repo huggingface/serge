@@ -41,6 +41,7 @@ from .reviewer import (
     _UnparseableLLMOutput,
 )
 from .slack_tool import post_task_pr_created_notification
+from .verify import VerifyOutcome, run_gpu_verify
 
 log = logging.getLogger(__name__)
 
@@ -610,6 +611,22 @@ def _failure_blocks(context: str) -> list[list[str]]:
     return blocks
 
 
+def _select_failure_block(req: TaskRequest, plan: TaskPlan) -> list[str]:
+    """The single failure block most relevant to the produced patch (scored by
+    word overlap with the patch/title/body). Shared by the PR-body decorator and
+    the GPU verify gate, so both target the same group's node-ids."""
+    blocks = _failure_blocks(req.context)
+    if not blocks:
+        return []
+    haystack = f"{plan.title}\n{plan.body}\n{plan.patch}".lower()
+
+    def _score(block: list[str]) -> int:
+        words = set(re.findall(r"[a-z0-9_]{5,}", "\n".join(block).lower()))
+        return sum(1 for word in words if word in haystack)
+
+    return max(blocks, key=_score)
+
+
 def _selected_failure_context(req: TaskRequest, plan: TaskPlan) -> str:
     heading = ""
     for line in req.context.splitlines():
@@ -617,17 +634,10 @@ def _selected_failure_context(req: TaskRequest, plan: TaskPlan) -> str:
             heading = line.removeprefix("## Serge candidate failure group ").strip()
             break
 
-    blocks = _failure_blocks(req.context)
-    if not blocks:
+    selected = _select_failure_block(req, plan)
+    if not selected:
         return ""
 
-    haystack = f"{plan.title}\n{plan.body}\n{plan.patch}".lower()
-
-    def _score(block: list[str]) -> int:
-        words = set(re.findall(r"[a-z0-9_]{5,}", "\n".join(block).lower()))
-        return sum(1 for word in words if word in haystack)
-
-    selected = max(blocks, key=_score)
     lines = ["## Original CI failure", ""]
     if heading:
         lines.append(f"- Failure group: `{heading}`")
@@ -657,6 +667,79 @@ def _decorate_body(cfg: Config, plan: TaskPlan, req: TaskRequest) -> str:
     return body
 
 
+def _verify_failure_message(outcome: VerifyOutcome) -> str:
+    """Human/next-run explanation when GPU verify does not confirm the fix."""
+    reasons = {
+        "not_fixed": "the patch did not turn the targeted tests green",
+        "already_passing": (
+            "a targeted test was NOT failing on the pre-patch baseline "
+            "(self-healed or flaky) — nothing to fix"
+        ),
+        "broke_others": "the patch broke other tests in the model's suite",
+        "error": "a targeted test could not be verified (missing/skipped/collection error)",
+        "no_targets": "no test node-ids were found in the failure group",
+        "dispatch_failed": "the GPU verify workflow could not be dispatched",
+        "timeout": "the GPU verify workflow did not finish in time",
+        "no_result": "the GPU verify workflow produced no result artifact",
+    }
+    reason = reasons.get(outcome.verdict, outcome.verdict)
+    lines = [
+        f"GPU verification did not confirm the fix (`{outcome.verdict}`): {reason}.",
+        "No PR was opened.",
+    ]
+    if outcome.run_url:
+        lines.append(f"Verify run: {outcome.run_url}")
+    if outcome.detail:
+        lines.append(outcome.detail)
+    for nodeid, tb in list(outcome.tracebacks.items())[:5]:
+        lines.append(f"\n### {nodeid}\n```\n{tb[-1500:]}\n```")
+    return "\n".join(lines)
+
+
+def _make_verify_gate(
+    cfg: Config,
+    gh: GitHubClient,
+    req: TaskRequest,
+    plan: TaskPlan,
+    job_id: str,
+    emit_fn: Callable[[str, str], None],
+) -> Optional[Callable[[str, str], "tuple[bool, str]"]]:
+    """Build the pre-PR GPU verify gate, or ``None`` when disabled/inapplicable.
+
+    Returns a callback ``(base_sha, candidate_sha) -> (open_pr, message)``: it
+    runs the targeted tests on GPU and only permits the PR when the verdict is
+    `fixed`. Only wired for ``new_pr`` (follow-up commits on an existing PR keep
+    the current behavior)."""
+    if not cfg.verify_on_gpu or req.mode != "new_pr":
+        return None
+    block = _select_failure_block(req, plan)
+
+    def _gate(base_sha: str, candidate_sha: str) -> tuple[bool, str]:
+        outcome = run_gpu_verify(
+            gh,
+            owner=req.owner,
+            repo=req.repo,
+            base_sha=base_sha,
+            commit_sha=candidate_sha,
+            block_lines=block,
+            correlation_id=job_id,
+            workflow_file=cfg.verify_workflow_file,
+            ref=cfg.verify_ref,
+            default_machine_type=cfg.verify_machine_type,
+            run_collateral=cfg.verify_run_collateral,
+            transformersci_ref=cfg.verify_transformersci_ref,
+            poll_timeout=cfg.verify_poll_timeout,
+            poll_interval=cfg.verify_poll_interval,
+            emit=emit_fn,
+        )
+        if outcome.is_fixed:
+            emit_fn("log", f"GPU verify: fixed ✓ ({outcome.run_url or 'run'})")
+            return True, ""
+        return False, _verify_failure_message(outcome)
+
+    return _gate
+
+
 def _commit_changes(
     cfg: Config,
     gh: GitHubClient,
@@ -667,6 +750,7 @@ def _commit_changes(
     body: str,
     job_id: str,
     emit_fn: Callable[[str, str], None],
+    verify: Optional[Callable[[str, str], "tuple[bool, str]"]] = None,
 ) -> TaskResult:
     """Commit a set of worktree changes via the Git Data API and open/update
     a PR. ``changes`` must be non-empty. Never pushes to a non-serge branch."""
@@ -719,6 +803,25 @@ def _commit_changes(
     )
     gh.create_ref(owner, repo, f"refs/heads/{branch}", commit_sha)
     emit_fn("log", f"Created branch {branch} at {commit_sha[:8]}")
+
+    # GPU verify gate (opt-in): run the targeted tests on the candidate before
+    # opening the PR. `parent_sha` is the baseline-red reference. On a non-`fixed`
+    # verdict, tear the branch down and return without a PR.
+    if verify is not None:
+        open_pr, message = verify(parent_sha, commit_sha)
+        if not open_pr:
+            try:
+                gh.delete_ref(owner, repo, f"heads/{branch}")
+            except Exception:  # noqa: BLE001 — cleanup is best-effort
+                emit_fn("log", f"Could not delete branch {branch} after failed verify")
+            emit_fn("log", "GPU verify did not confirm the fix; no PR opened.")
+            return TaskResult(
+                mode=req.mode,
+                no_change=True,
+                commit_sha=commit_sha,
+                message=message,
+            )
+
     # Open as a draft, then immediately mark ready-for-review. The
     # draft->ready transition is what fires the `ready_for_review` webhook that
     # reviewer-assignment workflows (e.g. transformers' assign-reviewers.yml)
@@ -846,4 +949,5 @@ def publish_task(
         body=_decorate_body(cfg, plan, req),
         job_id=job_id,
         emit_fn=_emit,
+        verify=_make_verify_gate(cfg, gh, req, plan, job_id, _emit),
     )
