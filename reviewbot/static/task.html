@@ -24,6 +24,11 @@
   </header>
   <main>
     <div id="error-banner"></div>
+    <section class="normalize-error" id="normalize-error" hidden>
+      <div class="normalize-error-title">Normalize failed</div>
+      <div class="normalize-error-meta" id="normalize-error-meta"></div>
+      <pre id="normalize-error-detail"></pre>
+    </section>
 
     <section class="card">
       <h2 style="margin-top:0;">Task</h2>
@@ -79,6 +84,59 @@
       return prefix + tail;
     }
 
+    function normalizeSummary(info) {
+      const trace = Array.isArray(info.trace) ? info.trace : [];
+      if (String(info.status || "") !== "error" || !trace.length) return null;
+
+      let lastStep = "";
+      let lastNormalizeAt = -1;
+      let validateLine = "";
+      let retryLine = "";
+      for (let i = 0; i < trace.length; i += 1) {
+        const ev = trace[i] || {};
+        const kind = ev.kind;
+        const text = displayText(ev.text || "");
+        if (kind === "step") {
+          lastStep = text;
+          if (text === "normalize") lastNormalizeAt = i;
+        }
+        if (lastNormalizeAt >= 0 && i >= lastNormalizeAt && kind === "log") {
+          if (text.startsWith("Validating the patch with ")) validateLine = text;
+          if (text.startsWith("Patch validation failed ")) retryLine = text;
+        }
+      }
+
+      const error = displayText(info.error || "");
+      const normalizeInTail =
+        /Validating the patch with|Patch validation failed|normalizer|normalize/i.test(error);
+      if (lastStep !== "normalize" && !validateLine && !normalizeInTail) return null;
+
+      const commandMatch = validateLine.match(/`([^`]+)`/);
+      const detail = [];
+      if (validateLine) detail.push(validateLine);
+      if (retryLine) detail.push(retryLine);
+      if (error) detail.push(error);
+
+      return {
+        meta: commandMatch
+          ? `The task errored while the normalizer command was active: ${commandMatch[1]}`
+          : "The task errored while normalize was the active step.",
+        detail: detail.join("\n\n"),
+      };
+    }
+
+    function renderNormalizeSummary(info) {
+      const panel = document.getElementById("normalize-error");
+      const summary = normalizeSummary(info);
+      if (!summary) {
+        panel.hidden = true;
+        return;
+      }
+      document.getElementById("normalize-error-meta").textContent = summary.meta;
+      document.getElementById("normalize-error-detail").textContent = summary.detail;
+      panel.hidden = false;
+    }
+
     async function loadInfo() {
       try {
         const r = await fetch(`${apiBase}/info`);
@@ -86,11 +144,12 @@
         const info = await r.json();
         setStatus(info.status);
         document.getElementById("instruction").textContent = info.instruction || "";
+        renderNormalizeSummary(info);
         if (info.error) {
           const shown = displayText(info.error);
           const b = document.getElementById("error-banner");
           b.textContent = shown;
-          b.className = "error";
+          b.className = "visible";
           b.style.whiteSpace = "pre-wrap";
           if (renderedErrorText !== shown) {
             renderedErrorText = shown;
@@ -175,7 +234,7 @@
           // a prominent banner as well as the console.
           const b = document.getElementById("error-banner");
           b.textContent = txt;
-          b.className = "error";
+          b.className = "visible";
           b.style.whiteSpace = "pre-wrap";
           renderedErrorText = txt;
         }

@@ -1057,6 +1057,29 @@ class TaskLauncherTests(unittest.TestCase):
         )
         self.assertEqual(job.status, "running")  # non-terminal
 
+    def test_task_info_includes_filtered_trace(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        job = self._make_job(webapp, status="error")
+        webapp._push_event(job, "step", "normalize")
+        webapp._push_event(job, "log", "Validating the patch with `make style`…")
+        webapp._push_event(job, "token", "noisy")
+        job.error = "task runner exited without reporting (exit code 1)"
+        client = TestClient(webapp.app)
+
+        r = client.get("/tasks/acme/widgets/job123abc456/info")
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertEqual(
+            [(e["kind"], e["text"]) for e in data["trace"]],
+            [
+                ("step", "normalize"),
+                ("log", "Validating the patch with `make style`…"),
+            ],
+        )
+
     def test_ingest_terminal_records_outcome(self):
         if TestClient is None:
             self.skipTest("fastapi not installed")
