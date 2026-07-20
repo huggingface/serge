@@ -92,6 +92,7 @@
       let lastNormalizeAt = -1;
       let validateLine = "";
       let retryLine = "";
+      let normalizeError = "";
       for (let i = 0; i < trace.length; i += 1) {
         const ev = trace[i] || {};
         const kind = ev.kind;
@@ -102,21 +103,30 @@
             lastNormalizeAt = i;
             validateLine = "";
             retryLine = "";
+            normalizeError = "";
           }
         }
         if (lastNormalizeAt >= 0 && i >= lastNormalizeAt && kind === "log") {
           if (text.startsWith("Validating the patch with ")) validateLine = text;
           if (text.startsWith("Patch validation failed ")) retryLine = text;
         }
+        if (lastNormalizeAt >= 0 && i >= lastNormalizeAt && kind === "normalize_error") {
+          normalizeError = text;
+        }
       }
 
       const error = displayText(info.error || "");
       const normalizeInTail =
         /Validating the patch with|Patch validation failed|normalizer|normalize/i.test(error);
-      if (lastStep !== "normalize" && !validateLine && !normalizeInTail) return null;
+      if (lastStep !== "normalize" && !validateLine && !normalizeError && !normalizeInTail) return null;
 
       const commandMatch = validateLine.match(/`([^`]+)`/);
       const detail = [];
+      if (normalizeError) {
+        const highlights = normalizeHighlights(normalizeError);
+        if (highlights) detail.push(`Likely error lines:\n${highlights}`);
+        detail.push(`Full normalizer log:\n${normalizeError}`);
+      }
       if (error) detail.push(error);
       if (validateLine) detail.push(validateLine);
       if (retryLine) detail.push(retryLine);
@@ -127,6 +137,29 @@
           : "The task errored while normalize was the active step.",
         detail: detail.join("\n\n"),
       };
+    }
+
+    function normalizeHighlights(text) {
+      const lines = String(text || "").split("\n");
+      const patterns = [
+        /\bFAILED\b/,
+        /\bERROR\b/,
+        /\bTraceback\b/,
+        /\b(?:AssertionError|RuntimeError|TypeError|ValueError|ImportError|ModuleNotFoundError)\b/,
+        /\b(?:failed|error|violation|would reformat|Found \d+|No such file)\b/i,
+      ];
+      const hits = [];
+      for (let i = 0; i < lines.length; i += 1) {
+        if (!patterns.some((p) => p.test(lines[i]))) continue;
+        const start = Math.max(0, i - 2);
+        const end = Math.min(lines.length, i + 3);
+        for (let j = start; j < end; j += 1) {
+          const line = `${j + 1}: ${lines[j]}`;
+          if (!hits.includes(line)) hits.push(line);
+        }
+        if (hits.length >= 80) break;
+      }
+      return hits.join("\n");
     }
 
     function renderNormalizeSummary(info) {
@@ -225,7 +258,7 @@
       if (!body && !calls) return `assistant: (thinking…)${metaStr}`;
       return `assistant:${body ? " " + body : ""}${calls}${metaStr}`;
     }
-    ["step", "tool", "error", "log", "chat"].forEach(kind => {
+    ["step", "tool", "error", "log", "chat", "normalize_error"].forEach(kind => {
       es.addEventListener(kind, (e) => {
         // The browser also fires a native "error" event (no .data) on a
         // dropped connection; ignore those here — es.onerror handles them.

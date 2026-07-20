@@ -1064,6 +1064,7 @@ class TaskLauncherTests(unittest.TestCase):
         job = self._make_job(webapp, status="error")
         webapp._push_event(job, "step", "normalize")
         webapp._push_event(job, "log", "Validating the patch with `make style`…")
+        webapp._push_event(job, "normalize_error", "Normalizer failed:\nactual error")
         webapp._push_event(job, "token", "noisy")
         job.error = "task runner exited without reporting (exit code 1)"
         client = TestClient(webapp.app)
@@ -1077,6 +1078,7 @@ class TaskLauncherTests(unittest.TestCase):
             [
                 ("step", "normalize"),
                 ("log", "Validating the patch with `make style`…"),
+                ("normalize_error", "Normalizer failed:\nactual error"),
             ],
         )
 

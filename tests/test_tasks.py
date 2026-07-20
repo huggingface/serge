@@ -725,11 +725,22 @@ class ValidatePatchTests(unittest.TestCase):
             task_normalize_command=["sh", "-c", "echo boom >&2; exit 3"],
             task_normalize_timeout=30,
         )
-        feedback, prepared = self._validate(cfg, self._content(self._PATCH))
+        events = []
+        feedback, prepared = _validate_patch(
+            cfg,
+            checkout=self.co,
+            clone_cache=self.cache,
+            content=self._content(self._PATCH),
+            emit=lambda kind, text: events.append((kind, text)),
+        )
         self.assertFalse(prepared)
         self.assertIsNotNone(feedback)
         self.assertIn("normalizer", feedback.lower())
         self.assertIn("boom", feedback)
+        normalize_errors = [text for kind, text in events if kind == "normalize_error"]
+        self.assertEqual(len(normalize_errors), 1)
+        self.assertIn("Normalizer failed (exit 3)", normalize_errors[0])
+        self.assertIn("boom", normalize_errors[0])
         # Guides the model toward root-cause fixes over suppressions.
         self.assertIn("ROOT CAUSE", feedback)
         self.assertIn("noqa", feedback)
