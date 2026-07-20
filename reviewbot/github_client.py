@@ -262,6 +262,87 @@ class GitHubClient:
             )
         return r.json()
 
+    def delete_ref(self, owner: str, repo: str, ref: str) -> None:
+        """Delete a ref. ``ref`` is the short form without ``refs/``, e.g.
+        ``heads/serge/fix-abc``. Used to tear down a candidate branch whose GPU
+        verification did not confirm the fix, so no dangling branch is left."""
+        r = self.session.delete(
+            f"https://api.github.com/repos/{owner}/{repo}/git/refs/{ref}",
+            timeout=30,
+        )
+        # 404 = already gone; treat as success so cleanup is idempotent.
+        if not r.ok and r.status_code != 404:
+            raise requests.HTTPError(
+                f"{r.status_code} deleting ref {ref} on {owner}/{repo}: {r.text}",
+                response=r,
+            )
+
+    # --- GitHub Actions (serge GPU verify loop) --------------------------------
+    # These require the serge GitHub App to be granted `Actions: read and write`.
+
+    def dispatch_workflow(
+        self,
+        owner: str,
+        repo: str,
+        workflow_file: str,
+        *,
+        ref: str,
+        inputs: dict[str, Any],
+    ) -> None:
+        """Trigger a ``workflow_dispatch``. ``workflow_file`` is the filename on
+        ``ref`` (e.g. ``serge-verify-caller.yml``). Returns 204 with no body and
+        no run id — correlate the resulting run via a ``run-name`` echoing a
+        unique input (see :func:`list_workflow_runs`)."""
+        r = self.session.post(
+            f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_file}/dispatches",
+            json={"ref": ref, "inputs": inputs},
+            timeout=30,
+        )
+        if not r.ok:
+            raise requests.HTTPError(
+                f"{r.status_code} dispatching {workflow_file} on {owner}/{repo}: {r.text}",
+                response=r,
+            )
+
+    def list_workflow_runs(
+        self,
+        owner: str,
+        repo: str,
+        workflow_file: str,
+        *,
+        event: Optional[str] = None,
+        per_page: int = 30,
+    ) -> list[dict]:
+        params: dict[str, Any] = {"per_page": per_page}
+        if event:
+            params["event"] = event
+        r = self.session.get(
+            f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_file}/runs",
+            params=params,
+            timeout=30,
+        )
+        r.raise_for_status()
+        return (r.json() or {}).get("workflow_runs", [])
+
+    def list_run_artifacts(self, owner: str, repo: str, run_id: int) -> list[dict]:
+        r = self.session.get(
+            f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
+            params={"per_page": 100},
+            timeout=30,
+        )
+        r.raise_for_status()
+        return (r.json() or {}).get("artifacts", [])
+
+    def download_artifact_zip(self, owner: str, repo: str, artifact_id: int) -> bytes:
+        """Download an artifact's zip. GitHub returns a 302 to a signed blob
+        URL; ``requests`` follows it and the zip bytes come back in ``.content``."""
+        r = self.session.get(
+            f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip",
+            timeout=120,
+        )
+        r.raise_for_status()
+        return r.content
+
     def create_pull_request(
         self,
         owner: str,

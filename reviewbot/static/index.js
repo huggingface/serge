@@ -149,13 +149,13 @@
     return hfModels;
   }
 
-  function populateModelSelect() {
+  function populateModelSelect(models) {
     // The text input stays the source of truth for the submitted value;
     // the dropdown mirrors it. Keep the current value selectable even if
-    // the router doesn't list it (e.g. a config default not yet live), so
-    // switching to HF never silently drops a configured model.
+    // the provider doesn't list it (e.g. a config default not yet live), so
+    // switching never silently drops a configured model.
     const current = modelEl.value.trim();
-    const options = [...(hfModels || [])];
+    const options = [...(models || [])];
     if (current && !options.includes(current)) options.unshift(current);
     modelSelectEl.replaceChildren();
     for (const m of options) {
@@ -172,24 +172,67 @@
     }
   }
 
-  // Show a dropdown of HF Router models when the HF provider is selected;
-  // every other provider keeps the free-text input. Falls back to the text
-  // input when the model list can't be fetched.
+  function showModelDropdown(models) {
+    populateModelSelect(models);
+    modelSelectEl.style.display = "";
+    modelEl.style.display = "none";
+    modelEl.required = false;
+  }
+
+  function showModelInput() {
+    modelSelectEl.style.display = "none";
+    modelEl.style.display = "";
+    modelEl.required = true;
+  }
+
+  // Models for the provider config that matches the entered repo, fetched
+  // server-side (the key never reaches the browser). Keyed by repo+provider so
+  // a stale list is never shown after either changes.
+  let repoModels = [];
+  let repoModelsSig = "";
+
+  function repoModelSig(parsed) {
+    return parsed
+      ? `${parsed.owner}/${parsed.repo}|${providerEl.value}`.toLowerCase()
+      : "";
+  }
+
+  async function ensureRepoModels(parsed) {
+    const sig = repoModelSig(parsed);
+    if (sig === repoModelsSig) return repoModels;
+    try {
+      const qs = new URLSearchParams({ owner: parsed.owner, repo: parsed.repo });
+      const r = await fetch(`/reviews/models?${qs}`);
+      const data = r.ok ? await r.json() : {};
+      repoModels = Array.isArray(data.models) ? data.models : [];
+    } catch {
+      repoModels = [];
+    }
+    repoModelsSig = sig;
+    return repoModels;
+  }
+
+  // HF has a public, tool-filtered catalogue and needs no repo/key, so it
+  // populates directly. Every other provider lists the matched config's models
+  // (fetched by ensureRepoModels once the repo resolves); until then — or when
+  // nothing matches / the fetch fails — it stays a free-text box.
   async function updateModelControl() {
     if (providerEl.value === "hf") {
       const models = await ensureHfModels();
       // Guard against the provider changing while the fetch was in flight.
       if (providerEl.value === "hf" && models.length) {
-        populateModelSelect();
-        modelSelectEl.style.display = "";
-        modelEl.style.display = "none";
-        modelEl.required = false;
+        showModelDropdown(models);
         return;
       }
+      showModelInput();
+      return;
     }
-    modelSelectEl.style.display = "none";
-    modelEl.style.display = "";
-    modelEl.required = true;
+    const parsed = parseOwnerRepo(prEl.value);
+    if (parsed && repoModelSig(parsed) === repoModelsSig && repoModels.length) {
+      showModelDropdown(repoModels);
+    } else {
+      showModelInput();
+    }
   }
 
   function ingestProviderDefaults(providers) {
@@ -344,6 +387,13 @@
         return;
       }
       applyMatchedConfig(data.match, parsed);
+      // For keyed providers, list the matched config's models server-side and
+      // upgrade the free-text box to a dropdown. HF already populated from its
+      // public catalogue inside applyMatchedConfig → updateModelControl.
+      if (providerEl.value !== "hf") {
+        await ensureRepoModels(parsed);
+        await updateModelControl();
+      }
     } catch {
       // Non-fatal — the user can still submit; the server will reject
       // with the same message if no config matches.

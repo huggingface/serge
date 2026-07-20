@@ -75,6 +75,43 @@ class ChatCompletionClientTests(unittest.TestCase):
         self.assertEqual(first_payload["model"], "auto-model")
         self.assertEqual(second_payload["model"], "auto-model")
 
+    def test_list_models_returns_sorted_unique_ids(self) -> None:
+        with patch("reviewbot.llm_client.requests.get") as mock_get:
+            mock_get.return_value = Mock(
+                ok=True,
+                status_code=200,
+                json=Mock(
+                    return_value={
+                        "data": [
+                            {"id": "gpt-4o"},
+                            {"id": "GPT-3.5"},
+                            {"id": "gpt-4o"},  # duplicate, collapsed
+                            {"no_id": True},  # skipped — no id
+                            "not-a-dict",  # skipped — not an object
+                        ]
+                    }
+                ),
+            )
+            client = ChatCompletionClient("https://api.example.com", "token")
+            models = client.list_models()
+
+        self.assertEqual(models, ["GPT-3.5", "gpt-4o"])
+        mock_get.assert_called_once_with(
+            "https://api.example.com/v1/models",
+            headers={
+                "Authorization": "Bearer token",
+                "Content-Type": "application/json",
+            },
+            timeout=15,
+        )
+
+    def test_list_models_raises_on_non_ok(self) -> None:
+        with patch("reviewbot.llm_client.requests.get") as mock_get:
+            mock_get.return_value = Mock(ok=False, status_code=401)
+            client = ChatCompletionClient("https://api.example.com/v1", "bad")
+            with self.assertRaises(RuntimeError):
+                client.list_models()
+
     def test_complete_adds_v1_when_base_is_unversioned(self) -> None:
         with (
             patch("reviewbot.llm_client.requests.get") as mock_get,
