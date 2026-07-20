@@ -98,7 +98,11 @@
         const text = displayText(ev.text || "");
         if (kind === "step") {
           lastStep = text;
-          if (text === "normalize") lastNormalizeAt = i;
+          if (text === "normalize") {
+            lastNormalizeAt = i;
+            validateLine = "";
+            retryLine = "";
+          }
         }
         if (lastNormalizeAt >= 0 && i >= lastNormalizeAt && kind === "log") {
           if (text.startsWith("Validating the patch with ")) validateLine = text;
@@ -113,13 +117,13 @@
 
       const commandMatch = validateLine.match(/`([^`]+)`/);
       const detail = [];
+      if (error) detail.push(error);
       if (validateLine) detail.push(validateLine);
       if (retryLine) detail.push(retryLine);
-      if (error) detail.push(error);
 
       return {
         meta: commandMatch
-          ? `The task errored while the normalizer command was active: ${commandMatch[1]}`
+          ? `The task runner exited while this normalizer command was active: ${commandMatch[1]}`
           : "The task errored while normalize was the active step.",
         detail: detail.join("\n\n"),
       };
