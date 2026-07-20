@@ -10,6 +10,9 @@
   const apiKeyHint = document.getElementById("api-key-hint");
   const defaultModelEl = document.getElementById("default_model");
   const defaultModelSelectEl = document.getElementById("default-model-select");
+  const loadModelsRow = document.getElementById("load-models-row");
+  const loadModelsBtn = document.getElementById("load-models-btn");
+  const loadModelsHint = document.getElementById("load-models-hint");
   const repoPatternEl = document.getElementById("repo_pattern");
   const allowedUsersEl = document.getElementById("allowed_users");
   const allowedOrgsEl = document.getElementById("allowed_orgs");
@@ -54,8 +57,18 @@
   }
 
   // HF Router model catalogue, lazily fetched once and cached. null until
-  // loaded; [] when unreachable (we then keep the free-text input).
+  // loaded; [] when unreachable (we then keep the free-text input). HF is a
+  // public catalogue; the keyed providers (openai/anthropic/custom) need a
+  // token, so their models are fetched on demand via "Load models" below and
+  // held in keyedModels, keyed by a provider+base signature so switching
+  // provider or base doesn't show a stale list.
   let hfModels = null;
+  let keyedModels = [];
+  let keyedModelsSig = "";
+
+  function providerSig() {
+    return `${providerEl.value}|${apiBaseEl.value.trim()}`;
+  }
 
   async function ensureHfModels() {
     if (hfModels !== null) return hfModels;
@@ -69,20 +82,20 @@
     return hfModels;
   }
 
-  function populateModelSelect() {
+  function populateModelSelect(models) {
     // The text input stays the source of truth; the dropdown mirrors it.
     // A leading blank option keeps "no default" expressible (the submit
     // form's model then wins). Preserve any current value even if the
-    // router doesn't list it.
+    // provider doesn't list it.
     const current = defaultModelEl.value.trim();
-    const models = [...(hfModels || [])];
-    if (current && !models.includes(current)) models.unshift(current);
+    const list = [...(models || [])];
+    if (current && !list.includes(current)) list.unshift(current);
     defaultModelSelectEl.replaceChildren();
     const blank = document.createElement("option");
     blank.value = "";
     blank.textContent = "— none (use submit-form model) —";
     defaultModelSelectEl.appendChild(blank);
-    for (const m of models) {
+    for (const m of list) {
       const opt = document.createElement("option");
       opt.value = m;
       opt.textContent = m;
@@ -91,21 +104,93 @@
     defaultModelSelectEl.value = current;
   }
 
-  // Show a dropdown of HF Router models when the HF provider is selected;
-  // other providers keep the free-text input. Falls back to the text input
-  // when the model list can't be fetched.
-  async function updateModelControl() {
-    if (providerEl.value === "hf") {
-      const models = await ensureHfModels();
-      if (providerEl.value === "hf" && models.length) {
-        populateModelSelect();
-        defaultModelSelectEl.style.display = "";
-        defaultModelEl.style.display = "none";
-        return;
-      }
-    }
+  function showDropdown(models) {
+    populateModelSelect(models);
+    defaultModelSelectEl.style.display = "";
+    defaultModelEl.style.display = "none";
+  }
+
+  function showFreeText() {
     defaultModelSelectEl.style.display = "none";
     defaultModelEl.style.display = "";
+  }
+
+  // HF auto-populates from its public catalogue. Keyed providers show the
+  // free-text input plus a "Load models" button, upgrading to a dropdown once
+  // a non-empty list has been fetched for the current provider/base.
+  async function updateModelControl() {
+    if (providerEl.value === "hf") {
+      loadModelsRow.style.display = "none";
+      loadModelsHint.textContent = "";
+      const models = await ensureHfModels();
+      if (providerEl.value === "hf" && models.length) {
+        showDropdown(models);
+        return;
+      }
+      showFreeText();
+      return;
+    }
+    loadModelsRow.style.display = "";
+    if (keyedModelsSig === providerSig() && keyedModels.length) {
+      showDropdown(keyedModels);
+    } else {
+      showFreeText();
+    }
+  }
+
+  // Fetch the selected keyed provider's models with the typed key (or, when
+  // editing and the key field is blank, the stored key server-side). On
+  // success we swap to the dropdown; on any failure we keep the free-text box
+  // and show the provider's own error as a hint.
+  async function loadModels() {
+    const provider = providerEl.value;
+    if (provider === "hf") return;
+    const apiKey = apiKeyEl.value.trim();
+    if (!apiKey && !editing) {
+      loadModelsHint.textContent = "Enter an API key first.";
+      return;
+    }
+    if (provider === "custom" && !apiBaseEl.value.trim()) {
+      loadModelsHint.textContent = "Enter a base URL first.";
+      return;
+    }
+    loadModelsBtn.disabled = true;
+    const prev = loadModelsBtn.textContent;
+    loadModelsBtn.textContent = "Loading…";
+    loadModelsHint.textContent = "";
+    try {
+      const body = { provider, api_base: apiBaseEl.value.trim() };
+      if (apiKey) body.api_key = apiKey;
+      if (editing) body.config_id = editing;
+      const r = await fetch("/admin/providers/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        loadModelsHint.textContent = await errorMessage(r);
+        return;
+      }
+      const data = await r.json();
+      if (!data.ok) {
+        loadModelsHint.textContent = data.error || "Could not list models.";
+        return;
+      }
+      keyedModels = Array.isArray(data.models) ? data.models : [];
+      keyedModelsSig = providerSig();
+      if (keyedModels.length) {
+        showDropdown(keyedModels);
+        loadModelsHint.textContent = `${keyedModels.length} models.`;
+      } else {
+        showFreeText();
+        loadModelsHint.textContent = "No models returned; type the name.";
+      }
+    } catch (err) {
+      loadModelsHint.textContent = err.message;
+    } finally {
+      loadModelsBtn.disabled = false;
+      loadModelsBtn.textContent = prev;
+    }
   }
 
   function resetForm() {
@@ -388,6 +473,8 @@
   defaultModelSelectEl.addEventListener("change", () => {
     defaultModelEl.value = defaultModelSelectEl.value;
   });
+
+  loadModelsBtn.addEventListener("click", loadModels);
 
   resetForm();
   loadConfigs();

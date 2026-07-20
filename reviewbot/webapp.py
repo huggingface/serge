@@ -2538,6 +2538,50 @@ def lookup_provider(request: Request, owner: str, repo: str) -> JSONResponse:
     return final
 
 
+@app.get("/reviews/models")
+def review_models(request: Request, owner: str, repo: str) -> JSONResponse:
+    """Model ids available for the provider config that matches (owner, repo),
+    for the submit form's Model dropdown. Mirrors ``lookup-provider``'s match +
+    authorization exactly, then lists models with the matched config's stored
+    key server-side — the key never reaches the browser. HF has its own public
+    catalogue (``/llm-options/hf-models``); this covers the keyed providers,
+    whose key is only knowable once the repo (hence its config) is resolved.
+
+    Always HTTP 200: ``{models: [...]}`` on success, ``{models: [], error?}``
+    when nothing matches or the provider's ``/models`` route fails — the form
+    then keeps the free-text box."""
+    user = _require_user(request)
+    if not _GH_NAME_RE.match(owner) or not _GH_NAME_RE.match(repo):
+        raise HTTPException(status_code=400, detail="bad_repo")
+    # _effective_user_orgs_for_repo may mint a refreshed session cookie; carry
+    # it onto whatever response we ultimately return, as lookup-provider does.
+    placeholder = JSONResponse({"models": []})
+    user_orgs = _effective_user_orgs_for_repo(request, placeholder, user, owner, repo)
+    matched = _store.find_provider_config(
+        user=user, user_orgs=user_orgs, owner=owner, repo=repo
+    )
+    if matched is None:
+        return placeholder
+    provider = matched["provider"]
+    body: dict[str, Any] = {"models": []}
+    try:
+        api_base = _api_base_for_provider(provider, custom_base=matched.get("api_base"))
+        bill_to = _llm_bill_to_for_provider(provider)
+        client = ChatCompletionClient(
+            api_base, matched["api_key"], bill_to=bill_to, stream=False
+        )
+        body["models"] = client.list_models()
+    except HTTPException:
+        body["error"] = "provider base URL is not configured"
+    except Exception as exc:  # noqa: BLE001 — a bad token / no-/models route is a hint
+        body["error"] = f"{type(exc).__name__}: {exc}"
+    resp = JSONResponse(body)
+    cookie = placeholder.headers.get("set-cookie")
+    if cookie:
+        resp.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
+    return resp
+
+
 @app.get("/admin")
 def admin_page(request: Request) -> Response:
     if not _current_user(request):
@@ -2747,6 +2791,52 @@ def admin_delete_provider(request: Request, config_id: str) -> JSONResponse:
         raise HTTPException(status_code=404, detail="config_not_found")
     log.info("user %s deleted provider config %s", user, config_id)
     return JSONResponse({"status": "deleted"})
+
+
+@app.post("/admin/providers/models")
+async def admin_list_provider_models(request: Request) -> JSONResponse:
+    """List the model ids a keyed provider's ``/models`` route advertises, for
+    the admin form's default-model dropdown — the OpenAI/Anthropic/custom analog
+    of the public HF catalogue (``/llm-options/hf-models``).
+
+    Uses the ``api_key`` from the request body (the config being created, or an
+    edit that typed a new key); when omitted, falls back to the stored key of
+    the ``config_id`` being edited. Always HTTP 200 — ``ok`` is the verdict; a
+    bad token or an endpoint with no ``/models`` route is an expected outcome
+    the form shows as a hint before falling back to the free-text box, not a
+    server error."""
+    _require_same_origin(request)
+    user = _require_user(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid_json_body")
+    provider = (payload.get("provider") or "").strip().lower()
+    if provider not in _VALID_PROVIDERS:
+        raise HTTPException(status_code=400, detail="bad_provider")
+    api_key = (payload.get("api_key") or "").strip()
+    if not api_key:
+        # No key typed — reuse the stored key of the config being edited.
+        config_id = (payload.get("config_id") or "").strip()
+        if config_id:
+            row = _store.get_provider_config(config_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail="config_not_found")
+            api_key = row["api_key"]
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key_required")
+    api_base = _api_base_for_provider(
+        provider, custom_base=(payload.get("api_base") or "").strip() or None
+    )
+    bill_to = _llm_bill_to_for_provider(provider)
+    client = ChatCompletionClient(api_base, api_key, bill_to=bill_to, stream=False)
+    log.info("user %s listing models for provider %s", user, provider)
+    try:
+        models = await asyncio.to_thread(client.list_models)
+    except Exception as exc:  # noqa: BLE001 — surface the provider's own message
+        return JSONResponse(
+            {"ok": False, "error": f"{type(exc).__name__}: {exc}", "models": []}
+        )
+    return JSONResponse({"ok": True, "models": models})
 
 
 @app.post("/admin/providers/{config_id}/test")
