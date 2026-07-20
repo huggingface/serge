@@ -396,8 +396,8 @@ class WebappTasksTests(unittest.TestCase):
             source="task",
             kind="task",
         )
-        # prepare_task/publish_task are both stubbed, so the plan value is never
-        # inspected — any sentinel works.
+        # The per-candidate prepare+publish (incl. any GPU verify retry loop) is
+        # stubbed to return the given result, so we only assert status mapping.
         with (
             patch.object(webapp, "installation_id_for_repo", return_value=1),
             patch.object(webapp, "installation_token", return_value="tok"),
@@ -409,8 +409,9 @@ class WebappTasksTests(unittest.TestCase):
             ),
             patch.object(webapp._clone_cache, "release"),
             patch.object(webapp, "_persist_terminal"),
-            patch.object(webapp, "prepare_task", return_value=object()),
-            patch.object(webapp, "publish_task", return_value=task_result),
+            patch.object(
+                webapp, "prepare_and_publish_candidate", return_value=task_result
+            ),
         ):
             webapp._run_task_worker(job, worker_cfg, req)
         return job

@@ -256,6 +256,27 @@ class Config:
     # serge keeps the proxy's allowlist in sync with the configured LLM
     # provider hosts (see webapp._sync_egress_allowlist). "" = never touch it.
     task_egress_name: Optional[str] = None
+    # --- GPU verify loop (opt-in) ------------------------------------------
+    # When enabled, a new_pr task runs its targeted @slow tests on GPU (via the
+    # serge-verify-caller.yml workflow_dispatch in the target repo) after the
+    # candidate branch/commit is created but BEFORE the PR is opened, and only
+    # opens the PR when the verdict is `fixed`. Default off = unchanged behavior.
+    # Requires the serge GitHub App to be granted `Actions: read and write`.
+    verify_on_gpu: bool = False
+    verify_workflow_file: str = "serge-verify-caller.yml"
+    # Ref the caller workflow lives on (its file must exist here to dispatch).
+    verify_ref: str = "main"
+    # transformers-ci ref the workflow installs the verdict tool from.
+    verify_transformersci_ref: str = "main"
+    # Also run the full tests/models/<model> slow suite on both trees.
+    verify_run_collateral: bool = False
+    # Runner group used when the failure group carries no [single|multi-gpu] tag.
+    verify_machine_type: str = "aws-g5-12xlarge-cache"
+    verify_poll_timeout: int = 2400
+    verify_poll_interval: int = 30
+    # Extra LLM rounds after the first when GPU verify says the patch didn't fix
+    # the tests: re-prompt with the fresh tracebacks. 0 = verify once, no retry.
+    verify_max_rounds: int = 2
     # Optional Slack notification for PRs created by the /tasks flow.
     # Defaults to the org-level CI feedback Slack secrets; the transformers CI
     # names remain supported as fallbacks.
@@ -503,6 +524,21 @@ class Config:
             ).strip()
             or None,
             task_egress_name=(os.environ.get("TASK_EGRESS_NAME") or "").strip() or None,
+            verify_on_gpu=_bool_env("VERIFY_ON_GPU", False),
+            verify_workflow_file=(
+                os.environ.get("VERIFY_WORKFLOW_FILE") or "serge-verify-caller.yml"
+            ).strip(),
+            verify_ref=(os.environ.get("VERIFY_REF") or "main").strip(),
+            verify_transformersci_ref=(
+                os.environ.get("VERIFY_TRANSFORMERSCI_REF") or "main"
+            ).strip(),
+            verify_run_collateral=_bool_env("VERIFY_RUN_COLLATERAL", False),
+            verify_machine_type=(
+                os.environ.get("VERIFY_MACHINE_TYPE") or "aws-g5-12xlarge-cache"
+            ).strip(),
+            verify_poll_timeout=_int_env("VERIFY_POLL_TIMEOUT", 2400),
+            verify_poll_interval=_int_env("VERIFY_POLL_INTERVAL", 30),
+            verify_max_rounds=_int_env("VERIFY_MAX_ROUNDS", 2),
             slack_bot_token=(
                 os.environ.get("SLACK_CIFEEDBACK_BOT_TOKEN")
                 or os.environ.get("CI_SLACK_BOT_TOKEN")
