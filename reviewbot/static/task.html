@@ -47,6 +47,7 @@
     const consoleEl = document.getElementById("console");
     const statusEl = document.getElementById("status");
     const targetEl = document.getElementById("target");
+    let renderedErrorText = null;
     targetEl.textContent = `${owner}/${repo}`;
 
     function append(line) {
@@ -54,18 +55,47 @@
       consoleEl.scrollTop = consoleEl.scrollHeight;
     }
 
+    function setStatus(status) {
+      const value = String(status || "running");
+      statusEl.textContent = value;
+      statusEl.className = `status-badge ${value.replace(/[^a-z0-9_-]/gi, "-").toLowerCase()}`;
+    }
+
+    function displayText(text) {
+      let s = String(text || "");
+      const marker = "\n--- runner log tail ---\n";
+      const idx = s.indexOf(marker + "b'");
+      if (idx < 0) return s;
+      const prefix = s.slice(0, idx + marker.length);
+      let tail = s.slice(idx + marker.length);
+      if (tail.startsWith("b'") && tail.endsWith("'")) {
+        tail = tail.slice(2, -1);
+      }
+      tail = tail
+        .replace(/\\n/g, "\n")
+        .replace(/\\t/g, "\t")
+        .replace(/\\'/g, "'")
+        .replace(/\\\\/g, "\\");
+      return prefix + tail;
+    }
+
     async function loadInfo() {
       try {
         const r = await fetch(`${apiBase}/info`);
         if (!r.ok) return;
         const info = await r.json();
-        statusEl.textContent = info.status;
+        setStatus(info.status);
         document.getElementById("instruction").textContent = info.instruction || "";
         if (info.error) {
+          const shown = displayText(info.error);
           const b = document.getElementById("error-banner");
-          b.textContent = info.error;
+          b.textContent = shown;
           b.className = "error";
           b.style.whiteSpace = "pre-wrap";
+          if (renderedErrorText !== shown) {
+            renderedErrorText = shown;
+            append(`[error] ${shown}`);
+          }
         }
         if (info.result) {
           const res = info.result;
@@ -140,12 +170,14 @@
         let txt;
         try { txt = JSON.parse(e.data); } catch { txt = e.data; }
         if (kind === "error") {
+          txt = displayText(txt);
           // Surface the full server-side error (incl. multi-line hints) in
           // a prominent banner as well as the console.
           const b = document.getElementById("error-banner");
           b.textContent = txt;
           b.className = "error";
           b.style.whiteSpace = "pre-wrap";
+          renderedErrorText = txt;
         }
         if (kind === "chat") { append(`💬 ${fmtMessage(txt)}`); return; }
         append(kind === "log" ? txt : `[${kind}] ${txt}`);

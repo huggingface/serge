@@ -93,12 +93,30 @@ def main():
     parser.add_argument("--since", default="2h", help="Log window, e.g. 30m, 2h")
     parser.add_argument("-f", "--follow", action="store_true", help="Follow logs")
     parser.add_argument("--grep", dest="grep_pattern", help="Filter logs with grep -Ei semantics")
+    parser.add_argument(
+        "--task-id",
+        help=(
+            "Filter to one task id. Useful for /tasks investigations; shows "
+            "queue/finalizer/watcher lines and hides high-volume HTTP access logs."
+        ),
+    )
+    parser.add_argument(
+        "--task-http",
+        action="store_true",
+        help="With --task-id, include high-volume HTTP callback/status access logs.",
+    )
     parser.add_argument("--last-error", action="store_true", help="Print the last ERROR/Traceback block")
     parser.add_argument("--context", dest="expected_context", help="Required kubectl context")
     args = parser.parse_args()
 
     if args.last_error and args.follow:
         print("--last-error cannot be combined with --follow", file=sys.stderr)
+        return 2
+    if args.task_http and not args.task_id:
+        print("--task-http requires --task-id", file=sys.stderr)
+        return 2
+    if args.task_id and args.grep_pattern:
+        print("--task-id cannot be combined with --grep", file=sys.stderr)
         return 2
 
     if shutil.which("kubectl") is None:
@@ -169,6 +187,16 @@ def main():
     log_args = ["kubectl", "logs", "-n", args.namespace, pod, f"--since={args.since}"]
     if args.follow:
         log_args.append("-f")
+
+    if args.task_id:
+        escaped = re.escape(args.task_id)
+        if args.task_http:
+            args.grep_pattern = (
+                f"{escaped}|task .*{escaped}|/internal/tasks/{escaped}|"
+                f"/tasks/[^ ]*/{escaped}"
+            )
+        else:
+            args.grep_pattern = f"^[0-9].*(task .*{escaped}|{escaped}.*task)"
 
     if args.last_error:
         return latest_error_block(log_args, pod, pod_started, args.since)

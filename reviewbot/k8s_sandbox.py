@@ -309,6 +309,8 @@ def _collect_pod_result(core, namespace: str, job_name: str) -> tuple[int, str]:
         # Logs are best-effort; the exit code is what gates the patch.
         log.warning("could not read normalize pod logs: %s", exc.reason or exc)
         logs = ""
+    if isinstance(logs, bytes):
+        logs = logs.decode("utf-8", errors="replace")
     tail = "\n".join((logs or "").splitlines()[-40:])
     return exit_code, tail
 
