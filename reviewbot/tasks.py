@@ -698,7 +698,7 @@ def _verify_failure_message(outcome: VerifyOutcome) -> str:
     if outcome.detail:
         lines.append(outcome.detail)
     for nodeid, tb in list(outcome.tracebacks.items())[:5]:
-        lines.append(f"\n### {nodeid}\n```\n{tb[-1500:]}\n```")
+ lines.append(f"\n### {nodeid}\n```\n{(tb or '')[-1500:]}\n```")
     return "\n".join(lines)
 
 
