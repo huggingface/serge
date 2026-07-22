@@ -3691,6 +3691,12 @@ def task_page(request: Request, owner: str, repo: str, job_id: str) -> Response:
 @app.get("/tasks/{owner}/{repo}/{job_id}/info")
 def task_info(request: Request, owner: str, repo: str, job_id: str) -> JSONResponse:
     job = _get_task_job(request, owner, repo, job_id)
+    with job.history_lock:
+        trace = [
+            {"kind": e.get("kind"), "text": e.get("text"), "ts": e.get("ts")}
+            for e in job.history
+            if e.get("kind") not in _NOISY_KINDS
+        ]
     return JSONResponse(
         {
             "id": job.id,
@@ -3704,6 +3710,7 @@ def task_info(request: Request, owner: str, repo: str, job_id: str) -> JSONRespo
             "llm_base_url": job.llm_api_base,
             "llm_model": job.llm_model or "",
             "error": job.error,
+            "trace": trace,
         }
     )
 

@@ -63,7 +63,7 @@ def run_normalize(
 ) -> tuple[int, str]:
     """Run ``command`` against the worktree in the selected sandbox backend.
 
-    Returns ``(returncode, output_tail)``. Does not stage or commit — the
+    Returns ``(returncode, output)``. Does not stage or commit — the
     caller stages the worktree afterwards and collects the combined diff.
 
     ``backend`` is ``bwrap`` | ``docker`` | ``auto`` — all run as a local
@@ -127,5 +127,4 @@ def _run_subprocess(
         raise NormalizeError(f"could not launch normalize command: {exc}") from exc
 
     output = (proc.stdout or "") + (proc.stderr or "")
-    tail = "\n".join(output.splitlines()[-40:])
-    return proc.returncode, tail
+    return proc.returncode, output.rstrip()

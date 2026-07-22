@@ -238,6 +238,26 @@ class RunTaskJobTests(unittest.TestCase):
         self.assertTrue(batch.delete_namespaced_job.called)
         self.assertTrue(core.delete_namespaced_secret.called)
 
+    def test_decodes_byte_pod_logs(self):
+        done = types.SimpleNamespace(succeeded=1, failed=None, conditions=None)
+        batch, core = self._clients(
+            statuses=[done],
+            pod=_pod_with(1),
+            log_text=b"line one\nline two\n",
+        )
+        with mock.patch.object(
+            k8s_sandbox, "_load_clients", return_value=(batch, core)
+        ):
+            rc, tail = k8s_sandbox.run_task_job(
+                {"job_id": "j1", "github_token": "tok"},
+                image="serge/runner:latest",
+                settings=K8sSettings(namespace="serge"),
+                timeout=30,
+                poll_interval=0.0,
+            )
+        self.assertEqual(rc, 1)
+        self.assertEqual(tail, "line one\nline two")
+
     def test_secret_create_failure_deletes_job(self):
         done = types.SimpleNamespace(succeeded=1, failed=None, conditions=None)
         batch, core = self._clients(statuses=[done], pod=_pod_with(0))

@@ -108,6 +108,7 @@ PERSIST_EVENT_KINDS = frozenset(
         "done",
         "metrics",
         "chat",
+        "normalize_error",
     }
 )
 
