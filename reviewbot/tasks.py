@@ -45,6 +45,8 @@ from .verify import VerifyOutcome, run_gpu_verify, should_retry
 
 log = logging.getLogger(__name__)
 
+_NORMALIZE_FEEDBACK_CHARS = 80_000
+
 # Serge only ever writes inside its own branch namespace. ``existing_pr``
 # mode is rejected for any head branch outside it, so the OIDC
 # ``repository`` claim cannot be leveraged to push to an arbitrary PR.
@@ -332,7 +334,7 @@ def _run_repo_normalizer(
     the current worktree with its fixers enabled, writing any regenerated files
     (e.g. transformers' ``modeling_*.py`` from ``modular_*.py``) back in place.
 
-    Returns ``(returncode, tail)``. ``returncode`` is ``None`` when the
+    Returns ``(returncode, output)``. ``returncode`` is ``None`` when the
     normalizer could not run at all (sandbox unavailable / timeout / launch
     failure) — infrastructure, not the patch's fault, which callers treat as a
     best-effort pass. Assumes ``cfg.task_normalize_command`` is set."""
@@ -412,7 +414,7 @@ def _validate_patch(
             False,
         )
 
-    returncode, tail = _run_repo_normalizer(cfg, checkout, emit)
+    returncode, output = _run_repo_normalizer(cfg, checkout, emit)
     if returncode is None:
         # Normalizer could not run (infra) — accept the applied patch
         # best-effort rather than blaming the LLM.
@@ -421,9 +423,14 @@ def _validate_patch(
     if returncode != 0:
         clone_cache.reset_worktree(checkout)
         cmd = " ".join(command)
+        feedback_output = _bounded_normalize_feedback(output)
+        emit(
+            "normalize_error",
+            f"Normalizer failed (exit {returncode}) for `{cmd}`:\n{output}",
+        )
         msg = (
             f"Your patch applied cleanly, but the repository's normalizer "
-            f"(`{cmd}`) then failed (exit {returncode}):\n\n{tail}\n\n"
+            f"(`{cmd}`) then failed (exit {returncode}):\n\n{feedback_output}\n\n"
             "Revise the patch so the normalizer passes. Fix the ROOT CAUSE — "
             "suppress a check (`# noqa`, `# type: ignore`, disabling a rule) "
             "only as a last resort, for a deliberate and justified exception, "
@@ -438,6 +445,20 @@ def _validate_patch(
 
     emit("log", "Patch validated; normalizer is clean.")
     return None, True
+
+
+def _bounded_normalize_feedback(output: str) -> str:
+    """Bound normalize feedback sent back into the LLM conversation."""
+    if len(output) <= _NORMALIZE_FEEDBACK_CHARS:
+        return output
+    head = _NORMALIZE_FEEDBACK_CHARS // 2
+    tail = _NORMALIZE_FEEDBACK_CHARS - head
+    omitted = len(output) - _NORMALIZE_FEEDBACK_CHARS
+    return (
+        output[:head].rstrip()
+        + f"\n\n--- omitted {omitted} chars of normalize output from LLM feedback ---\n\n"
+        + output[-tail:].lstrip()
+    ).rstrip()
 
 
 def _read_repo_conventions(cfg: Config, checkout: Checkout) -> str:
@@ -698,7 +719,7 @@ def _verify_failure_message(outcome: VerifyOutcome) -> str:
     if outcome.detail:
         lines.append(outcome.detail)
     for nodeid, tb in list(outcome.tracebacks.items())[:5]:
- lines.append(f"\n### {nodeid}\n```\n{(tb or '')[-1500:]}\n```")
+        lines.append(f"\n### {nodeid}\n```\n{(tb or '')[-1500:]}\n```")
     return "\n".join(lines)
 
 
@@ -960,9 +981,14 @@ def publish_task(
         # regenerated files ride along in the commit, and refuse rather than open
         # a PR the repo's own consistency CI would immediately reject.
         if cfg.task_normalize_command:
-            returncode, tail = _run_repo_normalizer(cfg, checkout, _emit)
+            returncode, output = _run_repo_normalizer(cfg, checkout, _emit)
             if returncode not in (None, 0):
                 clone_cache.reset_worktree(checkout)
+                cmd = " ".join(cfg.task_normalize_command)
+                _emit(
+                    "normalize_error",
+                    f"Normalizer failed (exit {returncode}) for `{cmd}`:\n{output}",
+                )
                 _emit("log", "Normalizer rejected the patch; not opening a PR.")
                 return TaskResult(
                     mode=req.mode,
@@ -971,7 +997,7 @@ def publish_task(
                         "The proposed patch does not pass the repository's "
                         f"normalizer (exit {returncode}), so no PR was opened — "
                         "the in-loop correction budget was exhausted before a "
-                        f"clean patch was found:\n\n{tail}"
+                        f"clean patch was found:\n\n{output}"
                     ),
                 )
 

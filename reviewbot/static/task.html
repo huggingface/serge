@@ -24,6 +24,11 @@
   </header>
   <main>
     <div id="error-banner"></div>
+    <section class="normalize-error" id="normalize-error" hidden>
+      <div class="normalize-error-title">Normalize failed</div>
+      <div class="normalize-error-meta" id="normalize-error-meta"></div>
+      <pre id="normalize-error-detail"></pre>
+    </section>
 
     <section class="card">
       <h2 style="margin-top:0;">Task</h2>
@@ -47,6 +52,7 @@
     const consoleEl = document.getElementById("console");
     const statusEl = document.getElementById("status");
     const targetEl = document.getElementById("target");
+    let renderedErrorText = null;
     targetEl.textContent = `${owner}/${repo}`;
 
     function append(line) {
@@ -54,18 +60,138 @@
       consoleEl.scrollTop = consoleEl.scrollHeight;
     }
 
+    function setStatus(status) {
+      const value = String(status || "running");
+      statusEl.textContent = value;
+      statusEl.className = `status-badge ${value.replace(/[^a-z0-9_-]/gi, "-").toLowerCase()}`;
+    }
+
+    function displayText(text) {
+      let s = String(text || "");
+      const marker = "\n--- runner log tail ---\n";
+      const idx = s.indexOf(marker + "b'");
+      if (idx < 0) return s;
+      const prefix = s.slice(0, idx + marker.length);
+      let tail = s.slice(idx + marker.length);
+      if (tail.startsWith("b'") && tail.endsWith("'")) {
+        tail = tail.slice(2, -1);
+      }
+      tail = tail
+        .replace(/\\n/g, "\n")
+        .replace(/\\t/g, "\t")
+        .replace(/\\'/g, "'")
+        .replace(/\\\\/g, "\\");
+      return prefix + tail;
+    }
+
+    function normalizeSummary(info) {
+      const trace = Array.isArray(info.trace) ? info.trace : [];
+      if (String(info.status || "") !== "error" || !trace.length) return null;
+
+      let lastStep = "";
+      let lastNormalizeAt = -1;
+      let validateLine = "";
+      let retryLine = "";
+      let normalizeError = "";
+      for (let i = 0; i < trace.length; i += 1) {
+        const ev = trace[i] || {};
+        const kind = ev.kind;
+        const text = displayText(ev.text || "");
+        if (kind === "step") {
+          lastStep = text;
+          if (text === "normalize") {
+            lastNormalizeAt = i;
+            validateLine = "";
+            retryLine = "";
+            normalizeError = "";
+          }
+        }
+        if (lastNormalizeAt >= 0 && i >= lastNormalizeAt && kind === "log") {
+          if (text.startsWith("Validating the patch with ")) validateLine = text;
+          if (text.startsWith("Patch validation failed ")) retryLine = text;
+        }
+        if (lastNormalizeAt >= 0 && i >= lastNormalizeAt && kind === "normalize_error") {
+          normalizeError = text;
+        }
+      }
+
+      const error = displayText(info.error || "");
+      const normalizeInTail =
+        /Validating the patch with|Patch validation failed|normalizer|normalize/i.test(error);
+      if (lastStep !== "normalize" && !validateLine && !normalizeError && !normalizeInTail) return null;
+
+      const commandMatch = validateLine.match(/`([^`]+)`/);
+      const detail = [];
+      if (normalizeError) {
+        const highlights = normalizeHighlights(normalizeError);
+        if (highlights) detail.push(`Likely error lines:\n${highlights}`);
+        detail.push(`Full normalizer log:\n${normalizeError}`);
+      }
+      if (error) detail.push(error);
+      if (validateLine) detail.push(validateLine);
+      if (retryLine) detail.push(retryLine);
+
+      return {
+        meta: commandMatch
+          ? `The task runner exited while this normalizer command was active: ${commandMatch[1]}`
+          : "The task errored while normalize was the active step.",
+        detail: detail.join("\n\n"),
+      };
+    }
+
+    function normalizeHighlights(text) {
+      const lines = String(text || "").split("\n");
+      const patterns = [
+        /\bFAILED\b/,
+        /\bERROR\b/,
+        /\bTraceback\b/,
+        /\b(?:AssertionError|RuntimeError|TypeError|ValueError|ImportError|ModuleNotFoundError)\b/,
+        /\b(?:failed|error|violation|would reformat|Found \d+|No such file)\b/i,
+      ];
+      const hits = [];
+      for (let i = 0; i < lines.length; i += 1) {
+        if (!patterns.some((p) => p.test(lines[i]))) continue;
+        const start = Math.max(0, i - 2);
+        const end = Math.min(lines.length, i + 3);
+        for (let j = start; j < end; j += 1) {
+          const line = `${j + 1}: ${lines[j]}`;
+          if (!hits.includes(line)) hits.push(line);
+        }
+        if (hits.length >= 80) break;
+      }
+      return hits.join("\n");
+    }
+
+    function renderNormalizeSummary(info) {
+      const panel = document.getElementById("normalize-error");
+      const summary = normalizeSummary(info);
+      if (!summary) {
+        panel.hidden = true;
+        return;
+      }
+      document.getElementById("normalize-error-meta").textContent = summary.meta;
+      document.getElementById("normalize-error-detail").textContent = summary.detail;
+      panel.hidden = false;
+    }
+
     async function loadInfo() {
       try {
         const r = await fetch(`${apiBase}/info`);
         if (!r.ok) return;
         const info = await r.json();
-        statusEl.textContent = info.status;
+        setStatus(info.status);
         document.getElementById("instruction").textContent = info.instruction || "";
+        renderNormalizeSummary(info);
         if (info.error) {
+          const shown = displayText(info.error);
           const b = document.getElementById("error-banner");
-          b.textContent = info.error;
-          b.className = "error";
+          b.textContent = shown;
+          b.className = "visible";
           b.style.whiteSpace = "pre-wrap";
+          if (renderedErrorText !== shown) {
+            renderedErrorText = shown;
+            append(`[error] ${shown}`);
+          }
         }
         if (info.result) {
           const res = info.result;
@@ -132,7 +258,7 @@
       if (!body && !calls) return `assistant: (thinking…)${metaStr}`;
       return `assistant:${body ? " " + body : ""}${calls}${metaStr}`;
     }
-    ["step", "tool", "error", "log", "chat"].forEach(kind => {
+    ["step", "tool", "error", "log", "chat", "normalize_error"].forEach(kind => {
       es.addEventListener(kind, (e) => {
         // The browser also fires a native "error" event (no .data) on a
         // dropped connection; ignore those here — es.onerror handles them.
@@ -140,12 +266,14 @@
         let txt;
         try { txt = JSON.parse(e.data); } catch { txt = e.data; }
         if (kind === "error") {
+          txt = displayText(txt);
           // Surface the full server-side error (incl. multi-line hints) in
           // a prominent banner as well as the console.
           const b = document.getElementById("error-banner");
           b.textContent = txt;
-          b.className = "error";
+          b.className = "visible";
           b.style.whiteSpace = "pre-wrap";
+          renderedErrorText = txt;
         }
         if (kind === "chat") { append(`💬 ${fmtMessage(txt)}`); return; }
         append(kind === "log" ? txt : `[${kind}] ${txt}`);

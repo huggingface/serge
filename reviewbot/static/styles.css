@@ -583,6 +583,41 @@ td .source-tag {
 }
 #error-banner.visible { display: block; }
 
+.normalize-error {
+  background: #fff7ed;
+  color: #7c2d12;
+  border: 1px solid #fed7aa;
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+.normalize-error-title {
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.normalize-error-meta {
+  margin-bottom: 10px;
+}
+.normalize-error pre {
+  white-space: pre-wrap;
+  overflow-x: auto;
+  margin: 0;
+  font-size: 0.86rem;
+  line-height: 1.45;
+  color: #7c2d12;
+}
+
+@media (prefers-color-scheme: dark) {
+  .normalize-error {
+    background: rgba(124, 45, 18, 0.22);
+    color: #fed7aa;
+    border-color: rgba(251, 146, 60, 0.45);
+  }
+  .normalize-error pre {
+    color: #fed7aa;
+  }
+}
+
 table.jobs-list {
   width: 100%;
   border-collapse: collapse;
