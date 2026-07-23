@@ -206,3 +206,68 @@ def test_run_verify_correlation_id_mismatch_times_out():
     )
     out = _run(gh, poll_timeout=1, monotonic=Clock([0, 0, 100]))
     assert out.verdict == verify.TIMEOUT
+
+
+# ---- run_gpu_reproduce -------------------------------------------------------
+
+
+def _run_repro(gh, **overrides):
+    kwargs = dict(
+        owner="huggingface",
+        repo="transformers",
+        base_sha="base",
+        block_lines=BLOCK,
+        correlation_id="corr-123",
+        workflow_file="serge-verify-caller.yml",
+        ref="main",
+        default_machine_type="aws-g5-12xlarge-cache",
+        transformersci_ref="main",
+        poll_timeout=100,
+        poll_interval=0,
+        sleep=lambda _s: None,
+        monotonic=Clock([0, 0]),
+    )
+    kwargs.update(overrides)
+    return verify.run_gpu_reproduce(gh, **kwargs)
+
+
+def test_run_reproduce_reproduced_dispatches_mode_and_no_commit():
+    gh = FakeGH(
+        runs=[
+            {"id": 5, "name": "x [corr-123]", "status": "completed", "html_url": "u"}
+        ],
+        artifacts=[{"id": 9, "name": "serge-verify-result-x"}],
+        zip_bytes=_zip_with(
+            {"verdict": "reproduced", "tracebacks": {"t": "RuntimeError"}}
+        ),
+    )
+    out = _run_repro(gh)
+    assert out.verdict == verify.REPRODUCED
+    assert out.tracebacks == {"t": "RuntimeError"}
+    # dispatched in reproduce mode, with no candidate commit.
+    (_o, _r, _wf, _ref, inputs) = gh.dispatched[0]
+    assert inputs["mode"] == "reproduce"
+    assert "commit_sha" not in inputs
+    assert inputs["run_collateral"] == "false"
+    assert "test_tiny_generation" in inputs["test_nodeids"]
+
+
+def test_run_reproduce_not_reproduced_passthrough():
+    gh = FakeGH(
+        runs=[{"id": 5, "name": "x [corr-123]", "status": "completed"}],
+        artifacts=[{"id": 9, "name": "serge-verify-result-x"}],
+        zip_bytes=_zip_with({"verdict": "not_reproduced", "tracebacks": {}}),
+    )
+    assert _run_repro(gh).verdict == verify.NOT_REPRODUCED
+
+
+def test_run_reproduce_no_targets_skips_dispatch():
+    gh = FakeGH()
+    out = _run_repro(gh, block_lines=["- no node ids here"])
+    assert out.verdict == verify.NO_TARGETS
+    assert gh.dispatched == []
+
+
+def test_run_reproduce_dispatch_failed():
+    gh = FakeGH(dispatch_exc=RuntimeError("no actions:write"))
+    assert _run_repro(gh).verdict == verify.DISPATCH_FAILED
