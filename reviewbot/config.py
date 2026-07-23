@@ -263,6 +263,13 @@ class Config:
     # opens the PR when the verdict is `fixed`. Default off = unchanged behavior.
     # Requires the serge GitHub App to be granted `Actions: read and write`.
     verify_on_gpu: bool = False
+    # Reproduce-first: before investigating, run the group's targeted tests on
+    # GPU at the base commit to confirm the failure is real, then classify it
+    # (product vs test issue) and seed the LLM with the real traceback. Bails the
+    # group (no LLM, no PR) when it does not reproduce. Requires verify_on_gpu.
+    # Fail-open: any GPU/infra error proceeds to investigate — the end verify
+    # gate still guards the PR. See docs/plans/serge-reproduce-first.md.
+    verify_reproduce_first: bool = False
     verify_workflow_file: str = "serge-verify-caller.yml"
     # Ref the caller workflow lives on (its file must exist here to dispatch).
     verify_ref: str = "main"
@@ -525,6 +532,7 @@ class Config:
             or None,
             task_egress_name=(os.environ.get("TASK_EGRESS_NAME") or "").strip() or None,
             verify_on_gpu=_bool_env("VERIFY_ON_GPU", False),
+            verify_reproduce_first=_bool_env("VERIFY_REPRODUCE_FIRST", False),
             verify_workflow_file=(
                 os.environ.get("VERIFY_WORKFLOW_FILE") or "serge-verify-caller.yml"
             ).strip(),

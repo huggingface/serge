@@ -3,8 +3,12 @@ import types
 from reviewbot import tasks, verify
 
 
-def _cfg(on_gpu: bool, rounds: int = 2):
-    return types.SimpleNamespace(verify_on_gpu=on_gpu, verify_max_rounds=rounds)
+def _cfg(on_gpu: bool, rounds: int = 2, reproduce_first: bool = False):
+    return types.SimpleNamespace(
+        verify_on_gpu=on_gpu,
+        verify_max_rounds=rounds,
+        verify_reproduce_first=reproduce_first,
+    )
 
 
 def _req(context="original context"):

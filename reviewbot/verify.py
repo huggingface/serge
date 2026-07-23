@@ -37,12 +37,17 @@ _MODEL_RE = re.compile(r"tests/models/([^/]+)/")
 _MULTI_GPU = "aws-g5-12xlarge-cache"
 _SINGLE_GPU = "aws-g5-4xlarge-cache"
 
-# Verdicts produced workflow-side (serge-verify-verdict). Only `fixed` opens a PR.
+# Verify-mode verdicts produced workflow-side (serge-verify-verdict). Only
+# `fixed` opens a PR.
 FIXED = "fixed"
 NOT_FIXED = "not_fixed"
 BROKE_OTHERS = "broke_others"
 ALREADY_PASSING = "already_passing"
 ERROR = "error"
+# Reproduce-mode verdicts (baseline-only run, before serge investigates). Only
+# `reproduced` lets serge proceed to investigate the group.
+REPRODUCED = "reproduced"
+NOT_REPRODUCED = "not_reproduced"
 # Orchestration-level verdicts produced here when the workflow can't be run/read.
 NO_TARGETS = "no_targets"
 DISPATCH_FAILED = "dispatch_failed"
@@ -164,22 +169,19 @@ def run_gpu_verify(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> VerifyOutcome:
-    """Dispatch the verify workflow for one failure group, wait for it, and
-    return the verdict. Never raises for the expected failure modes — it returns
-    a ``VerifyOutcome`` whose ``verdict`` the caller gates on."""
-
-    def _emit(kind: str, text: str) -> None:
-        if emit is not None:
-            emit(kind, text)
-
+    """Dispatch the verify workflow (mode=verify) for one failure group, wait for
+    it, and return the red→green verdict. Never raises for the expected failure
+    modes — it returns a ``VerifyOutcome`` whose ``verdict`` the caller gates on."""
     node_ids, model, machine_type = extract_verify_targets(
         block_lines, default_machine_type
     )
     if not node_ids:
-        _emit("log", "GPU verify: no node-ids found in the failure group; skipping.")
+        if emit is not None:
+            emit("log", "GPU verify: no node-ids found in the failure group; skipping.")
         return VerifyOutcome(NO_TARGETS, detail="no node-ids parsed from failure group")
 
     inputs: dict[str, Any] = {
+        "mode": "verify",
         "base_sha": base_sha,
         "commit_sha": commit_sha,
         "test_nodeids": " ".join(node_ids),
@@ -189,11 +191,118 @@ def run_gpu_verify(
         "transformersci_ref": transformersci_ref,
         "correlation_id": correlation_id,
     }
-    _emit(
-        "log",
-        f"GPU verify: dispatching {workflow_file} on {machine_type} for "
-        f"{len(node_ids)} test(s) [{model or 'no-model'}]",
+    return _dispatch_poll_fetch(
+        gh,
+        owner=owner,
+        repo=repo,
+        workflow_file=workflow_file,
+        ref=ref,
+        inputs=inputs,
+        correlation_id=correlation_id,
+        poll_timeout=poll_timeout,
+        poll_interval=poll_interval,
+        log_label=(
+            f"GPU verify: dispatching {workflow_file} on {machine_type} for "
+            f"{len(node_ids)} test(s) [{model or 'no-model'}]"
+        ),
+        emit=emit,
+        sleep=sleep,
+        monotonic=monotonic,
     )
+
+
+def run_gpu_reproduce(
+    gh: GitHubClient,
+    *,
+    owner: str,
+    repo: str,
+    base_sha: str,
+    block_lines: list[str],
+    correlation_id: str,
+    workflow_file: str,
+    ref: str,
+    default_machine_type: str,
+    transformersci_ref: str,
+    poll_timeout: float,
+    poll_interval: float,
+    emit: Optional[Callable[[str, str], None]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> VerifyOutcome:
+    """Dispatch the verify workflow in ``mode=reproduce`` — a baseline-only run,
+    BEFORE serge investigates — to confirm the group's failure is real at
+    ``base_sha``. Returns ``reproduced`` (every targeted test red, with the fresh
+    tracebacks) so serge can proceed and seed the LLM, or ``not_reproduced`` /
+    ``error`` so it bails. No candidate commit is involved. Same never-raise
+    contract as :func:`run_gpu_verify`."""
+    node_ids, model, machine_type = extract_verify_targets(
+        block_lines, default_machine_type
+    )
+    if not node_ids:
+        if emit is not None:
+            emit(
+                "log",
+                "GPU reproduce: no node-ids found in the failure group; skipping.",
+            )
+        return VerifyOutcome(NO_TARGETS, detail="no node-ids parsed from failure group")
+
+    inputs: dict[str, Any] = {
+        "mode": "reproduce",
+        "base_sha": base_sha,
+        "test_nodeids": " ".join(node_ids),
+        "model": model,
+        "machine_type": machine_type,
+        "run_collateral": "false",
+        "transformersci_ref": transformersci_ref,
+        "correlation_id": correlation_id,
+    }
+    return _dispatch_poll_fetch(
+        gh,
+        owner=owner,
+        repo=repo,
+        workflow_file=workflow_file,
+        ref=ref,
+        inputs=inputs,
+        correlation_id=correlation_id,
+        poll_timeout=poll_timeout,
+        poll_interval=poll_interval,
+        log_label=(
+            f"GPU reproduce: dispatching {workflow_file} on {machine_type} for "
+            f"{len(node_ids)} test(s) [{model or 'no-model'}]"
+        ),
+        emit=emit,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+
+
+def _dispatch_poll_fetch(
+    gh: GitHubClient,
+    *,
+    owner: str,
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    inputs: dict[str, Any],
+    correlation_id: str,
+    poll_timeout: float,
+    poll_interval: float,
+    log_label: str,
+    emit: Optional[Callable[[str, str], None]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> VerifyOutcome:
+    """Shared dispatch → poll-for-completion → download-verdict plumbing for both
+    verify and reproduce modes. The workflow-side verdict (whatever string the
+    ``serge-verify-verdict`` tool emitted for the given mode) is returned verbatim
+    in ``VerifyOutcome.verdict``; orchestration failures map to the ``*_FAILED`` /
+    ``TIMEOUT`` / ``NO_RESULT`` verdicts. Never raises for expected failures."""
+
+    def _emit(kind: str, text: str) -> None:
+        if emit is not None:
+            emit(kind, text)
+
+    _emit("log", log_label)
     try:
         gh.dispatch_workflow(owner, repo, workflow_file, ref=ref, inputs=inputs)
     except Exception as exc:  # noqa: BLE001 — surface as a verdict, never crash publish
