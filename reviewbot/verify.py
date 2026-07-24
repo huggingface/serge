@@ -37,6 +37,12 @@ _MODEL_RE = re.compile(r"tests/models/([^/]+)/")
 _MULTI_GPU = "aws-g5-12xlarge-cache"
 _SINGLE_GPU = "aws-g5-4xlarge-cache"
 
+# GitHub finalizes a run's artifacts slightly AFTER the run status flips to
+# "completed", so a fetch immediately on completion can see an empty artifact
+# list and wrongly report no_result. Retry the fetch this many times (spaced by
+# the poll interval) before giving up.
+_FETCH_ATTEMPTS = 6
+
 # Verify-mode verdicts produced workflow-side (serge-verify-verdict). Only
 # `fixed` opens a PR.
 FIXED = "fixed"
@@ -335,10 +341,21 @@ def _dispatch_poll_fetch(
             TIMEOUT, run_url=run_url, detail="verify run did not complete in time"
         )
 
-    result = _fetch_verdict(gh, owner, repo, int(run["id"]))
+    # Retry the artifact fetch: it can lag the run's "completed" status by a few
+    # seconds (see _FETCH_ATTEMPTS), and dropping a real verdict as no_result
+    # forces a blind investigation.
+    result: Optional[dict] = None
+    for attempt in range(_FETCH_ATTEMPTS):
+        result = _fetch_verdict(gh, owner, repo, int(run["id"]))
+        if result is not None:
+            break
+        if attempt < _FETCH_ATTEMPTS - 1:
+            sleep(poll_interval)
     if result is None:
         return VerifyOutcome(
-            NO_RESULT, run_url=run_url, detail="no verify-result artifact"
+            NO_RESULT,
+            run_url=run_url,
+            detail=f"no verify-result artifact after {_FETCH_ATTEMPTS} attempts",
         )
     return VerifyOutcome(
         verdict=result.get("verdict", NO_RESULT),
