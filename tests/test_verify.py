@@ -197,6 +197,31 @@ def test_run_verify_no_result_artifact():
     assert out.verdict == verify.NO_RESULT
 
 
+def test_run_verify_retries_late_artifact():
+    # The artifact list is empty on the first two polls (GitHub still finalizing)
+    # and populated on the third — serge must retry rather than report no_result.
+    class LateArtifactGH(FakeGH):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self._calls = 0
+
+        def list_run_artifacts(self, owner, repo, run_id):
+            self._calls += 1
+            if self._calls < 3:
+                return []
+            return [{"id": 9, "name": "serge-verify-result-x"}]
+
+    gh = LateArtifactGH(
+        runs=[
+            {"id": 5, "name": "x [corr-123]", "status": "completed", "html_url": "u"}
+        ],
+        zip_bytes=_zip_with({"verdict": "reproduced", "tracebacks": {"t": "boom"}}),
+    )
+    out = _run_repro(gh)
+    assert out.verdict == verify.REPRODUCED
+    assert gh._calls == 3  # succeeded on the third fetch, not on the first
+
+
 def test_run_verify_correlation_id_mismatch_times_out():
     # A concurrent run for a different task must not be picked up.
     gh = FakeGH(
