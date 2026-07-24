@@ -241,6 +241,11 @@ class WebappTasksTests(unittest.TestCase):
         self.assertEqual(body["id"], "task-status-1")
         self.assertEqual(body["status"], "no_fix")
         self.assertEqual(body["target"], "acme/widgets")
+        # Model + token counts are exposed so the triage reconciler can render a
+        # per-group spending recap (tokens null until the task finishes).
+        self.assertEqual(body["model"], "m")
+        self.assertIn("prompt_tokens", body)
+        self.assertIn("completion_tokens", body)
 
     def test_status_endpoint_rejects_foreign_repo_claim(self):
         if TestClient is None:

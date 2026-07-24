@@ -336,5 +336,43 @@ class BuildRunnerConfigTests(unittest.TestCase):
         self.assertEqual(cfg.helper_sandbox, "off")
 
 
+class RunnerConfigPassthroughTest(unittest.TestCase):
+    """The runner pod rebuilds Config from a near-empty env and applies only the
+    RUNNER_CONFIG_FIELDS subset from the spec. A verify_* field missing from that
+    list silently disables that behavior in the pod that actually runs tasks —
+    exactly the bug where verify_reproduce_first never reached the runner."""
+
+    def test_all_verify_fields_are_threaded_to_the_runner(self):
+        import dataclasses
+
+        from reviewbot import launcher
+        from reviewbot.config import Config
+
+        verify_fields = {
+            f.name for f in dataclasses.fields(Config) if f.name.startswith("verify_")
+        }
+        missing = verify_fields - set(launcher.RUNNER_CONFIG_FIELDS)
+        self.assertEqual(
+            missing,
+            set(),
+            f"verify_* Config fields not threaded to the runner pod: {missing}",
+        )
+
+    def test_runner_config_threads_reproduce_first(self):
+        import types
+
+        from reviewbot import launcher
+
+        fake = types.SimpleNamespace(
+            **{
+                field: (field in ("verify_on_gpu", "verify_reproduce_first"))
+                for field in launcher.RUNNER_CONFIG_FIELDS
+            }
+        )
+        out = launcher.runner_config(fake)
+        self.assertTrue(out["verify_reproduce_first"])
+        self.assertTrue(out["verify_on_gpu"])
+
+
 if __name__ == "__main__":
     unittest.main()
