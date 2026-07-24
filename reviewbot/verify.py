@@ -37,11 +37,14 @@ _MODEL_RE = re.compile(r"tests/models/([^/]+)/")
 _MULTI_GPU = "aws-g5-12xlarge-cache"
 _SINGLE_GPU = "aws-g5-4xlarge-cache"
 
-# GitHub finalizes a run's artifacts slightly AFTER the run status flips to
-# "completed", so a fetch immediately on completion can see an empty artifact
-# list and wrongly report no_result. Retry the fetch this many times (spaced by
-# the poll interval) before giving up.
-_FETCH_ATTEMPTS = 6
+# GitHub's run-scoped artifact listing lags the run's "completed" status: the
+# artifact is uploaded before completion, but `GET /runs/{id}/artifacts` can keep
+# returning an empty list for MINUTES afterwards (observed ~3 min in prod across a
+# whole nightly batch). A fetch right after completion therefore sees nothing and
+# would wrongly report no_result -> blind investigation. Keep re-fetching (spaced
+# by the poll interval) against the remaining poll budget, but for at least this
+# many seconds so a run that finishes near poll_timeout still gets a fair chance.
+_MIN_FETCH_WINDOW = 300.0
 
 # Verify-mode verdicts produced workflow-side (serge-verify-verdict). Only
 # `fixed` opens a PR.
@@ -341,21 +344,26 @@ def _dispatch_poll_fetch(
             TIMEOUT, run_url=run_url, detail="verify run did not complete in time"
         )
 
-    # Retry the artifact fetch: it can lag the run's "completed" status by a few
-    # seconds (see _FETCH_ATTEMPTS), and dropping a real verdict as no_result
-    # forces a blind investigation.
+    # Retry the artifact fetch: the run-scoped listing can lag "completed" by
+    # minutes (see _MIN_FETCH_WINDOW), and dropping a real verdict as no_result
+    # forces a blind investigation. Keep polling for the verdict until it appears
+    # or we run past the fetch deadline — the remaining poll budget, but at least
+    # _MIN_FETCH_WINDOW. Success breaks immediately, so the common case adds no
+    # latency; only a genuinely-missing artifact waits out the window.
     result: Optional[dict] = None
-    for attempt in range(_FETCH_ATTEMPTS):
+    fetch_deadline = max(deadline, monotonic() + _MIN_FETCH_WINDOW)
+    while True:
         result = _fetch_verdict(gh, owner, repo, int(run["id"]))
         if result is not None:
             break
-        if attempt < _FETCH_ATTEMPTS - 1:
-            sleep(poll_interval)
+        if monotonic() >= fetch_deadline:
+            break
+        sleep(poll_interval)
     if result is None:
         return VerifyOutcome(
             NO_RESULT,
             run_url=run_url,
-            detail=f"no verify-result artifact after {_FETCH_ATTEMPTS} attempts",
+            detail="no verify-result artifact before fetch deadline",
         )
     return VerifyOutcome(
         verdict=result.get("verdict", NO_RESULT),

@@ -193,8 +193,36 @@ def test_run_verify_no_result_artifact():
         ],
         artifacts=[],
     )
-    out = _run(gh)
+    # The verdict never appears: fetch loop runs until monotonic passes the fetch
+    # deadline (a big jump here), then falls open to no_result.
+    out = _run(gh, poll_timeout=1, monotonic=Clock([0, 0, 0, 10_000]))
     assert out.verdict == verify.NO_RESULT
+
+
+def test_run_verify_retries_artifact_past_old_window():
+    # Regression for the ~3-min prod listing lag: the artifact stays invisible for
+    # far longer than the old fixed 6-attempt (150s) window, then appears. serge
+    # must keep polling against the remaining budget rather than bail no_result.
+    class VeryLateArtifactGH(FakeGH):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self._calls = 0
+
+        def list_run_artifacts(self, owner, repo, run_id):
+            self._calls += 1
+            if self._calls < 20:  # empty well past the old 6-attempt window
+                return []
+            return [{"id": 9, "name": "serge-verify-result-x"}]
+
+    gh = VeryLateArtifactGH(
+        runs=[
+            {"id": 5, "name": "x [corr-123]", "status": "completed", "html_url": "u"}
+        ],
+        zip_bytes=_zip_with({"verdict": "reproduced", "tracebacks": {"t": "boom"}}),
+    )
+    out = _run_repro(gh)
+    assert out.verdict == verify.REPRODUCED
+    assert gh._calls == 20  # kept polling far beyond the old 6-attempt cap
 
 
 def test_run_verify_retries_late_artifact():
