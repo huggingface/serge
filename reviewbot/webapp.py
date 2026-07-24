@@ -3755,6 +3755,10 @@ def task_status(request: Request, owner: str, repo: str, job_id: str) -> JSONRes
     if job.target_owner != owner or job.target_repo != repo:
         raise HTTPException(status_code=404, detail="task_target_mismatch")
 
+    # Token counts live on the persisted row (written at finish), not the
+    # in-memory Job — load them so the triage reconciler can render a per-group
+    # spending recap. None while the task is still running; that is fine.
+    row = _store.load(job_id)
     return JSONResponse(
         {
             "id": job.id,
@@ -3762,6 +3766,9 @@ def task_status(request: Request, owner: str, repo: str, job_id: str) -> JSONRes
             "target": f"{job.target_owner}/{job.target_repo}",
             "result": job.task_result,
             "error": job.error,
+            "model": job.llm_model,
+            "prompt_tokens": (row or {}).get("prompt_tokens"),
+            "completion_tokens": (row or {}).get("completion_tokens"),
         }
     )
 

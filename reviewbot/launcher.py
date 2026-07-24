@@ -67,6 +67,7 @@ RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
     "tool_max_iterations",
     "tool_max_iterations_strict",
     "verify_on_gpu",
+    "verify_reproduce_first",
     "verify_workflow_file",
     "verify_ref",
     "verify_transformersci_ref",
