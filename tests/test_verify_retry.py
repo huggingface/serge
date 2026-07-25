@@ -8,6 +8,8 @@ def _cfg(on_gpu: bool, rounds: int = 2, reproduce_first: bool = False):
         verify_on_gpu=on_gpu,
         verify_max_rounds=rounds,
         verify_reproduce_first=reproduce_first,
+        classify_max_tokens=4096,
+        reproduce_tb_chars=12000,
     )
 
 

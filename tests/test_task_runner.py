@@ -390,6 +390,22 @@ class RunnerConfigPassthroughTest(unittest.TestCase):
         )
         self.assertEqual(launcher.runner_config(fake)["classify_max_tokens"], 4096)
 
+    def test_reproduce_tb_chars_is_threaded_to_the_runner(self):
+        # The reproduce/verify traceback seed is built in the runner pod, so its
+        # char budget must reach it (same failure class as classify_max_tokens).
+        import types
+
+        from reviewbot import launcher
+
+        self.assertIn("reproduce_tb_chars", launcher.RUNNER_CONFIG_FIELDS)
+        fake = types.SimpleNamespace(
+            **{
+                field: (12000 if field == "reproduce_tb_chars" else None)
+                for field in launcher.RUNNER_CONFIG_FIELDS
+            }
+        )
+        self.assertEqual(launcher.runner_config(fake)["reproduce_tb_chars"], 12000)
+
 
 if __name__ == "__main__":
     unittest.main()

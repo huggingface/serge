@@ -120,6 +120,11 @@ class ReviewEdits:
 
 
 _FENCED_BLOCK_RE = re.compile(r"```(?:json|JSON)?\s*([\s\S]*?)\s*```")
+# Opening fence of a JSON block at the very start of a reply, and the fence
+# that closes it. Used to peel the wrapper off a stub-JSON reply — see
+# `_prose_outside_json`.
+_LEADING_FENCE_RE = re.compile(r"\A```[ \t]*(?:json|JSON)?[ \t]*\r?\n?")
+_CLOSING_FENCE_RE = re.compile(r"\A\s*```[ \t]*\r?\n?")
 _TAGGED_DIFF_LINE_RE = re.compile(r"^\[(R|L)\s*(\d+)\] ")
 _PARSE_PREVIEW_CHARS = 500
 
@@ -180,6 +185,38 @@ def _extract_json(content: Optional[str]) -> dict[str, Any]:
         f"LLM response did not contain a JSON object "
         f"(length={len(content)} chars, preview={_content_preview(text)!r})"
     )
+
+
+def _prose_outside_json(content: Optional[str]) -> str:
+    """The markdown left over once the JSON object `_extract_json` picked up
+    (and any fence wrapping it) is removed.
+
+    Models occasionally answer with a *stub* JSON object — empty summary, no
+    comments — and then write the actual review as prose underneath, often
+    forgetting the closing ``` of the fence they opened. Handing that whole
+    reply to the reader publishes the fence and the stub verbatim, and an
+    unterminated fence swallows the entire review into one code block.
+
+    Returns "" when there is no prose to salvage, so callers can keep their
+    own fallback.
+    """
+    text = (content or "").strip()
+    if not text:
+        return ""
+    text = _LEADING_FENCE_RE.sub("", text, count=1)
+
+    decoder = json.JSONDecoder()
+    for idx in (i for i, ch in enumerate(text) if ch == "{"):
+        try:
+            _, end = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        head = text[:idx]
+        # Drop only the fence that closes the JSON block — a global strip
+        # would eat legitimate code fences inside the prose review.
+        tail = _CLOSING_FENCE_RE.sub("", text[idx + end :], count=1)
+        return "\n\n".join(part for part in (head.strip(), tail.strip()) if part)
+    return ""
 
 
 @dataclass
@@ -1465,15 +1502,18 @@ def prepare_review(
         # object alongside the actual review written as prose. Since
         # `_extract_json` accepts the first decodable `{...}`, we can
         # end up with an empty `summary` while the model's real
-        # write-up sits in `chat.content`. Use the raw content rather
-        # than publishing an empty "(no overall summary provided)".
+        # write-up sits in `chat.content`. Salvage the prose rather
+        # than publishing an empty "(no overall summary provided)" —
+        # but peel off the JSON stub and its ``` fence first, or the
+        # published summary opens with a fence the model never closed
+        # and renders as one giant code block.
         if (
             not summary
             and not (result.get("comments") or [])
             and chat.content
             and chat.content.strip()
         ):
-            summary = chat.content.strip()
+            summary = _prose_outside_json(chat.content) or chat.content.strip()
             log.warning(
                 "Parsed JSON yielded empty summary/comments; using "
                 "raw content (%d chars) as summary",
