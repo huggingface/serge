@@ -26,6 +26,8 @@ def _cfg(reproduce_first=True):
         verify_transformersci_ref="main",
         verify_poll_timeout=100,
         verify_poll_interval=0,
+        classify_max_tokens=4096,
+        reproduce_tb_chars=12000,
     )
 
 

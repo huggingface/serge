@@ -164,6 +164,11 @@ class Config:
     # before emitting the JSON verdict, so the old 300 default always truncated
     # to `unclear — unparseable`. Tunable via CLASSIFY_MAX_TOKENS.
     classify_max_tokens: int = 4096
+    # Per-traceback char budget when serge seeds the reproduced/verify failures
+    # into the fix prompt. The GPU run emits full assertion diffs (pytest -vv);
+    # the old 2000-char tail chopped the very generated strings the LLM needs to
+    # rewrite stale expected values. Tunable via REPRODUCE_TB_CHARS.
+    reproduce_tb_chars: int = 12000
     # Optional task-only completion-token cap. When unset, tasks use the
     # normal llm_max_tokens value.
     task_llm_max_tokens: Optional[int] = None
@@ -422,6 +427,7 @@ class Config:
             llm_bill_to=os.environ.get("LLM_BILL_TO") or None,
             llm_max_tokens=_int_env("LLM_MAX_TOKENS", 4096),
             classify_max_tokens=_int_env("CLASSIFY_MAX_TOKENS", 4096),
+            reproduce_tb_chars=_int_env("REPRODUCE_TB_CHARS", 12000),
             # Streaming on by default — the web UI's live token counter
             # and reasoning display rely on incremental SSE chunks. Set
             # LLM_STREAM=0 to fall back to the buffered REST path.

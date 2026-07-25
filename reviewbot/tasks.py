@@ -1032,7 +1032,19 @@ def publish_task(
     )
 
 
-def _format_verify_feedback(result: TaskResult) -> str:
+def _tail_tb(tb: Optional[str], max_chars: int) -> str:
+    """Keep the tail of a traceback (the assertion diff + captured output sit at
+    the end) up to ``max_chars``, marking the cut so the LLM knows it's partial."""
+    text = tb or ""
+    if len(text) <= max_chars:
+        return text
+    return "…(traceback truncated to last %d chars)…\n%s" % (
+        max_chars,
+        text[-max_chars:],
+    )
+
+
+def _format_verify_feedback(result: TaskResult, max_chars: int = 12000) -> str:
     """Markdown feedback for the next LLM round: the failures the previous
     candidate's GPU verify still produced."""
     lines = [
@@ -1047,7 +1059,7 @@ def _format_verify_feedback(result: TaskResult) -> str:
     for nodeid, tb in list(result.verify_tracebacks.items())[:5]:
         lines.append(f"### {nodeid}")
         lines.append("```")
-        lines.append((tb or "")[-2000:])
+        lines.append(_tail_tb(tb, max_chars))
         lines.append("```")
         lines.append("")
     return "\n".join(lines).rstrip()
@@ -1087,7 +1099,9 @@ def _reproduce_bail_message(outcome: VerifyOutcome) -> str:
 
 
 def _format_reproduce_feedback(
-    outcome: VerifyOutcome, classification: ClassifyResult
+    outcome: VerifyOutcome,
+    classification: ClassifyResult,
+    max_chars: int = 12000,
 ) -> str:
     """Authoritative reproduction context seeded into the LLM prompt. Supersedes
     any inbound 'do not run the test suite' note: serge already ran the tests on
@@ -1119,7 +1133,7 @@ def _format_reproduce_feedback(
             "",
         ]
     for nodeid, tb in list(outcome.tracebacks.items())[:5]:
-        lines += [f"### {nodeid}", "```", (tb or "")[-2000:], "```", ""]
+        lines += [f"### {nodeid}", "```", _tail_tb(tb, max_chars), "```", ""]
     return "\n".join(lines).rstrip()
 
 
@@ -1225,7 +1239,10 @@ def _maybe_reproduce_first(
         cfg, node_ids, outcome.tracebacks, req.context, emit
     )
     seeded = _with_verify_feedback(
-        req, _format_reproduce_feedback(outcome, classification)
+        req,
+        _format_reproduce_feedback(
+            outcome, classification, max_chars=cfg.reproduce_tb_chars
+        ),
     )
     return None, seeded
 
@@ -1292,7 +1309,8 @@ def prepare_and_publish_candidate(
                 f"(round {attempt + 2}/{rounds + 1})",
             )
             req_i = _with_verify_feedback(
-                candidate_req, _format_verify_feedback(result)
+                candidate_req,
+                _format_verify_feedback(result, max_chars=cfg.reproduce_tb_chars),
             )
             continue
         return result
