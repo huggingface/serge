@@ -1141,7 +1141,11 @@ def _classify_reproduced(
             stream=False,
         )
         result = classify_failure(
-            llm, node_ids=node_ids, tracebacks=tracebacks, context=context
+            llm,
+            node_ids=node_ids,
+            tracebacks=tracebacks,
+            context=context,
+            max_tokens=cfg.classify_max_tokens,
         )
     except Exception as exc:  # noqa: BLE001 — classification is best-effort
         log.debug("classify failed: %s", exc, exc_info=True)

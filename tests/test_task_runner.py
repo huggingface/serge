@@ -373,6 +373,23 @@ class RunnerConfigPassthroughTest(unittest.TestCase):
         self.assertTrue(out["verify_reproduce_first"])
         self.assertTrue(out["verify_on_gpu"])
 
+    def test_classify_max_tokens_is_threaded_to_the_runner(self):
+        # The classifier runs in the runner pod (_classify_reproduced), so its
+        # token budget must reach it or the pod silently uses the dataclass
+        # default. Same failure class as the verify_* fields above.
+        import types
+
+        from reviewbot import launcher
+
+        self.assertIn("classify_max_tokens", launcher.RUNNER_CONFIG_FIELDS)
+        fake = types.SimpleNamespace(
+            **{
+                field: (4096 if field == "classify_max_tokens" else None)
+                for field in launcher.RUNNER_CONFIG_FIELDS
+            }
+        )
+        self.assertEqual(launcher.runner_config(fake)["classify_max_tokens"], 4096)
+
 
 if __name__ == "__main__":
     unittest.main()

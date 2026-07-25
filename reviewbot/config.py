@@ -159,6 +159,11 @@ class Config:
     task_api_enabled: bool = False
     task_oidc_issuer: str = "https://token.actions.githubusercontent.com"
     task_oidc_audience: str = "serge"
+    # Completion-token budget for the cheap product-vs-test classifier
+    # (reviewbot/classify.py). Reasoning models (Kimi) burn tokens on reasoning
+    # before emitting the JSON verdict, so the old 300 default always truncated
+    # to `unclear — unparseable`. Tunable via CLASSIFY_MAX_TOKENS.
+    classify_max_tokens: int = 4096
     # Optional task-only completion-token cap. When unset, tasks use the
     # normal llm_max_tokens value.
     task_llm_max_tokens: Optional[int] = None
@@ -416,6 +421,7 @@ class Config:
             llm_model=os.environ.get("LLM_MODEL") or None,
             llm_bill_to=os.environ.get("LLM_BILL_TO") or None,
             llm_max_tokens=_int_env("LLM_MAX_TOKENS", 4096),
+            classify_max_tokens=_int_env("CLASSIFY_MAX_TOKENS", 4096),
             # Streaming on by default — the web UI's live token counter
             # and reasoning display rely on incremental SSE chunks. Set
             # LLM_STREAM=0 to fall back to the buffered REST path.
