@@ -107,6 +107,10 @@ class TaskRequest:
     slack_notify_task_finished: bool = False
     # Resolved during processing (existing_pr): the PR's head branch.
     head_branch: Optional[str] = None
+    # Set by reproduce-first when the group reproduced on GPU: the run that
+    # confirmed the failure at the base commit. Surfaced in the PR body as the
+    # "failed before" evidence.
+    reproduce_run_url: Optional[str] = None
 
     @property
     def repo_full_name(self) -> str:
@@ -781,6 +785,29 @@ def _make_verify_gate(
     return _gate
 
 
+def _verification_footer(
+    verify_run_url: Optional[str], reproduce_run_url: Optional[str]
+) -> str:
+    """Provenance appended to the PR body: serge ran the targeted ``@slow`` tests
+    on GPU and opened this PR only after they passed with the patch. Links the
+    verify run (green with the patch) and, when reproduce-first ran, the run that
+    confirmed the failure at the base commit (red before)."""
+    if not verify_run_url and not reproduce_run_url:
+        return ""
+    lines = [
+        "",
+        "---",
+        "### ✅ Verified on GPU",
+        "serge ran the targeted `@slow` test(s) on a GPU runner and opened this PR "
+        "only after they passed with this patch.",
+    ]
+    if verify_run_url:
+        lines.append(f"- **Passes with this patch:** {verify_run_url}")
+    if reproduce_run_url:
+        lines.append(f"- **Failed before the fix (base commit):** {reproduce_run_url}")
+    return "\n".join(lines)
+
+
 def _commit_changes(
     cfg: Config,
     gh: GitHubClient,
@@ -879,6 +906,7 @@ def _commit_changes(
     # GPU verify gate (opt-in): run the targeted tests on the candidate before
     # opening the PR. `parent_sha` is the baseline-red reference. On a non-`fixed`
     # verdict, tear the branch down and return without a PR.
+    verify_run_url: Optional[str] = None
     if verify is not None:
         outcome = verify(parent_sha, commit_sha)
         if not outcome.is_fixed:
@@ -895,6 +923,7 @@ def _commit_changes(
                 verify_verdict=outcome.verdict,
                 verify_tracebacks=outcome.tracebacks,
             )
+        verify_run_url = outcome.run_url
 
     # Open as a draft, then immediately mark ready-for-review. The
     # draft->ready transition is what fires the `ready_for_review` webhook that
@@ -907,7 +936,7 @@ def _commit_changes(
         title=title,
         head=branch,
         base=req.base_ref,
-        body=body,
+        body=body + _verification_footer(verify_run_url, req.reproduce_run_url),
         draft=True,
     )
     gh.mark_pull_request_ready(pr["node_id"])
@@ -1244,6 +1273,7 @@ def _maybe_reproduce_first(
             outcome, classification, max_chars=cfg.reproduce_tb_chars
         ),
     )
+    seeded = dataclasses.replace(seeded, reproduce_run_url=outcome.run_url)
     return None, seeded
 
 
