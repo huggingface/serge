@@ -61,6 +61,7 @@ def _install(monkeypatch, *, repro_outcome, classify_result=None):
 
     def fake_prepare(cfg, req, **kwargs):
         rec["prepare_contexts"].append(req.context)
+        rec["reproduce_run_url"] = req.reproduce_run_url
         return tasks.TaskPlan(title="t", body="b", patch="p")
 
     def fake_publish(cfg, gh, req, plan, **kwargs):
@@ -121,7 +122,9 @@ def test_reproduced_seeds_prompt_and_investigates(monkeypatch):
     rec = _install(
         monkeypatch,
         repro_outcome=VerifyOutcome(
-            REPRODUCED, tracebacks={"n": "RuntimeError: boom"}, run_url="u"
+            REPRODUCED,
+            tracebacks={"n": "RuntimeError: boom"},
+            run_url="https://github.com/o/r/actions/runs/111-repro",
         ),
         classify_result=ClassifyResult(PRODUCT_ISSUE, reason="hard crash"),
     )
@@ -131,6 +134,8 @@ def test_reproduced_seeds_prompt_and_investigates(monkeypatch):
     assert "REPRODUCED on GPU" in seeded
     assert "RuntimeError: boom" in seeded
     assert "genuine library/model bug" in seeded  # product_issue routing note
+    # the reproduce run is threaded to the request for the PR "failed before" link
+    assert rec["reproduce_run_url"] == "https://github.com/o/r/actions/runs/111-repro"
     assert result.pr_number == 1
     # reproduce dispatched with a distinct correlation id + resolved base sha.
     assert rec["reproduce_kwargs"]["correlation_id"] == "job1234-repro"
@@ -185,3 +190,24 @@ def test_no_nodeids_skips_reproduce(monkeypatch):
     )
     assert rec["reproduce_called"] is False
     assert rec["prepare_contexts"] == ["- no node ids in this context"]
+
+
+def test_verification_footer_links_both_runs():
+    footer = tasks._verification_footer(
+        verify_run_url="https://gh/run/verify",
+        reproduce_run_url="https://gh/run/repro",
+    )
+    assert "Verified on GPU" in footer
+    assert "Passes with this patch:** https://gh/run/verify" in footer
+    assert "Failed before the fix (base commit):** https://gh/run/repro" in footer
+
+
+def test_verification_footer_empty_when_no_runs():
+    assert tasks._verification_footer(None, None) == ""
+
+
+def test_verification_footer_verify_only():
+    # reproduce-first disabled / failed-open: still surface the verify run.
+    footer = tasks._verification_footer("https://gh/run/verify", None)
+    assert "Passes with this patch:** https://gh/run/verify" in footer
+    assert "Failed before" not in footer
