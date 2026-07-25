@@ -17,6 +17,7 @@ from reviewbot.reviewer import (
     _extract_json,
     _merge_chunk_event,
     _merge_chunk_summaries,
+    _prose_outside_json,
     _run_agentic_loop,
     _summarize_rejected_comments,
 )
@@ -224,6 +225,63 @@ class ExtractJsonTests(unittest.TestCase):
             _extract_json(content),
             {"summary": "use { and } carefully", "comments": []},
         )
+
+
+class ProseOutsideJsonTests(unittest.TestCase):
+    """The stub-JSON-plus-prose reply: `_extract_json` takes the stub, this
+    takes the review the model actually wrote."""
+
+    STUB = '{"summary": "", "event": "COMMENT", "comments": []}'
+    PROSE = (
+        "### Correctness\n- `src/foo.py` drops the return value.\n\n### Style\n- nit"
+    )
+
+    def test_unclosed_json_fence_yields_prose_only(self) -> None:
+        # The peft#3354 case: the model opened ```json and never closed it,
+        # so the whole review rendered inside one code block.
+        content = f"```json\n{self.STUB}\n\n{self.PROSE}\n"
+        out = _prose_outside_json(content)
+        self.assertEqual(out, self.PROSE)
+        self.assertNotIn("```json", out)
+        self.assertNotIn('"summary"', out)
+
+    def test_closed_json_fence_yields_prose_only(self) -> None:
+        content = f"```json\n{self.STUB}\n```\n\n{self.PROSE}\n"
+        self.assertEqual(_prose_outside_json(content), self.PROSE)
+
+    def test_unfenced_stub_yields_prose_only(self) -> None:
+        content = f"{self.STUB}\n\n{self.PROSE}"
+        self.assertEqual(_prose_outside_json(content), self.PROSE)
+
+    def test_prose_before_the_json_is_kept(self) -> None:
+        content = f"Here is my review:\n\n{self.STUB}\n\n{self.PROSE}"
+        self.assertEqual(
+            _prose_outside_json(content),
+            f"Here is my review:\n\n{self.PROSE}",
+        )
+
+    def test_code_fences_inside_the_prose_survive(self) -> None:
+        prose = "### Correctness\n\n```python\nx = 1\n```\n\nLooks wrong."
+        content = f"```json\n{self.STUB}\n```\n\n{prose}"
+        self.assertEqual(_prose_outside_json(content), prose)
+
+    def test_json_only_reply_has_no_prose(self) -> None:
+        self.assertEqual(_prose_outside_json(f"```json\n{self.STUB}\n```"), "")
+        self.assertEqual(_prose_outside_json(self.STUB), "")
+
+    def test_no_json_object_returns_empty(self) -> None:
+        self.assertEqual(_prose_outside_json("just prose, no object"), "")
+
+    def test_empty_and_none_content(self) -> None:
+        self.assertEqual(_prose_outside_json(""), "")
+        self.assertEqual(_prose_outside_json("   \n\t "), "")
+        self.assertEqual(_prose_outside_json(None), "")
+
+    def test_matches_what_extract_json_consumed(self) -> None:
+        # The two halves of the same reply: the dict and the leftover prose.
+        content = f"```json\n{self.STUB}\n\n{self.PROSE}\n"
+        self.assertEqual(_extract_json(content), json.loads(self.STUB))
+        self.assertEqual(_prose_outside_json(content), self.PROSE)
 
 
 class ContentPreviewTests(unittest.TestCase):
