@@ -235,15 +235,28 @@
     return `assistant:${body ? " " + body : ""}${calls}${metaStr}`;
   }
 
+  // [HH:MM] wall-clock stamp for a console line. Uses the browser's local clock
+  // at the moment the event arrived (the SSE frames carry no server timestamp),
+  // which is accurate for live tailing; replayed backlog on (re)connect is
+  // stamped at connect time.
+  function fmtClock(d) {
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return `[${hh}:${mm}]`;
+  }
+
   function flushConsole() {
     consoleFlushScheduled = false;
     if (consolePending.length === 0) return;
     const frag = document.createDocumentFragment();
-    for (const { kind, text } of consolePending) {
+    for (const { kind, text, at } of consolePending) {
       const span = document.createElement("span");
       span.className = kind;
       const streamed = kind === "token" || kind === "reasoning";
       let prefix = streamed || consoleAtLineStart ? "" : "\n";
+      // Timestamp only whole lines (log/tool/chat/error), not streamed
+      // token/reasoning fragments that continue an existing line.
+      if (!streamed) prefix += fmtClock(at) + " ";
       if (kind === "log") prefix += "› ";
       else if (kind === "tool") prefix += "⚙ ";
       else if (kind === "chat") prefix += "💬 ";
@@ -265,7 +278,7 @@
   }
 
   function appendConsole(kind, text) {
-    consolePending.push({ kind, text });
+    consolePending.push({ kind, text, at: new Date() });
     if (!consoleFlushScheduled) {
       consoleFlushScheduled = true;
       requestAnimationFrame(flushConsole);
