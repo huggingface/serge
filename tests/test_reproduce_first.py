@@ -211,3 +211,44 @@ def test_verification_footer_verify_only():
     footer = tasks._verification_footer("https://gh/run/verify", None)
     assert "Passes with this patch:** https://gh/run/verify" in footer
     assert "Failed before" not in footer
+
+
+def test_verification_footer_notes_flakiness_runs():
+    footer = tasks._verification_footer(
+        "https://gh/run/verify", "https://gh/run/repro", runs=5
+    )
+    assert (
+        "run 5× on both the pre-patch and patched trees to rule out flakiness" in footer
+    )
+
+
+def test_verification_footer_omits_flakiness_note_for_single_run():
+    # runs unknown (None) or a single run: no flakiness sentence.
+    assert "flakiness" not in tasks._verification_footer(
+        "https://gh/run/verify", None, runs=None
+    )
+    assert "flakiness" not in tasks._verification_footer(
+        "https://gh/run/verify", None, runs=1
+    )
+
+
+def test_decorate_body_places_gpu_section_before_disclaimer():
+    cfg = types.SimpleNamespace(is_staging=False)
+    plan = tasks.TaskPlan(title="t", body="the actual fix body", patch="p")
+    req = types.SimpleNamespace(context="")
+    footer = tasks._verification_footer("https://gh/run/verify", "https://gh/run/repro")
+    body = tasks._decorate_body(cfg, plan, req, verification_footer=footer)
+    assert "Verified on GPU" in body
+    # The GPU section vouches for the fix, so it sits right under the fix body
+    # and ABOVE the "produced automatically by serge" disclaimer.
+    assert body.index("the actual fix body") < body.index("Verified on GPU")
+    assert body.index("Verified on GPU") < body.index(
+        "This change was produced automatically"
+    )
+
+
+def test_decorate_body_no_gpu_section_without_footer():
+    cfg = types.SimpleNamespace(is_staging=False)
+    plan = tasks.TaskPlan(title="t", body="b", patch="p")
+    req = types.SimpleNamespace(context="")
+    assert "Verified on GPU" not in tasks._decorate_body(cfg, plan, req)

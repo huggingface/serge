@@ -64,11 +64,14 @@
       const tdPr = document.createElement("td");
       const link = document.createElement("a");
       link.href = e.url;
+      // Shorten the "huggingface" org to "hf" in the label only (href stays
+      // full) so the PR-or-Task column doesn't hog width.
+      const owner = e.owner === "huggingface" ? "hf" : e.owner;
       // Task jobs have no PR number until the PR is opened; show repo only.
       link.textContent =
         e.kind === "task"
-          ? `${e.owner}/${e.repo}`
-          : `${e.owner}/${e.repo}#${e.number}`;
+          ? `${owner}/${e.repo}`
+          : `${owner}/${e.repo}#${e.number}`;
       tdPr.appendChild(link);
 
       const tdProvider = cell(e.provider || "—");
