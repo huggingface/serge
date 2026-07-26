@@ -2052,10 +2052,16 @@ def _journal_rows_html(rows: list[dict[str, Any]]) -> str:
         entry_type = _journal_type(row)
         status_text = str(row.get("status") or "unknown")
         status_class = re.sub(r"[^a-zA-Z0-9_-]+", "-", status_text)
+        # Shorten the "huggingface" org to "hf" in the label only (the link
+        # href is unaffected) so the PR-or-Task column stays narrow. Mirrors
+        # static/journal.js, which renders the same cell on the client refresh.
+        owner_label = (
+            "hf" if row["target_owner"] == "huggingface" else row["target_owner"]
+        )
         target = (
-            f"{row['target_owner']}/{row['target_repo']}"
+            f"{owner_label}/{row['target_repo']}"
             if (row.get("kind") or "review") == "task"
-            else f"{row['target_owner']}/{row['target_repo']}#{row['target_number']}"
+            else f"{owner_label}/{row['target_repo']}#{row['target_number']}"
         )
         rendered.append(
             "<tr>"
