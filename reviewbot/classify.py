@@ -13,8 +13,20 @@ Labels:
                  real regression) — investigate and fix the source
   test_issue     the test itself is wrong (stale expected values, a bad skip
                  condition, an over-tight tolerance) — prefer correcting the test
+  environment_issue
+                 neither: the failure is a property of the machine or the
+                 installed environment (device memory exhausted, a missing or
+                 incompatible dependency, a driver/CUDA mismatch, a checkpoint
+                 gone from the Hub). No source patch fixes it, so serge bails
+                 here — one cheap classifier call instead of a full investigation
+                 that can only end ``no_fix``
   unclear        cannot tell from the traceback alone — serge proceeds as if
                  product_issue but flags it
+
+``environment_issue`` is the only label that stops the flow, so it is deliberately
+the hardest to earn: the prompt requires the traceback to show it and says to fall
+back to ``product_issue`` on doubt. It can be disabled entirely with
+``CLASSIFY_BAIL_ON_ENVIRONMENT=0``, which restores investigate-everything.
 
 The classifier is a single cheap, non-tool ``response_format=json_object`` call.
 It never raises: any transport/parse failure defaults to ``unclear`` so the flow
@@ -34,9 +46,10 @@ log = logging.getLogger(__name__)
 
 PRODUCT_ISSUE = "product_issue"
 TEST_ISSUE = "test_issue"
+ENVIRONMENT_ISSUE = "environment_issue"
 UNCLEAR = "unclear"
 
-_LABELS = frozenset({PRODUCT_ISSUE, TEST_ISSUE, UNCLEAR})
+_LABELS = frozenset({PRODUCT_ISSUE, TEST_ISSUE, ENVIRONMENT_ISSUE, UNCLEAR})
 
 # Per-test traceback budget fed to the classifier. The tail of a pytest traceback
 # (the failing frame + the exception) is the discriminating part, so we keep the
@@ -54,11 +67,22 @@ crash (TypeError/RuntimeError/shape or dtype error), an exception raised inside 
 - "test_issue": the failure is the test's own fault — an assertion on stale \
 expected values/tensors that legitimately changed, an over-tight tolerance, or a \
 bad skip/guard condition. The test (its expectations) should be corrected.
+- "environment_issue": NEITHER the code nor the test is wrong — the failure is a \
+property of the machine or the installed environment, and no source change can fix \
+it. Only for: device/host out-of-memory, a missing or version-incompatible \
+dependency (ImportError/ModuleNotFoundError, an API that moved in a third-party \
+package), a CUDA/driver/hardware mismatch, or a checkpoint that is gone, renamed, \
+or gated on the Hub.
 - "unclear": you genuinely cannot tell from the traceback which it is.
 
 Judge only from the traceback and node-ids given. Do not guess beyond them. \
 Prefer "product_issue" for hard crashes; prefer "test_issue" when the ONLY failure \
-is an assertion comparing expected constants to fresh outputs.\
+is an assertion comparing expected constants to fresh outputs.
+
+"environment_issue" STOPS the fix attempt entirely, so use it only when the \
+traceback itself shows the environment is at fault. If you are weighing it against \
+"product_issue", choose "product_issue" — a wasted investigation is cheaper than a \
+real bug dismissed as an environment problem.\
 """
 
 
@@ -78,6 +102,12 @@ class ClassifyResult:
         # unclear routes with product_issue (investigate), so callers usually
         # branch on is_test_issue; this is provided for symmetry / logging.
         return self.label == PRODUCT_ISSUE
+
+    @property
+    def is_environment_issue(self) -> bool:
+        """The only label that stops the flow: no source patch can fix it, so the
+        caller bails instead of investigating. See :func:`tasks._maybe_reproduce_first`."""
+        return self.label == ENVIRONMENT_ISSUE
 
 
 def _tail(text: str, limit: int = _TRACEBACK_TAIL_CHARS) -> str:

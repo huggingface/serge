@@ -26,10 +26,29 @@ TB = {
 
 
 def test_parse_valid_labels():
-    for label in ("product_issue", "test_issue", "unclear"):
+    for label in ("product_issue", "test_issue", "environment_issue", "unclear"):
         r = classify.parse_classify_response(f'{{"label": "{label}", "reason": "x"}}')
         assert r.label == label
         assert r.reason == "x"
+
+
+def test_environment_issue_predicate_is_exclusive():
+    env = classify.parse_classify_response('{"label": "environment_issue"}')
+    assert env.is_environment_issue
+    assert not env.is_product_issue and not env.is_test_issue
+    # It is the only label that stops the flow, so nothing else may report it.
+    for other in ("product_issue", "test_issue", "unclear"):
+        r = classify.parse_classify_response(f'{{"label": "{other}"}}')
+        assert not r.is_environment_issue
+
+
+def test_environment_issue_prompt_is_biased_against_itself():
+    # A wasted investigation is cheaper than a real bug dismissed as an
+    # environment problem, so the prompt must say which way to break a tie.
+    prompt = classify.build_classify_messages(["a::b::c"], {})[0]["content"]
+    assert "environment_issue" in prompt
+    assert "STOPS the fix attempt" in prompt
+    assert 'choose "product_issue"' in prompt
 
 
 def test_parse_unknown_label_is_unclear():

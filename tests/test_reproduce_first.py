@@ -1,7 +1,12 @@
 import types
 
 from reviewbot import tasks
-from reviewbot.classify import PRODUCT_ISSUE, TEST_ISSUE, ClassifyResult
+from reviewbot.classify import (
+    ENVIRONMENT_ISSUE,
+    PRODUCT_ISSUE,
+    TEST_ISSUE,
+    ClassifyResult,
+)
 from reviewbot.verify import (
     DISPATCH_FAILED,
     NOT_REPRODUCED,
@@ -15,10 +20,11 @@ CTX = (
 )
 
 
-def _cfg(reproduce_first=True):
+def _cfg(reproduce_first=True, bail_on_env=True):
     return types.SimpleNamespace(
         verify_on_gpu=True,
         verify_reproduce_first=reproduce_first,
+        classify_bail_on_environment=bail_on_env,
         verify_max_rounds=0,
         verify_workflow_file="serge-verify-caller.yml",
         verify_ref="main",
@@ -150,6 +156,56 @@ def test_reproduced_test_issue_routing_note(monkeypatch):
     )
     _call(_cfg())
     assert "TEST/expectations issue" in rec["prepare_contexts"][0]
+
+
+def test_environment_issue_bails_after_one_classifier_call(monkeypatch):
+    # The failure is REAL on GPU but not patchable (runner OOM, missing dep, a
+    # checkpoint gone from the Hub). Investigating could only end `no_fix`, so we
+    # stop here — no LLM cycle, no PR. This is the whole point of the label.
+    rec = _install(
+        monkeypatch,
+        repro_outcome=VerifyOutcome(
+            REPRODUCED,
+            tracebacks={"n": "torch.OutOfMemoryError: CUDA out of memory"},
+            run_url="https://github.com/o/r/actions/runs/222-repro",
+        ),
+        classify_result=ClassifyResult(
+            ENVIRONMENT_ISSUE, reason="CUDA out of memory on the runner"
+        ),
+    )
+    result = _call(_cfg())
+    assert rec["reproduce_called"] is True
+    assert rec["prepare_contexts"] == []  # never investigated
+    assert rec["published"] is False
+    assert result.no_change is True
+    assert (
+        result.verify_verdict == REPRODUCED
+    )  # it DID reproduce; it just can't be fixed
+    # The recap takes the first line as the reason, so it must lead with it.
+    assert result.message.splitlines()[0].startswith("GPU reproduce + classify:")
+    assert "ENVIRONMENT issue" in result.message
+    assert "CUDA out of memory on the runner" in result.message
+    assert "222-repro" in result.message
+    # The tracebacks travel with the bail so a human sees what happened.
+    assert result.verify_tracebacks == {
+        "n": "torch.OutOfMemoryError: CUDA out of memory"
+    }
+
+
+def test_environment_issue_investigates_when_bail_disabled(monkeypatch):
+    # CLASSIFY_BAIL_ON_ENVIRONMENT=0 restores investigate-everything, but the
+    # agent must still be told what the label means rather than dropped in blind.
+    rec = _install(
+        monkeypatch,
+        repro_outcome=VerifyOutcome(REPRODUCED, tracebacks={"n": "ImportError: x"}),
+        classify_result=ClassifyResult(ENVIRONMENT_ISSUE, reason="missing dependency"),
+    )
+    result = _call(_cfg(bail_on_env=False))
+    assert rec["published"] is True
+    seeded = rec["prepare_contexts"][0]
+    assert "ENVIRONMENT/dependency problem" in seeded
+    assert "no source patch fixes it" in seeded
+    assert result.pr_number == 1
 
 
 def test_infra_error_fails_open_to_investigate(monkeypatch):
