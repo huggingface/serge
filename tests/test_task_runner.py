@@ -373,6 +373,42 @@ class RunnerConfigPassthroughTest(unittest.TestCase):
         self.assertTrue(out["verify_reproduce_first"])
         self.assertTrue(out["verify_on_gpu"])
 
+    def test_all_classify_fields_are_threaded_to_the_runner(self):
+        # The classifier runs in the runner pod, so EVERY classify_* setting must
+        # reach it — a missing one silently reverts to the dataclass default there
+        # (that is bug #6: classify_max_tokens defaulted to 300 in the pod). Kept
+        # generic so a new classify_* field cannot repeat it.
+        import dataclasses
+
+        from reviewbot import launcher
+        from reviewbot.config import Config
+
+        classify_fields = {
+            f.name for f in dataclasses.fields(Config) if f.name.startswith("classify_")
+        }
+        missing = classify_fields - set(launcher.RUNNER_CONFIG_FIELDS)
+        self.assertEqual(
+            missing,
+            set(),
+            f"classify_* Config fields not threaded to the runner pod: {missing}",
+        )
+
+    def test_classify_bail_on_environment_is_threaded_to_the_runner(self):
+        # `_maybe_reproduce_first` reads this in the runner pod to decide whether an
+        # `environment_issue` verdict stops the flow; unthreaded, the pod would
+        # always use the default regardless of the operator's setting.
+        import types
+
+        from reviewbot import launcher
+
+        fake = types.SimpleNamespace(
+            **{
+                field: (field == "classify_bail_on_environment")
+                for field in launcher.RUNNER_CONFIG_FIELDS
+            }
+        )
+        self.assertTrue(launcher.runner_config(fake)["classify_bail_on_environment"])
+
     def test_classify_max_tokens_is_threaded_to_the_runner(self):
         # The classifier runs in the runner pod (_classify_reproduced), so its
         # token budget must reach it or the pod silently uses the dataclass
