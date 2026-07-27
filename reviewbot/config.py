@@ -174,8 +174,14 @@ class Config:
     # Per-traceback char budget when serge seeds the reproduced/verify failures
     # into the fix prompt. The GPU run emits full assertion diffs (pytest -vv);
     # the old 2000-char tail chopped the very generated strings the LLM needs to
-    # rewrite stale expected values. Tunable via REPRODUCE_TB_CHARS.
-    reproduce_tb_chars: int = 12000
+    # rewrite stale expected values. Raised to 40000 to pair with the verdict
+    # tool's traceback distiller (serge_verify_verdict.distill_failure): the
+    # distiller caps KB-scale intermediate tensors so a distilled traceback is
+    # ~20-30KB, and this budget keeps the whole of it — including the assert diff
+    # and the asserted actual output, which sit at the HEAD of the longrepr and a
+    # smaller tail-cut would drop (the owlvit/instructblip cases).
+    # Tunable via REPRODUCE_TB_CHARS.
+    reproduce_tb_chars: int = 40000
     # Optional task-only completion-token cap. When unset, tasks use the
     # normal llm_max_tokens value.
     task_llm_max_tokens: Optional[int] = None
@@ -437,7 +443,7 @@ class Config:
             classify_bail_on_environment=_bool_env(
                 "CLASSIFY_BAIL_ON_ENVIRONMENT", True
             ),
-            reproduce_tb_chars=_int_env("REPRODUCE_TB_CHARS", 12000),
+            reproduce_tb_chars=_int_env("REPRODUCE_TB_CHARS", 40000),
             # Streaming on by default — the web UI's live token counter
             # and reasoning display rely on incremental SSE chunks. Set
             # LLM_STREAM=0 to fall back to the buffered REST path.
