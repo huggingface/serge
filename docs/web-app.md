@@ -44,6 +44,33 @@ Use `WEB_ALLOWED_ORG=org-a,org-b` instead of, or in addition to,
 
 Set `DEV_NO_AUTH=1` only for local development.
 
+## Private Repositories
+
+Private repositories are supported: install the GitHub App on them and add a
+matching [provider config](#provider-configs). serge reads and clones them with
+the App's installation token, so no personal access token is involved and the
+OAuth scope stays `read:org`.
+
+Because a private repository's diff must not reach someone GitHub would not
+show it to, serge checks repository access on top of the login allowlist:
+
+- Submitting a review requires the signed-in user to be a **collaborator** on
+  the target repository (org membership alone is not enough).
+- Following a review or task — including webhook-triggered ones, which any
+  signed-in user may otherwise open — requires the same.
+
+Public repositories are unaffected: any signed-in user may review and follow
+them, as before.
+
+The check runs against the App's `Metadata: read` permission and is
+**fail-closed** — if GitHub cannot be reached, or the App is not installed on
+the repository, access is denied. Verdicts are cached for five minutes, so
+revoking someone's repository access takes up to that long to take effect in
+serge.
+
+Repository names and PR numbers stay visible to all signed-in users on the
+cross-user `/journal` page; only review and task *content* is gated.
+
 ## Provider Configs
 
 The web app stores per-repository provider configs in SQLite. A provider config

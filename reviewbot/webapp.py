@@ -286,6 +286,119 @@ def _user_is_allowed(login: str, orgs: list[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Private-repo gate.
+#
+# The login allowlist says who may use serge at all; on a public repo that
+# is enough, since the diff serge shows is public anyway. A private repo is
+# different: its diff, draft and task patch must not reach a user GitHub
+# itself wouldn't show them to. So for private repos serge additionally
+# requires the submitter/viewer to be a collaborator — the UI equivalent of
+# the webhook's ``author_association`` check.
+#
+# The check is App-side (installation token + ``Metadata: read``), so it
+# needs no extra OAuth scope from the user and is not defeated by SAML SSO.
+# Verdicts are cached per (user, repo) for a few minutes to keep the extra
+# round-trips off the streaming/publish path; the TTL bounds how long a
+# revoked access stays usable.
+# ---------------------------------------------------------------------------
+_REPO_ACCESS_TTL_SECONDS = 300.0
+_REPO_ACCESS_CACHE_MAX = 512
+_repo_access_lock = threading.Lock()
+_repo_access_cache: dict[tuple[str, str, str], tuple[float, bool]] = {}
+
+
+def _installation_client(owner: str, repo: str) -> GitHubClient:
+    """A GitHubClient carrying the App's installation token for the repo.
+    Raises AppNotInstalledError when the App can't see it at all."""
+    installation_id = installation_id_for_repo(
+        cfg.github_app_id or "", cfg.github_private_key or "", owner, repo
+    )
+    token = installation_token(
+        cfg.github_app_id or "", cfg.github_private_key or "", installation_id
+    )
+    return GitHubClient(token)
+
+
+def _user_may_access_repo(user: str, owner: str, repo: str) -> bool:
+    """True when ``user`` may see ``owner/repo`` through serge: always for a
+    public repo, only for collaborators on a private one.
+
+    Fail-closed — a GitHub error or an inconclusive collaborator answer
+    denies. Raises AppNotInstalledError if the App isn't installed on the
+    repo (the caller decides whether that is a setup hint or a denial)."""
+    if cfg.web_dev_no_auth or not (cfg.github_app_id and cfg.github_private_key):
+        return True
+    key = (user.lower(), owner.lower(), repo.lower())
+    now = time.monotonic()
+    with _repo_access_lock:
+        cached = _repo_access_cache.get(key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    gh = _installation_client(owner, repo)
+    try:
+        if not bool(gh.get_repo(owner, repo).get("private")):
+            allowed: Optional[bool] = True
+        else:
+            allowed = gh.is_collaborator(owner, repo, user)
+    except requests.RequestException:
+        # Don't cache a transient failure — the next request retries.
+        log.warning(
+            "could not check %s's access to %s/%s", user, owner, repo, exc_info=True
+        )
+        return False
+    if allowed is None:
+        log.warning(
+            "inconclusive collaborator check for %s on private %s/%s; denying. "
+            "The GitHub App needs 'Metadata: read' on the repository.",
+            user,
+            owner,
+            repo,
+        )
+        allowed = False
+
+    with _repo_access_lock:
+        if len(_repo_access_cache) >= _REPO_ACCESS_CACHE_MAX:
+            _repo_access_cache.clear()
+        _repo_access_cache[key] = (now + _REPO_ACCESS_TTL_SECONDS, allowed)
+    return allowed
+
+
+def _require_repo_access(user: str, owner: str, repo: str) -> None:
+    """Submit path. A missing installation is an actionable setup error
+    (400) rather than a permission failure — it is the same condition the
+    review worker would hit seconds later, surfaced up front."""
+    try:
+        allowed = _user_may_access_repo(user, owner, repo)
+    except AppNotInstalledError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not allowed:
+        log.warning("denied %s access to private repo %s/%s", user, owner, repo)
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"no_repo_access: your GitHub account does not have access to "
+                f"the private repository '{owner}/{repo}'."
+            ),
+        )
+
+
+def _require_job_repo_access(user: str, owner: str, repo: str) -> None:
+    """View path. Same gate, but an App that can no longer see the repo is a
+    denial: the job may predate an uninstall, and we can't tell whether its
+    content was private."""
+    try:
+        allowed = _user_may_access_repo(user, owner, repo)
+    except AppNotInstalledError:
+        log.warning(
+            "cannot verify %s's access to %s/%s: App not installed", user, owner, repo
+        )
+        allowed = False
+    if not allowed:
+        raise HTTPException(status_code=403, detail="no_repo_access")
+
+
+# ---------------------------------------------------------------------------
 # In-memory job registry. Each Job owns an asyncio.Queue the SSE endpoint
 # consumes; the worker thread pushes events via call_soon_threadsafe.
 # ---------------------------------------------------------------------------
@@ -3156,6 +3269,9 @@ async def submit_review(request: Request) -> JSONResponse:
     if len(trigger_comment) > _MAX_TRIGGER_COMMENT_CHARS:
         raise HTTPException(status_code=413, detail="comment_too_long")
     owner, repo, number = _parse_pr_ref(pr_ref)
+    # Private repos: the submitter must be able to see the repo on GitHub
+    # before serge streams its diff into the browser.
+    _require_repo_access(user, owner, repo)
     llm_provider = _parse_provider(payload)
     llm_max_input_tokens = _parse_max_input_tokens(payload)
     # Stash any newly-discovered orgs on the eventual response so a
@@ -3330,6 +3446,10 @@ def _get_owned_job(
         or job.target_number != number
     ):
         raise HTTPException(status_code=404, detail="job_target_mismatch")
+    # Webhook jobs (and shared links followed by an admin) skip the owner
+    # check above, so a private repo's review would otherwise be readable by
+    # any signed-in user. Gate every viewer on repo access instead.
+    _require_job_repo_access(user, job.target_owner, job.target_repo)
     return job
 
 
@@ -3671,12 +3791,13 @@ def discard(
 
 
 # ---------------------------------------------------------------------------
-# Tasks views: any authenticated user may follow a task (they are kicked
-# off by a machine via OIDC, not by a UI user, so there is no per-user
-# ownership to enforce — same posture as webhook reviews).
+# Tasks views: any authenticated user with access to the repo may follow a
+# task (they are kicked off by a machine via OIDC, not by a UI user, so
+# there is no per-user ownership to enforce — same posture as webhook
+# reviews).
 # ---------------------------------------------------------------------------
 def _get_task_job(request: Request, owner: str, repo: str, job_id: str) -> Job:
-    _require_user(request)
+    user = _require_user(request)
     with _jobs_lock:
         job = _jobs.get(job_id)
     if job is None:
@@ -3685,6 +3806,9 @@ def _get_task_job(request: Request, owner: str, repo: str, job_id: str) -> Job:
         raise HTTPException(status_code=404, detail="task_not_found")
     if job.target_owner != owner or job.target_repo != repo:
         raise HTTPException(status_code=404, detail="task_target_mismatch")
+    # No per-user ownership on tasks, so repo access is the only thing
+    # standing between a private repo's patch and any signed-in user.
+    _require_job_repo_access(user, job.target_owner, job.target_repo)
     return job
 
 

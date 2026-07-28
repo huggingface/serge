@@ -43,6 +43,9 @@ Use these permissions:
 | Issues | Read |
 | Metadata | Read |
 
+`Metadata: read` also powers the web app's private-repository access check —
+see [Private Repositories](web-app.md#private-repositories).
+
 Subscribe to:
 
 - Issue comment
