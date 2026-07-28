@@ -67,6 +67,8 @@ RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
     "tool_max_iterations",
     "tool_max_iterations_strict",
     "tool_repeat_limit",
+    "task_scope_commit_to_patch",
+    "task_commit_always_include",
     "verify_on_gpu",
     "verify_reproduce_first",
     "verify_workflow_file",

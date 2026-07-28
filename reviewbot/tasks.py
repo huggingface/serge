@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 
 from . import __version__
 from .clone_cache import Checkout, CloneCache, FileChange
+from .commit_scope import describe_dropped, scope_paths
 from .compression import MessageCompressor
 from .config import Config
 from .github_client import SERGE_GIT_EMAIL, GitHubClient
@@ -1072,6 +1073,26 @@ def publish_task(
             no_change=True,
             message="Patch applied but produced no file changes.",
         )
+
+    # The normalizer fixes the whole worktree, so a base that is not itself
+    # normalizer-clean contributes regenerated files the fix never touched (one
+    # prod task patched 1 file and committed 32). Drop those — validation above
+    # still ran repo-wide; only the commit is scoped.
+    if getattr(cfg, "task_scope_commit_to_patch", False):
+        keep, dropped = scope_paths(
+            [c.path for c in changes],
+            plan.patch,
+            always_include=getattr(cfg, "task_commit_always_include", None),
+        )
+        if dropped:
+            kept = set(keep)
+            changes = [c for c in changes if c.path in kept]
+            _emit(
+                "log",
+                f"Left {len(dropped)} unrelated file(s) out of the commit — "
+                f"regenerated from a stale base, not by this fix: "
+                f"{describe_dropped(dropped)}",
+            )
 
     return _commit_changes(
         cfg,

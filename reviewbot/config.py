@@ -3,7 +3,7 @@ import os
 import shlex
 import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from . import sandbox
@@ -94,6 +94,14 @@ class Config:
     # it is repeating; past this many the loop stops rather than spending the
     # rest of the input-token budget re-running the same search. 0 disables.
     tool_repeat_limit: int = 6
+    # Commit only the files the patch is responsible for, dropping files the
+    # normalizer regenerated because the *base* was stale (see commit_scope).
+    # Validation still runs repo-wide; this only bounds the commit.
+    task_scope_commit_to_patch: bool = True
+    # Globs always committed even when unrelated to the patch — the escape hatch
+    # for a normalizer that rewrites cross-cutting generated files (e.g.
+    # "src/transformers/utils/dummy_*.py").
+    task_commit_always_include: list[str] = field(default_factory=list)
 
     # When true, published reviews carry a note that they came from a
     # non-production (staging) deployment. Set via the STAGING env var.
@@ -485,6 +493,12 @@ class Config:
             tool_max_iterations=_int_env("TOOL_MAX_ITERATIONS", 30),
             llm_max_input_tokens=_int_env("LLM_MAX_INPUT_TOKENS", 2_000_000),
             tool_repeat_limit=_int_env("TOOL_REPEAT_LIMIT", 6),
+            task_scope_commit_to_patch=_bool_env("TASK_SCOPE_COMMIT_TO_PATCH", True),
+            task_commit_always_include=[
+                p.strip()
+                for p in (os.environ.get("TASK_COMMIT_ALWAYS_INCLUDE") or "").split(",")
+                if p.strip()
+            ],
             is_staging=_bool_env("STAGING", False),
             github_oauth_client_id=oauth_client_id,
             github_oauth_client_secret=oauth_client_secret,
