@@ -44,6 +44,7 @@ from .github_auth import (
     AppNotInstalledError,
     installation_id_for_repo,
     installation_token,
+    installation_token_for_repo,
     user_is_org_member,
 )
 from .github_client import GitHubClient
@@ -1496,6 +1497,9 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
                 f"{cfg.task_callback_base_url}/internal/tasks/{job.id}/events"
             ),
             callback_token=callback_token,
+            token_url=(
+                f"{cfg.task_callback_base_url}/internal/tasks/{job.id}/github-token"
+            ),
         )
         emit("step", "launch")
         emit(
@@ -1633,6 +1637,9 @@ def _launch_review_pod(
                 f"{cfg.task_callback_base_url}/internal/tasks/{job.id}/events"
             ),
             callback_token=callback_token,
+            token_url=(
+                f"{cfg.task_callback_base_url}/internal/tasks/{job.id}/github-token"
+            ),
         )
         emit("step", "launch")
         emit("log", f"Launching review runner ({cfg.review_execution}: {image})…")
@@ -3095,6 +3102,62 @@ async def submit_task(request: Request) -> JSONResponse:
     )
 
 
+def _authorize_runner_callback(job_id: str, request: Request) -> Job:
+    """Shared auth for the runner's internal endpoints.
+
+    The sole authorization is the unguessable per-job bearer token serge minted
+    at launch plus a live task/review job — a finished job (token cleared) or a
+    wrong token is rejected."""
+    token = _bearer_token(request)
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if (
+        job is None
+        or job.kind not in ("task", "review")
+        or not job.callback_token
+        or not hmac.compare_digest(token, job.callback_token)
+    ):
+        raise HTTPException(status_code=401, detail="invalid_callback_token")
+    return job
+
+
+@app.post("/internal/tasks/{job_id}/github-token")
+async def refresh_task_github_token(job_id: str, request: Request) -> JSONResponse:
+    """Mint a replacement GitHub installation token for a running runner.
+
+    Installation tokens expire after an hour. The runner pod deliberately holds
+    no App private key (serge mints the token and hands it over in the spec), so
+    when a long run's token dies mid-flight the pod cannot re-mint on its own —
+    it asks here, over the same authenticated channel it already streams events
+    on. Scoped to the job's own target repo, so the token this returns is never
+    broader than the one the pod started with.
+
+    Internal only — same authorization as the events callback."""
+    job = _authorize_runner_callback(job_id, request)
+    if not (cfg.github_app_id and cfg.github_private_key):
+        raise HTTPException(status_code=500, detail="github_app_not_configured")
+    try:
+        token = await asyncio.to_thread(
+            installation_token_for_repo,
+            cfg.github_app_id,
+            cfg.github_private_key,
+            job.target_owner,
+            job.target_repo,
+        )
+    except AppNotInstalledError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception:  # noqa: BLE001
+        log.exception("could not re-mint an installation token for job %s", job_id)
+        raise HTTPException(status_code=502, detail="token_mint_failed")
+    log.info(
+        "re-minted the installation token for job %s (%s/%s)",
+        job_id,
+        job.target_owner,
+        job.target_repo,
+    )
+    return JSONResponse({"token": token})
+
+
 @app.post("/internal/tasks/{job_id}/events")
 async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
     """Callback sink for the per-task runner (docker/kubernetes backends).
@@ -3107,16 +3170,7 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
     pushed onto the job's SSE stream; a *terminal* payload records the final
     ``status``/``result``/``error`` (the launcher thread then persists +
     notifies, exactly as for the in-process worker)."""
-    token = _bearer_token(request)
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-    if (
-        job is None
-        or job.kind not in ("task", "review")
-        or not job.callback_token
-        or not hmac.compare_digest(token, job.callback_token)
-    ):
-        raise HTTPException(status_code=401, detail="invalid_callback_token")
+    job = _authorize_runner_callback(job_id, request)
 
     try:
         payload = await request.json()

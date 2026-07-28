@@ -29,7 +29,12 @@ from .github_client import GitHubClient
 from .llm_client import LLMResponseError
 from .reviewer import ReviewRequest, _UnparseableLLMOutput, prepare_review
 from .store import encode_draft
-from .task_runner import CallbackEmitter, RunnerSpec, build_runner_config
+from .task_runner import (
+    CallbackEmitter,
+    RunnerSpec,
+    TokenRefresher,
+    build_runner_config,
+)
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +59,14 @@ def run(spec: RunnerSpec) -> int:
         spec.callback.get("url"), spec.callback.get("token"), spec.job_id
     )
     clone_cache = CloneCache(cfg.web_clone_cache_dir)
-    gh = GitHubClient(spec.github_token)
+    gh = GitHubClient(
+        spec.github_token,
+        token_provider=TokenRefresher(
+            spec.callback.get("token_url"),
+            spec.callback.get("token"),
+            spec.github_token,
+        ),
+    )
     checkout: Optional[Checkout] = None
 
     def emit(kind: str, text: str) -> None:
