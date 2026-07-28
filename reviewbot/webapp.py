@@ -2496,6 +2496,51 @@ async def hf_models(request: Request) -> JSONResponse:
     return JSONResponse({"models": await _fetch_hf_router_models()})
 
 
+def _models_for_provider_config(matched: dict[str, Any]) -> dict[str, Any]:
+    """List the models a stored provider config's endpoint advertises,
+    using its key server-side. Never raises: ``{models: [...]}`` on
+    success, ``{models: [], error, error_code}`` when the provider's
+    ``/models`` route can't be reached — the form then keeps the
+    free-text box. The cause only ever reaches the server log: the
+    endpoint's own error text can carry sensitive detail."""
+    body: dict[str, Any] = {"models": []}
+    provider = matched["provider"]
+    try:
+        api_base = _api_base_for_provider(provider, custom_base=matched.get("api_base"))
+        bill_to = _llm_bill_to_for_provider(provider)
+        client = ChatCompletionClient(
+            api_base, matched["api_key"], bill_to=bill_to, stream=False
+        )
+        body["models"] = client.list_models()
+    except Exception as exc:  # noqa: BLE001 — a failed listing is a hint, not a 500
+        log.error("could not list models for provider %s", provider, exc_info=True)
+        body["error"] = "Could not retrieve list of models"
+        body["error_code"] = exc.status_code if isinstance(exc, HTTPException) else 500
+    return body
+
+
+@app.get("/llm-options/models")
+def llm_option_models(request: Request, provider: str) -> JSONResponse:
+    """Model ids for the selected provider, listed with a stored key the
+    user is already authorized to use — no repo required. This is what
+    makes the submit form's Model field a dropdown on page load; once a
+    PR is typed, ``/reviews/models`` re-lists against the config that
+    actually matches that repo. HF keeps its own public catalogue
+    (``/llm-options/hf-models``), which needs no key at all.
+
+    Always HTTP 200: ``{models: [], error?, error_code?}`` when the user
+    has no config for the provider or its ``/models`` route fails."""
+    user = _require_user(request)
+    if provider not in _VALID_PROVIDERS:
+        raise HTTPException(status_code=400, detail="bad_provider")
+    matched = _store.find_provider_config_for_provider(
+        user=user, user_orgs=_current_user_orgs(request), provider=provider
+    )
+    if matched is None:
+        return JSONResponse({"models": []})
+    return JSONResponse(_models_for_provider_config(matched))
+
+
 @app.get("/reviews/lookup-provider")
 def lookup_provider(request: Request, owner: str, repo: str) -> JSONResponse:
     """Pre-flight match for the submit form: given a (owner, repo)
@@ -2553,9 +2598,9 @@ def review_models(request: Request, owner: str, repo: str) -> JSONResponse:
     catalogue (``/llm-options/hf-models``); this covers the keyed providers,
     whose key is only knowable once the repo (hence its config) is resolved.
 
-    Always HTTP 200: ``{models: [...]}`` on success, ``{models: [], error?}``
-    when nothing matches or the provider's ``/models`` route fails — the form
-    then keeps the free-text box."""
+    Always HTTP 200: ``{models: [...]}`` on success, ``{models: [], error?,
+    error_code?}`` when nothing matches or the provider's ``/models`` route
+    fails — the form then keeps the free-text box."""
     user = _require_user(request)
     if not _GH_NAME_RE.match(owner) or not _GH_NAME_RE.match(repo):
         raise HTTPException(status_code=400, detail="bad_repo")
@@ -2568,20 +2613,7 @@ def review_models(request: Request, owner: str, repo: str) -> JSONResponse:
     )
     if matched is None:
         return placeholder
-    provider = matched["provider"]
-    body: dict[str, Any] = {"models": []}
-    try:
-        api_base = _api_base_for_provider(provider, custom_base=matched.get("api_base"))
-        bill_to = _llm_bill_to_for_provider(provider)
-        client = ChatCompletionClient(
-            api_base, matched["api_key"], bill_to=bill_to, stream=False
-        )
-        body["models"] = client.list_models()
-    except HTTPException:
-        body["error"] = "provider base URL is not configured"
-    except Exception as exc:  # noqa: BLE001 — a bad token / no-/models route is a hint
-        body["error"] = f"{type(exc).__name__}: {exc}"
-    resp = JSONResponse(body)
+    resp = JSONResponse(_models_for_provider_config(matched))
     cookie = placeholder.headers.get("set-cookie")
     if cookie:
         resp.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))

@@ -288,6 +288,47 @@ class ProviderConfigsTests(unittest.TestCase):
             )
         )
 
+    def test_provider_lookup_ignores_repo_but_not_authorization(self) -> None:
+        store = self._store()
+        self._insert(
+            store,
+            "anthropic-cfg",
+            provider="anthropic",
+            allowed_users=["alice"],
+            repo_pattern="hf/transformers",
+        )
+        self._insert(
+            store,
+            "openai-cfg",
+            provider="openai",
+            allowed_orgs=["hf"],
+            repo_pattern="other/repo",
+        )
+
+        # No repo involved: any authorized config for the provider serves.
+        a = store.find_provider_config_for_provider(
+            user="alice", user_orgs=[], provider="anthropic"
+        )
+        assert a is not None
+        self.assertEqual(a["id"], "anthropic-cfg")
+        o = store.find_provider_config_for_provider(
+            user="bob", user_orgs=["HF"], provider="openai"
+        )
+        assert o is not None
+        self.assertEqual(o["id"], "openai-cfg")
+
+        # Unauthorized users and unconfigured providers get nothing.
+        self.assertIsNone(
+            store.find_provider_config_for_provider(
+                user="mallory", user_orgs=[], provider="anthropic"
+            )
+        )
+        self.assertIsNone(
+            store.find_provider_config_for_provider(
+                user="alice", user_orgs=[], provider="hf"
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

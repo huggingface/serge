@@ -191,7 +191,89 @@ class WebappReviewsTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         data = r.json()
         self.assertEqual(data["models"], [])
-        self.assertIn("401", data["error"])
+        # One generic message, never the upstream text (it can leak).
+        self.assertEqual(data["error"], "Could not retrieve list of models")
+        self.assertEqual(data["error_code"], 500)
+        self.assertNotIn("401", r.text)
+
+    def test_provider_models_listed_without_a_repo(self):
+        """The dropdown must be populated on page load, before any PR has
+        been typed — that's the whole point of the provider-wide list."""
+        client = TestClient(self.webapp.app)
+        self.webapp._store.insert_provider_config(
+            id="c-anthropic",
+            provider="anthropic",
+            api_key="sk-ant-stored",
+            api_base=None,
+            default_model=None,
+            repo_pattern="acme/*",
+            allowed_users=["dev"],
+            allowed_orgs=[],
+            created_by="admin",
+        )
+        seen = {}
+
+        class _FakeClient:
+            def __init__(self, api_base, api_key, *, bill_to=None, **kw):
+                seen["api_base"] = api_base
+                seen["api_key"] = api_key
+
+            def list_models(self):
+                return ["claude-opus-5", "claude-sonnet-5"]
+
+        with patch.object(self.webapp, "ChatCompletionClient", _FakeClient):
+            r = client.get("/llm-options/models", params={"provider": "anthropic"})
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["models"], ["claude-opus-5", "claude-sonnet-5"])
+        self.assertEqual(seen["api_key"], "sk-ant-stored")
+        self.assertNotIn("api_key", data)
+
+    def test_provider_models_empty_without_an_authorized_config(self):
+        client = TestClient(self.webapp.app)
+        r = client.get("/llm-options/models", params={"provider": "openai"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["models"], [])
+
+    def test_provider_models_rejects_unknown_provider(self):
+        client = TestClient(self.webapp.app)
+        r = client.get("/llm-options/models", params={"provider": "bogus"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_provider_models_fetch_error_is_a_verdict(self):
+        client = TestClient(self.webapp.app)
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            def list_models(self):
+                raise RuntimeError("Failed to list models (status 401).")
+
+        with patch.object(self.webapp, "ChatCompletionClient", _FakeClient):
+            r = client.get("/llm-options/models", params={"provider": "hf"})
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["models"], [])
+        self.assertEqual(data["error"], "Could not retrieve list of models")
+        self.assertEqual(data["error_code"], 500)
+        self.assertNotIn("401", r.text)
+
+    def test_provider_models_error_code_carries_http_status(self):
+        """An unconfigured base URL raises HTTPException — its status is
+        what ``error_code`` is for."""
+        client = TestClient(self.webapp.app)
+        with patch.object(
+            self.webapp,
+            "_api_base_for_provider",
+            side_effect=self.webapp.HTTPException(status_code=400, detail="no_base"),
+        ):
+            r = client.get("/llm-options/models", params={"provider": "hf"})
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["models"], [])
+        self.assertEqual(data["error"], "Could not retrieve list of models")
+        self.assertEqual(data["error_code"], 400)
 
     # --- effective_draft (single source of truth for what gets posted) ---
     def _sample_draft(self, **overrides):

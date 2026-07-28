@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The new-review form's per-provider model dropdown is visible again: it now
+  lists a provider's models on page load (via `GET /llm-options/models`) instead
+  of only after a PR reference resolved to a matching config, and Anthropic's
+  `/v1/models` is called with the `anthropic-version` header it requires.
 - The trigger gate now ignores comments authored by a bot, so the App never
   reacts to its own output (no self-trigger loops in App mode).
 
