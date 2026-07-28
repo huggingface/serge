@@ -639,6 +639,38 @@ class PublishFallbackNormalizeTests(unittest.TestCase):
         )
         self.assertTrue(any("models/other/regen.py" in line for line in logs))
 
+    def test_scoping_applies_to_the_prepared_worktree_path(self):
+        """The path prod task 433e8274 actually took: validation accepted the
+        patch in-loop (worktree_prepared=True), so publish_task commits the
+        worktree as-is. The scope comes from plan.patch, which is set on both
+        paths — without that this fix would no-op exactly where it is needed."""
+        co = self._checkout()
+        # Stand in for what the in-loop validation left behind: the patch applied
+        # plus normalizer drift in an unrelated directory.
+        self.cache.apply_patch(co, self._PATCH)
+        os.makedirs(os.path.join(co.path, "models", "other"), exist_ok=True)
+        with open(os.path.join(co.path, "models", "other", "regen.py"), "w") as f:
+            f.write("drift\n")
+        cfg = self._cfg(task_normalize_command=["true"], task_normalize_timeout=30)
+        plan = TaskPlan(
+            title="Fix hello",
+            body="desc",
+            patch=self._PATCH,
+            worktree_prepared=True,
+        )
+        gh = _FakeGH()
+        with patch("reviewbot.tasks.post_task_pr_created_notification"):
+            result = publish_task(
+                cfg,
+                gh,
+                self._req(),
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+        self.assertEqual(result.changed_files, ["hello.txt"])
+
     def test_scoping_can_be_turned_off(self):
         co = self._checkout()
         cfg = self._cfg(
