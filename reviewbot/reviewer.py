@@ -9,7 +9,12 @@ from .compression import MessageCompressor
 from .config import Config
 from .context_script import run_context_script
 from .github_client import GitHubClient
-from .llm_client import ChatCompletionClient, ChatResult, ToolCall
+from .llm_client import (
+    ChatCompletionClient,
+    ChatResult,
+    ToolCall,
+    _parse_text_tool_calls,
+)
 from .patch import DiffSnippetLine, ParsedFile, extract_hunk_snippet, parse_patch
 from .prompts import (
     build_followup_system_prompt,
@@ -136,7 +141,9 @@ def _content_preview(text: str, limit: int = _PARSE_PREVIEW_CHARS) -> str:
     return text[:limit] + f"... [+{len(text) - limit} chars truncated]"
 
 
-def _extract_json(content: Optional[str]) -> dict[str, Any]:
+def _extract_json(
+    content: Optional[str], require_any_key: Optional[tuple[str, ...]] = None
+) -> dict[str, Any]:
     """Forgiving JSON extraction. Tries, in order:
 
     1. Direct parse of the stripped content.
@@ -147,6 +154,13 @@ def _extract_json(content: Optional[str]) -> dict[str, Any]:
     The third pass means trailing prose after the JSON ("Hope this helps!")
     or surrounding chatter ("Sure, here you go: {...}") doesn't break us.
     Raises ValueError with a length-and-preview diagnostic when nothing parses.
+
+    ``require_any_key`` narrows what counts as a hit to objects carrying at
+    least one of those keys. Without it, pass 3 will happily return *any*
+    ``{...}`` in the reply — including a leaked tool call's own argument
+    object, which is how ``{"path": ..., "start_line": ...}`` was once
+    mistaken for a review and published as an empty summary (serge#79).
+    Callers that know their JSON contract should always pass it.
     """
     if not content:
         raise ValueError("LLM response was empty")
@@ -156,9 +170,14 @@ def _extract_json(content: Optional[str]) -> dict[str, Any]:
 
     decoder = json.JSONDecoder()
 
+    def accept(obj: Any) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        return require_any_key is None or any(k in obj for k in require_any_key)
+
     try:
         result = decoder.decode(text)
-        if isinstance(result, dict):
+        if accept(result):
             return result
     except json.JSONDecodeError:
         pass
@@ -171,7 +190,7 @@ def _extract_json(content: Optional[str]) -> dict[str, Any]:
             result = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(result, dict):
+        if accept(result):
             return result
 
     for idx in (i for i, ch in enumerate(text) if ch == "{"):
@@ -179,13 +198,46 @@ def _extract_json(content: Optional[str]) -> dict[str, Any]:
             result, _ = decoder.raw_decode(text[idx:])
         except json.JSONDecodeError:
             continue
-        if isinstance(result, dict):
+        if accept(result):
             return result
 
+    expected = ""
+    if require_any_key is not None:
+        expected = f" with any of the keys {list(require_any_key)}"
     raise ValueError(
-        f"LLM response did not contain a JSON object "
+        f"LLM response did not contain a JSON object{expected} "
         f"(length={len(content)} chars, preview={_content_preview(text)!r})"
     )
+
+
+# The review JSON contract from prompts.py — at least one of these must be
+# present for a decoded object to be a review rather than incidental JSON.
+_REVIEW_JSON_KEYS = ("summary", "comments", "event")
+
+# Chat-template special tokens (`<|im_end|>`, `<|tool_call_begin|>`, …) that a
+# model can leak into its content. `llm_client` recovers leaked tool calls, so
+# reaching here means the leak wasn't a parseable tool call — treat text made of
+# nothing but these as no review at all rather than publishing the markup.
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[^|>]*\|>")
+
+
+def _is_model_markup_only(text: str) -> bool:
+    """True when ``text`` is non-empty but says nothing — it is entirely a
+    leaked tool call, or entirely model special tokens.
+
+    The first check reuses the tool-call parser rather than stripping tokens,
+    because a leaked call leaves its own id and arguments between the tokens
+    (``functions.read_file:6``) and token-stripping alone would read that as
+    substance. Deliberately narrow: a legitimate review may quote
+    ``<|endoftext|>`` while discussing a tokenizer, so we only reject text
+    with *no* substance left — we never rewrite text that has some.
+    """
+    if not text.strip():
+        return False
+    calls, remainder = _parse_text_tool_calls(text)
+    if calls and not remainder.strip():
+        return True
+    return not _SPECIAL_TOKEN_RE.sub("", text).strip()
 
 
 def _prose_outside_json(content: Optional[str]) -> str:
@@ -1295,6 +1347,20 @@ def _load_review_rules(
     return content or cfg.default_review_rules
 
 
+class EmptyReviewError(Exception):
+    """``publish_review`` was handed a review with nothing in it — no summary
+    and no inline comments. Public (unlike ``_UnparseableLLMOutput``) because
+    the web app and the webhook publisher both need to catch it and report the
+    failure instead of posting an empty review."""
+
+    def user_message(self) -> str:
+        return (
+            "The model did not produce a usable review (no summary and no "
+            "inline comments), so nothing was posted. Re-run the review, or "
+            "try a different model."
+        )
+
+
 class _UnparseableLLMOutput(Exception):
     """The LLM returned content we couldn't parse as JSON. Carries the raw
     content + finish_reason + metrics line so the caller can render an
@@ -1511,7 +1577,7 @@ def prepare_review(
         _merge_metrics(total_metrics, chunk_metrics)
 
         try:
-            result = _extract_json(chat.content)
+            result = _extract_json(chat.content, _REVIEW_JSON_KEYS)
         except ValueError as exc:
             metrics_line = _format_aggregated_metrics(total_metrics)
             log.error(
@@ -1546,12 +1612,23 @@ def prepare_review(
             and chat.content
             and chat.content.strip()
         ):
-            summary = _prose_outside_json(chat.content) or chat.content.strip()
-            log.warning(
-                "Parsed JSON yielded empty summary/comments; using "
-                "raw content (%d chars) as summary",
-                len(summary),
-            )
+            salvaged = _prose_outside_json(chat.content) or chat.content.strip()
+            if _is_model_markup_only(salvaged):
+                # Nothing but leaked special tokens — publishing this is how
+                # serge#79 got a review body of raw `<|tool_call_begin|>`
+                # markup. Leave the summary empty so the publish gate refuses.
+                log.warning(
+                    "Discarding salvaged summary: content was only model "
+                    "special-token markup (%d chars)",
+                    len(salvaged),
+                )
+            else:
+                summary = salvaged
+                log.warning(
+                    "Parsed JSON yielded empty summary/comments; using "
+                    "raw content (%d chars) as summary",
+                    len(summary),
+                )
         if event not in ("COMMENT", "REQUEST_CHANGES", "APPROVE"):
             event = cfg.review_event
         if event == "APPROVE" and not cfg.allow_approve:
@@ -1703,15 +1780,33 @@ def publish_review(
 
     Returns the *effective* ReviewDraft that was actually posted (edits
     applied, event downgraded). Callers persist this so the audit log
-    records exactly what GitHub received rather than the raw draft."""
+    records exactly what GitHub received rather than the raw draft.
+
+    Raises :class:`EmptyReviewError` when there is nothing to say — no summary
+    and no inline comments. Such a review is never useful to a human, and
+    posting it is what turned a model malfunction into a public "(no overall
+    summary provided)" (or worse, raw special-token markup) on the PR."""
     effective = effective_draft(draft, edits, allow_approve=cfg.allow_approve)
+
+    summary_text = (effective.summary or "").strip()
+    if _is_model_markup_only(summary_text):
+        summary_text = ""
+    if not summary_text and not effective.comments:
+        raise EmptyReviewError(
+            f"refusing to publish an empty review on {effective.owner}/"
+            f"{effective.repo}#{effective.number}: no summary and no inline "
+            "comments"
+        )
 
     comments_payload: list[dict[str, Any]] = [
         {"path": c.path, "side": c.side, "line": c.line, "body": c.body}
         for c in effective.comments
     ]
 
-    body = effective.summary or "(no overall summary provided)"
+    # `summary_text` (not `effective.summary`) so a markup-only summary that
+    # rode along with real inline comments renders the fallback line rather
+    # than the leaked tokens.
+    body = summary_text or "(no overall summary provided)"
     if cfg.persona_header:
         body = f"{cfg.persona_header}\n\n{body}"
     if effective.rejected_count:
@@ -1779,7 +1874,13 @@ def run_review(
     if draft is None:
         return
     edits = ReviewEdits(event="COMMENT") if force_comment_event else None
-    publish_review(cfg, gh, draft, edits=edits)
+    try:
+        publish_review(cfg, gh, draft, edits=edits)
+    except EmptyReviewError as exc:
+        # Say so in the thread the reviewer is watching; silently posting
+        # nothing looks identical to serge never having run.
+        log.warning("empty review not published: %s", exc)
+        gh.post_issue_comment(req.owner, req.repo, req.number, exc.user_message())
 
 
 _FOLLOWUP_FORCE_FINAL_MESSAGE = (

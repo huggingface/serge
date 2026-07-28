@@ -71,6 +71,7 @@ from .llm_client import ChatCompletionClient, LLMResponseError
 from .oidc import OIDCError, verify_token
 from .reviewer import (
     DraftComment,
+    EmptyReviewError,
     ReviewDraft,
     ReviewEdits,
     ReviewRequest,
@@ -1023,6 +1024,17 @@ def _execute_review(
         _push_event(job, "step", "error")
         _push_event(job, "error", job.error)
         _push_event(job, "done", "")
+    except EmptyReviewError as exc:
+        # The model produced nothing publishable. A real failure, not a crash:
+        # report it as one rather than posting an empty review to the PR.
+        log.warning("review %s produced nothing publishable: %s", job.id, exc)
+        job.status = "error"
+        job.error = exc.user_message()
+        if auto_publish:
+            _post_webhook_failure_comment(gh, req, job.error)
+        _push_event(job, "step", "error")
+        _push_event(job, "error", job.error)
+        _push_event(job, "done", "")
     except AppNotInstalledError as exc:
         # Expected failure mode — the App isn't installed on the target
         # repo. Surface the actionable message verbatim instead of the
@@ -1735,6 +1747,15 @@ def _webhook_publish_or_report(job: Job) -> None:
             # produced (APPROVE may be downgraded inside publish_review).
             job.published_draft = publish_review(worker_cfg, gh, job.draft)
             job.status = "published"
+        except EmptyReviewError as exc:
+            # Nothing publishable came out of the model. Record it as an error
+            # and tell the human who triggered the review, instead of leaving
+            # the job looking done with no review on the PR.
+            log.warning("webhook auto-publish: %s", exc)
+            job.status = "error"
+            job.error = str(exc)
+            if isinstance(req, ReviewRequest):
+                _post_webhook_failure_comment(gh, req, exc.user_message())
         except Exception:  # noqa: BLE001
             log.exception("webhook auto-publish failed for job %s", job.id)
 
@@ -3685,7 +3706,13 @@ async def publish(
     # Persist exactly what publish_review posted — including any APPROVE ->
     # COMMENT downgrade — instead of re-deriving the draft separately (which
     # could drift from the publish path).
-    job.published_draft = publish_review(cfg, gh, job.draft, edits=edits)
+    try:
+        job.published_draft = publish_review(cfg, gh, job.draft, edits=edits)
+    except EmptyReviewError as exc:
+        # 409: the human can still fix this by editing the summary in the UI
+        # and hitting publish again, so it's a conflict, not a server error.
+        log.warning("publish refused for job %s: %s", job.id, exc)
+        raise HTTPException(status_code=409, detail="empty_review") from exc
     job.status = "published"
     job.review_edits = _review_edits_to_dict(edits)
     _store.update_status(job.id, "published")

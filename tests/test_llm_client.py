@@ -4,7 +4,11 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from reviewbot.llm_client import ChatCompletionClient, LLMResponseError
+from reviewbot.llm_client import (
+    ChatCompletionClient,
+    LLMResponseError,
+    _parse_text_tool_calls,
+)
 
 
 def _interrupted_iter_lines(prefix_lines: list[str], exc: Exception):
@@ -805,6 +809,175 @@ class ChatCompletionClientTests(unittest.TestCase):
             ChatCompletionClient("https://api.openai.com/v1", "sk").list_models()
 
         self.assertNotIn("anthropic-version", mock_get.call_args.kwargs["headers"])
+
+
+class TextToolCallRecoveryTests(unittest.TestCase):
+    """Kimi models on the HF Router sometimes write a tool call into
+    `message.content` as raw chat-template special tokens and leave the
+    structured `tool_calls` field empty, with finish_reason="stop". The agent
+    loop then reads it as a final answer — which published a review body of
+    nothing but that markup (serge#79). Recover the call instead."""
+
+    # The exact content moonshotai/Kimi-K2.6 returned on the serge#79 run.
+    PROD_CONTENT = (
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.read_file:6"
+        '<|tool_call_argument_begin|>{"path": "reviewbot/reviewer.py", '
+        '"start_line": 248, "end_line": 280}<|tool_call_end|>'
+        "<|tool_calls_section_end|>"
+    )
+
+    def test_recovers_the_prod_payload(self) -> None:
+        calls, content = _parse_text_tool_calls(self.PROD_CONTENT)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "read_file")
+        self.assertEqual(calls[0].id, "functions.read_file:6")
+        self.assertEqual(
+            json.loads(calls[0].arguments),
+            {"path": "reviewbot/reviewer.py", "start_line": 248, "end_line": 280},
+        )
+        # Nothing but markup went in, so no content survives.
+        self.assertEqual(content, "")
+
+    def test_content_without_markers_is_returned_untouched(self) -> None:
+        calls, content = _parse_text_tool_calls("A normal review summary.")
+        self.assertEqual(calls, [])
+        self.assertEqual(content, "A normal review summary.")
+
+    def test_recovers_multiple_calls(self) -> None:
+        content = (
+            "<|tool_calls_section_begin|>"
+            '<|tool_call_begin|>functions.read_file:0<|tool_call_argument_begin|>{"path": "a.py"}<|tool_call_end|>'
+            '<|tool_call_begin|>functions.grep:1<|tool_call_argument_begin|>{"q": "x"}<|tool_call_end|>'
+            "<|tool_calls_section_end|>"
+        )
+        calls, _ = _parse_text_tool_calls(content)
+        self.assertEqual([c.name for c in calls], ["read_file", "grep"])
+        self.assertEqual(
+            [c.arguments for c in calls], ['{"path": "a.py"}', '{"q": "x"}']
+        )
+
+    def test_keeps_prose_written_around_the_markup(self) -> None:
+        content = (
+            "Let me check that file.\n"
+            "<|tool_call_begin|>read_file<|tool_call_argument_begin|>"
+            '{"path": "a.py"}<|tool_call_end|>\nThen I will decide.'
+        )
+        calls, cleaned = _parse_text_tool_calls(content)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "read_file")
+        self.assertEqual(cleaned, "Let me check that file.\n\nThen I will decide.")
+
+    def test_truncated_trailing_call_still_recovers(self) -> None:
+        # `<|tool_call_end|>` never arrived — the arguments are complete
+        # anyway, so use them rather than throwing the whole turn away.
+        content = (
+            "<|tool_call_begin|>functions.read_file:2<|tool_call_argument_begin|>"
+            '{"path": "a.py"}'
+        )
+        calls, cleaned = _parse_text_tool_calls(content)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].arguments, '{"path": "a.py"}')
+        self.assertEqual(cleaned, "")
+
+    def test_call_with_no_argument_marker_is_dropped(self) -> None:
+        calls, _ = _parse_text_tool_calls("<|tool_call_begin|>functions.read_file:1")
+        self.assertEqual(calls, [])
+
+    def test_unrecognizable_id_is_dropped_not_invented(self) -> None:
+        content = (
+            "<|tool_call_begin|>not a tool id!<|tool_call_argument_begin|>"
+            "{}<|tool_call_end|>"
+        )
+        calls, _ = _parse_text_tool_calls(content)
+        self.assertEqual(calls, [])
+
+    def test_bare_name_without_namespace_or_index(self) -> None:
+        content = "<|tool_call_begin|>read_file<|tool_call_argument_begin|>{}<|tool_call_end|>"
+        calls, _ = _parse_text_tool_calls(content)
+        self.assertEqual([c.name for c in calls], ["read_file"])
+
+    def test_complete_recovers_on_the_buffered_path(self) -> None:
+        with patch("reviewbot.llm_client.requests.post") as mock_post:
+            mock_post.return_value = Mock(
+                status_code=200,
+                raise_for_status=Mock(),
+                json=Mock(
+                    return_value={
+                        "choices": [
+                            {
+                                "message": {"content": self.PROD_CONTENT},
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                ),
+            )
+            client = ChatCompletionClient(
+                "https://example.com/v1", "token", "moonshotai/Kimi-K2.6"
+            )
+            result = client.complete([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].name, "read_file")
+        self.assertEqual(result.content, "")
+
+    def test_complete_recovers_on_the_streaming_path(self) -> None:
+        sse_lines = [
+            "data: "
+            + json.dumps({"choices": [{"delta": {"content": self.PROD_CONTENT}}]}),
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        with patch("reviewbot.llm_client.requests.post") as mock_post:
+            mock_post.return_value = Mock(
+                status_code=200,
+                raise_for_status=Mock(),
+                iter_lines=Mock(return_value=iter(sse_lines)),
+            )
+            client = ChatCompletionClient(
+                "https://example.com/v1",
+                "token",
+                "moonshotai/Kimi-K2.6",
+                stream=True,
+            )
+            result = client.complete([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].name, "read_file")
+
+    def test_structured_tool_calls_win_over_text_markup(self) -> None:
+        with patch("reviewbot.llm_client.requests.post") as mock_post:
+            mock_post.return_value = Mock(
+                status_code=200,
+                raise_for_status=Mock(),
+                json=Mock(
+                    return_value={
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": self.PROD_CONTENT,
+                                    "tool_calls": [
+                                        {
+                                            "id": "call_a",
+                                            "function": {
+                                                "name": "grep",
+                                                "arguments": '{"q": "x"}',
+                                            },
+                                        }
+                                    ],
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ]
+                    }
+                ),
+            )
+            client = ChatCompletionClient("https://example.com/v1", "token", "m")
+            result = client.complete([{"role": "user", "content": "hi"}])
+
+        self.assertEqual([c.name for c in result.tool_calls], ["grep"])
+        # The structured field was authoritative, so content is left alone.
+        self.assertEqual(result.content, self.PROD_CONTENT)
 
 
 if __name__ == "__main__":

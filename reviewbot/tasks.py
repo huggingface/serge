@@ -57,6 +57,11 @@ log = logging.getLogger(__name__)
 
 _NORMALIZE_FEEDBACK_CHARS = 80_000
 
+# The task JSON contract from prompts.py. Passed to `_extract_json` so a stray
+# `{...}` in the reply — notably a leaked tool call's own argument object —
+# can't be mistaken for the task result.
+_TASK_JSON_KEYS = ("title", "body", "patch")
+
 # Serge only ever writes inside its own branch namespace. ``existing_pr``
 # mode is rejected for any head branch outside it, so the OIDC
 # ``repository`` claim cannot be leveraged to push to an arbitrary PR.
@@ -404,7 +409,7 @@ def _validate_patch(
     assert command is not None
 
     try:
-        result = _extract_json(content)
+        result = _extract_json(content, _TASK_JSON_KEYS)
     except ValueError:
         # Unparseable — not something the normalizer can speak to. Accept here
         # and let prepare_task's own extraction raise the proper error.
@@ -581,7 +586,7 @@ def prepare_task(
     _emit("log", f"LLM done: {metrics_line}")
 
     try:
-        result = _extract_json(chat.content)
+        result = _extract_json(chat.content, _TASK_JSON_KEYS)
     except ValueError as exc:
         raise _UnparseableLLMOutput(
             content=chat.content or "",
