@@ -126,6 +126,11 @@ _FENCED_BLOCK_RE = re.compile(r"```(?:json|JSON)?\s*([\s\S]*?)\s*```")
 _LEADING_FENCE_RE = re.compile(r"\A```[ \t]*(?:json|JSON)?[ \t]*\r?\n?")
 _CLOSING_FENCE_RE = re.compile(r"\A\s*```[ \t]*\r?\n?")
 _TAGGED_DIFF_LINE_RE = re.compile(r"^\[(R|L)\s*(\d+)\] ")
+# Keys the review contract promises (see prompts.build_system_prompt). Used to
+# tell the real payload apart from brace-literals the model quotes in prose.
+REVIEW_JSON_KEYS = ("summary", "event", "comments")
+# Same, for the task (fix/speed-up) contract in prompts.build_task_*_prompt.
+TASK_JSON_KEYS = ("patch", "title", "body")
 _PARSE_PREVIEW_CHARS = 500
 
 
@@ -135,32 +140,35 @@ def _content_preview(text: str, limit: int = _PARSE_PREVIEW_CHARS) -> str:
     return text[:limit] + f"... [+{len(text) - limit} chars truncated]"
 
 
-def _extract_json(content: Optional[str]) -> dict[str, Any]:
-    """Forgiving JSON extraction. Tries, in order:
+@dataclass
+class _JsonCandidate:
+    """A decodable JSON object found in an LLM reply, with the span it
+    occupies in the (preprocessed) text so callers can peel it off."""
 
-    1. Direct parse of the stripped content.
+    obj: dict[str, Any]
+    start: int
+    end: int
+
+
+def _json_candidates(text: str):
+    """Yield every decodable JSON object in `text`, in preference order:
+
+    1. Direct parse of the whole text.
     2. Each fenced ``` block (with or without a `json` language tag).
-    3. ``raw_decode`` starting at every ``{`` position, picking the first
-       attempt that yields a JSON object.
+    3. ``raw_decode`` starting at every ``{`` position.
 
     The third pass means trailing prose after the JSON ("Hope this helps!")
     or surrounding chatter ("Sure, here you go: {...}") doesn't break us.
-    Raises ValueError with a length-and-preview diagnostic when nothing parses.
     """
-    if not content:
-        raise ValueError("LLM response was empty")
-    text = content.strip()
-    if not text:
-        raise ValueError("LLM response was whitespace only")
-
     decoder = json.JSONDecoder()
 
     try:
         result = decoder.decode(text)
-        if isinstance(result, dict):
-            return result
     except json.JSONDecodeError:
         pass
+    else:
+        if isinstance(result, dict):
+            yield _JsonCandidate(result, 0, len(text))
 
     for match in _FENCED_BLOCK_RE.finditer(text):
         candidate = match.group(1).strip()
@@ -171,15 +179,65 @@ def _extract_json(content: Optional[str]) -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
         if isinstance(result, dict):
-            return result
+            # Span covers the fence itself so peeling removes the wrapper too.
+            yield _JsonCandidate(result, match.start(), match.end())
 
     for idx in (i for i, ch in enumerate(text) if ch == "{"):
         try:
-            result, _ = decoder.raw_decode(text[idx:])
+            result, end = decoder.raw_decode(text[idx:])
         except json.JSONDecodeError:
             continue
         if isinstance(result, dict):
-            return result
+            yield _JsonCandidate(result, idx, idx + end)
+
+
+def _select_json(
+    text: str, expect_keys: tuple[str, ...] = ()
+) -> Optional[_JsonCandidate]:
+    """Pick the candidate that is actually the answer.
+
+    Taking the *first* decodable object is wrong when the model narrates
+    before it answers: reasoning prose that mentions ``_caches = {}`` (or any
+    other brace-literal) parses as an empty dict, so the real payload sitting
+    further down the reply is never seen and the caller falls back to
+    publishing the whole raw reply (peft#3482). Prefer the first object that
+    carries at least one of the keys the caller asked for, then the first
+    non-empty object, and only then a bare ``{}``.
+    """
+    first_any: Optional[_JsonCandidate] = None
+    first_nonempty: Optional[_JsonCandidate] = None
+    for cand in _json_candidates(text):
+        if expect_keys:
+            if any(k in cand.obj for k in expect_keys):
+                return cand
+        elif cand.obj:
+            return cand
+        if first_any is None:
+            first_any = cand
+        if first_nonempty is None and cand.obj:
+            first_nonempty = cand
+    return first_nonempty or first_any
+
+
+def _extract_json(
+    content: Optional[str], expect_keys: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """Forgiving JSON extraction — see `_json_candidates` for the passes and
+    `_select_json` for which candidate wins. Callers should pass the keys
+    their contract requires (e.g. ``("summary", "event", "comments")``) so a
+    brace-literal quoted in the model's prose can't shadow the real payload.
+
+    Raises ValueError with a length-and-preview diagnostic when nothing parses.
+    """
+    if not content:
+        raise ValueError("LLM response was empty")
+    text = content.strip()
+    if not text:
+        raise ValueError("LLM response was whitespace only")
+
+    match = _select_json(text, expect_keys)
+    if match is not None:
+        return match.obj
 
     raise ValueError(
         f"LLM response did not contain a JSON object "
@@ -187,7 +245,9 @@ def _extract_json(content: Optional[str]) -> dict[str, Any]:
     )
 
 
-def _prose_outside_json(content: Optional[str]) -> str:
+def _prose_outside_json(
+    content: Optional[str], expect_keys: tuple[str, ...] = ()
+) -> str:
     """The markdown left over once the JSON object `_extract_json` picked up
     (and any fence wrapping it) is removed.
 
@@ -197,6 +257,9 @@ def _prose_outside_json(content: Optional[str]) -> str:
     reply to the reader publishes the fence and the stub verbatim, and an
     unterminated fence swallows the entire review into one code block.
 
+    Pass the same `expect_keys` as the matching `_extract_json` call so this
+    peels the object that call consumed.
+
     Returns "" when there is no prose to salvage, so callers can keep their
     own fallback.
     """
@@ -205,18 +268,14 @@ def _prose_outside_json(content: Optional[str]) -> str:
         return ""
     text = _LEADING_FENCE_RE.sub("", text, count=1)
 
-    decoder = json.JSONDecoder()
-    for idx in (i for i, ch in enumerate(text) if ch == "{"):
-        try:
-            _, end = decoder.raw_decode(text[idx:])
-        except json.JSONDecodeError:
-            continue
-        head = text[:idx]
-        # Drop only the fence that closes the JSON block — a global strip
-        # would eat legitimate code fences inside the prose review.
-        tail = _CLOSING_FENCE_RE.sub("", text[idx + end :], count=1)
-        return "\n\n".join(part for part in (head.strip(), tail.strip()) if part)
-    return ""
+    match = _select_json(text, expect_keys)
+    if match is None:
+        return ""
+    head = text[: match.start]
+    # Drop only the fence that closes the JSON block — a global strip
+    # would eat legitimate code fences inside the prose review.
+    tail = _CLOSING_FENCE_RE.sub("", text[match.end :], count=1)
+    return "\n\n".join(part for part in (head.strip(), tail.strip()) if part)
 
 
 @dataclass
@@ -1478,7 +1537,7 @@ def prepare_review(
         _merge_metrics(total_metrics, chunk_metrics)
 
         try:
-            result = _extract_json(chat.content)
+            result = _extract_json(chat.content, REVIEW_JSON_KEYS)
         except ValueError as exc:
             metrics_line = _format_aggregated_metrics(total_metrics)
             log.error(
@@ -1499,10 +1558,9 @@ def prepare_review(
         summary = (result.get("summary") or "").strip()
         event = result.get("event") or cfg.review_event
         # Fallback: forced-final turns sometimes return a stub JSON
-        # object alongside the actual review written as prose. Since
-        # `_extract_json` accepts the first decodable `{...}`, we can
-        # end up with an empty `summary` while the model's real
-        # write-up sits in `chat.content`. Salvage the prose rather
+        # object alongside the actual review written as prose, leaving
+        # an empty `summary` while the model's real write-up sits in
+        # `chat.content`. Salvage the prose rather
         # than publishing an empty "(no overall summary provided)" —
         # but peel off the JSON stub and its ``` fence first, or the
         # published summary opens with a fence the model never closed
@@ -1513,7 +1571,10 @@ def prepare_review(
             and chat.content
             and chat.content.strip()
         ):
-            summary = _prose_outside_json(chat.content) or chat.content.strip()
+            summary = (
+                _prose_outside_json(chat.content, REVIEW_JSON_KEYS)
+                or chat.content.strip()
+            )
             log.warning(
                 "Parsed JSON yielded empty summary/comments; using "
                 "raw content (%d chars) as summary",

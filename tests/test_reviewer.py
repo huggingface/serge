@@ -5,6 +5,8 @@ from reviewbot.llm_client import ChatResult, ToolCall
 from reviewbot.patch import parse_patch
 from reviewbot.tools import ToolEnv
 from reviewbot.reviewer import (
+    REVIEW_JSON_KEYS,
+    TASK_JSON_KEYS,
     _LOG_MSG_MAX_CHARS,
     _MAX_TRUNCATION_RETRIES,
     _UnparseableLLMOutput,
@@ -227,6 +229,66 @@ class ExtractJsonTests(unittest.TestCase):
         )
 
 
+class ExtractJsonExpectKeysTests(unittest.TestCase):
+    """peft#3482: the model narrated before answering and its reasoning
+    mentioned `_caches = {}`. That brace-literal decodes as an empty dict, so
+    the "first decodable object wins" rule handed back `{}` and the real
+    review — sitting at the end of the same reply — was published as raw
+    prose, escaped quotes and all."""
+
+    REAL = '{"summary":"The core change is sound.","event":"APPROVE","comments":[]}'
+    NARRATION = (
+        "The bnb HiRA layers call `HiraLayer.__init__` so they have "
+        "`_caches = {}`, but they define their own `merge`.\n\n"
+        "I have completed my review. Let me write the final output.\n\n"
+    )
+
+    def test_brace_literal_in_prose_does_not_shadow_the_review(self) -> None:
+        content = self.NARRATION + self.REAL
+        self.assertEqual(
+            _extract_json(content, REVIEW_JSON_KEYS),
+            {
+                "summary": "The core change is sound.",
+                "event": "APPROVE",
+                "comments": [],
+            },
+        )
+
+    def test_without_expect_keys_empty_object_is_still_skipped(self) -> None:
+        # Even with no contract to match, `{}` is never the answer if a
+        # non-empty object exists later in the reply.
+        content = self.NARRATION + self.REAL
+        self.assertEqual(_extract_json(content), json.loads(self.REAL))
+
+    def test_unrelated_object_in_prose_does_not_shadow_the_review(self) -> None:
+        content = 'Config was {"retries": 3} when it failed.\n\n' + self.REAL
+        self.assertEqual(
+            _extract_json(content, REVIEW_JSON_KEYS), json.loads(self.REAL)
+        )
+
+    def test_task_contract_keys_are_matched(self) -> None:
+        real = '{"title":"fix x","body":"why","patch":"diff --git a b\\n"}'
+        content = 'Ran with {"max_results": 200} first.\n\n' + real
+        self.assertEqual(_extract_json(content, TASK_JSON_KEYS), json.loads(real))
+
+    def test_first_matching_object_wins(self) -> None:
+        content = '{"summary": "first"}\n\nAlso: {"summary": "second"}'
+        self.assertEqual(_extract_json(content, REVIEW_JSON_KEYS), {"summary": "first"})
+
+    def test_bare_stub_still_returned_when_nothing_else_matches(self) -> None:
+        # A genuine stub reply must keep reaching the prose-salvage fallback.
+        content = "```json\n{}\n```\n\n### Correctness\n- nit"
+        self.assertEqual(_extract_json(content, REVIEW_JSON_KEYS), {})
+
+    def test_non_matching_object_returned_when_no_key_matches(self) -> None:
+        content = 'Result: {"verdict": "ok"}'
+        self.assertEqual(_extract_json(content, REVIEW_JSON_KEYS), {"verdict": "ok"})
+
+    def test_still_raises_when_nothing_decodes(self) -> None:
+        with self.assertRaises(ValueError):
+            _extract_json("no object here at all", REVIEW_JSON_KEYS)
+
+
 class ProseOutsideJsonTests(unittest.TestCase):
     """The stub-JSON-plus-prose reply: `_extract_json` takes the stub, this
     takes the review the model actually wrote."""
@@ -282,6 +344,23 @@ class ProseOutsideJsonTests(unittest.TestCase):
         content = f"```json\n{self.STUB}\n\n{self.PROSE}\n"
         self.assertEqual(_extract_json(content), json.loads(self.STUB))
         self.assertEqual(_prose_outside_json(content), self.PROSE)
+
+    def test_peels_the_stub_the_contract_matched_not_a_prose_brace(self) -> None:
+        # With a brace-literal in the narration, both halves must agree on
+        # which object was the answer — the stub, not `{}`.
+        content = f"It sets `_caches = {{}}` first.\n\n{self.STUB}\n\n{self.PROSE}"
+        self.assertEqual(
+            _extract_json(content, REVIEW_JSON_KEYS), json.loads(self.STUB)
+        )
+        out = _prose_outside_json(content, REVIEW_JSON_KEYS)
+        self.assertNotIn('"summary"', out)
+        self.assertIn("_caches = {}", out)
+        self.assertTrue(out.endswith(self.PROSE))
+
+    def test_bare_stub_reply_still_yields_prose(self) -> None:
+        content = f"```json\n{{}}\n```\n\n{self.PROSE}"
+        self.assertEqual(_extract_json(content, REVIEW_JSON_KEYS), {})
+        self.assertEqual(_prose_outside_json(content, REVIEW_JSON_KEYS), self.PROSE)
 
 
 class ContentPreviewTests(unittest.TestCase):
