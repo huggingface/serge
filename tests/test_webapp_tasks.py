@@ -1062,6 +1062,121 @@ class TaskLauncherTests(unittest.TestCase):
         )
         self.assertEqual(job.status, "running")  # non-terminal
 
+    # --- POST /internal/tasks/{id}/github-token --------------------------
+    # Installation tokens die after an hour; a >60min task asks here for a
+    # replacement rather than losing its finished work to 401 Bad credentials.
+    def test_launch_advertises_the_token_refresh_url(self):
+        webapp = self._import_webapp()
+        job = self._make_job(webapp)
+        worker_cfg, req = self._worker_cfg_and_req(webapp)
+        captured = {}
+
+        with (
+            patch.object(webapp, "installation_id_for_repo", return_value=1),
+            patch.object(webapp, "installation_token", return_value="gh-token"),
+            patch.object(
+                webapp,
+                "launch_docker",
+                side_effect=lambda spec, opts, *, wait, timeout: (
+                    captured.setdefault("spec", spec),
+                    (0, "cid"),
+                )[1],
+            ),
+            patch.object(webapp, "_notify_task_finished"),
+            patch.object(webapp, "_persist_terminal"),
+        ):
+            webapp._launch_task_pod(job, worker_cfg, req)
+
+        self.assertEqual(
+            captured["spec"]["callback"]["token_url"],
+            f"http://serge:8000/internal/tasks/{job.id}/github-token",
+        )
+
+    def test_token_refresh_mints_for_the_jobs_own_repo(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._make_job(webapp, callback_token="tok")
+        client = TestClient(webapp.app)
+        with patch.object(
+            webapp, "installation_token_for_repo", return_value="fresh-token"
+        ) as mint:
+            r = client.post(
+                "/internal/tasks/job123abc456/github-token",
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["token"], "fresh-token")
+        # Scoped to the job's target repo — never broader than the token the
+        # pod launched with.
+        self.assertEqual(mint.call_args[0][2], "acme")
+        self.assertEqual(mint.call_args[0][3], "widgets")
+
+    def test_token_refresh_rejects_bad_token(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._make_job(webapp, callback_token="right")
+        client = TestClient(webapp.app)
+        with patch.object(webapp, "installation_token_for_repo") as mint:
+            r = client.post(
+                "/internal/tasks/job123abc456/github-token",
+                headers={"Authorization": "Bearer wrong"},
+            )
+        self.assertEqual(r.status_code, 401)
+        mint.assert_not_called()
+
+    def test_token_refresh_rejects_missing_token(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._make_job(webapp, callback_token="right")
+        client = TestClient(webapp.app)
+        r = client.post("/internal/tasks/job123abc456/github-token")
+        self.assertEqual(r.status_code, 401)
+
+    def test_token_refresh_rejects_unknown_job(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        client = TestClient(webapp.app)
+        r = client.post(
+            "/internal/tasks/does-not-exist/github-token",
+            headers={"Authorization": "Bearer whatever"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_token_refresh_rejects_a_finished_job(self):
+        """The callback token is cleared when the launcher returns, so a reaped
+        job cannot mint tokens even with the right token replayed."""
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._make_job(webapp, status="published", callback_token=None)
+        client = TestClient(webapp.app)
+        r = client.post(
+            "/internal/tasks/job123abc456/github-token",
+            headers={"Authorization": "Bearer tok"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_token_refresh_reports_a_mint_failure(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._make_job(webapp, callback_token="tok")
+        client = TestClient(webapp.app)
+        with patch.object(
+            webapp,
+            "installation_token_for_repo",
+            side_effect=RuntimeError("github down"),
+        ):
+            r = client.post(
+                "/internal/tasks/job123abc456/github-token",
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertEqual(r.status_code, 502)
+
     def test_task_info_includes_filtered_trace(self):
         if TestClient is None:
             self.skipTest("fastapi not installed")

@@ -1,7 +1,11 @@
 import base64
-from typing import Any, Optional
+import logging
+from typing import Any, Callable, Optional
 
 import requests
+
+
+log = logging.getLogger(__name__)
 
 
 # Identity stamped on serge-authored commits created through the Git Data
@@ -11,11 +15,59 @@ SERGE_GIT_NAME = "serge[bot]"
 SERGE_GIT_EMAIL = "serge[bot]@users.noreply.github.com"
 
 
-class GitHubClient:
-    """Thin REST wrapper scoped to a single installation token."""
+class _AuthRetrySession(requests.Session):
+    """A session that re-mints its token on a ``401`` and replays the request.
 
-    def __init__(self, token: str):
-        self.session = requests.Session()
+    GitHub App installation tokens are valid for **one hour**. A ``/tasks`` run
+    that spends longer than that in the agentic loop plus the repo normalizer
+    reaches the publish step holding a dead token, and every write fails with
+    ``401 Bad credentials`` — the fix is finished but unpublishable, and the
+    whole run is wasted. Observed repeatedly in prod on runs of 65-67 minutes.
+
+    Rather than refresh on a timer (which needs a clock nobody owns and still
+    races a request in flight), let the request that *discovers* the expiry fix
+    it: ask ``token_provider`` for a fresh token, restamp the header, replay
+    once. Overriding :meth:`requests.Session.request` — the single funnel every
+    ``get``/``post``/``patch`` helper goes through — covers every call site in
+    :class:`GitHubClient`, present and future, with no per-method plumbing.
+
+    Only ever replays once, and only when the fresh token actually differs: a
+    401 from a genuinely bad token (wrong App, revoked install) must surface as
+    a 401 rather than double every request."""
+
+    def __init__(self, token_provider: Optional[Callable[[], str]] = None):
+        super().__init__()
+        self._token_provider = token_provider
+
+    def request(  # type: ignore[override]
+        self, method: str, url: str, **kwargs: Any
+    ) -> requests.Response:
+        response = super().request(method, url, **kwargs)
+        if response.status_code != 401 or self._token_provider is None:
+            return response
+        try:
+            token = self._token_provider()
+        except Exception:  # noqa: BLE001
+            # Refresh is best-effort: on failure return the original 401 so the
+            # caller reports the real GitHub error, not a refresh stacktrace.
+            log.warning("token refresh after 401 failed", exc_info=True)
+            return response
+        if not token or self.headers.get("Authorization") == f"Bearer {token}":
+            return response
+        log.info("got 401 from %s; re-minted the token and retrying once", url)
+        self.headers["Authorization"] = f"Bearer {token}"
+        return super().request(method, url, **kwargs)
+
+
+class GitHubClient:
+    """Thin REST wrapper scoped to a single installation token.
+
+    ``token_provider``, when given, is called to mint a replacement token after
+    a ``401`` so long-running tasks survive the one-hour installation-token
+    lifetime (see :class:`_AuthRetrySession`)."""
+
+    def __init__(self, token: str, token_provider: Optional[Callable[[], str]] = None):
+        self.session = _AuthRetrySession(token_provider)
         self.session.headers.update(
             {
                 "Authorization": f"Bearer {token}",

@@ -71,7 +71,8 @@ class RunnerSpec:
     ``request`` is the serialized :class:`TaskRequest`; ``github_token`` is a
     short-lived installation token minted by serge; ``llm`` carries the
     per-repo-resolved provider settings; ``callback`` is where to stream events
-    and the terminal result."""
+    and the terminal result, and optionally (``token_url``) where to ask for a
+    replacement GitHub token once the minted one expires."""
 
     job_id: str
     request: dict[str, Any]
@@ -179,6 +180,57 @@ class CallbackEmitter:
         )
 
 
+class TokenRefresher:
+    """Fetches a replacement GitHub installation token from serge.
+
+    Installation tokens expire after an hour, and the runner pod deliberately
+    holds no App private key (see the module docstring) — so it cannot mint one
+    itself. serge exposes ``POST /internal/tasks/{id}/github-token``, guarded by
+    the same per-job bearer token as the event callback; this asks for a fresh
+    token there.
+
+    Wired into :class:`GitHubClient` as its ``token_provider``, so any 401 from
+    an expired token is repaired and the request replayed. Without it a task that
+    outlives its token loses all of its work at the publish step: the patch is
+    written, validated and GPU-verified, and then every Git Data API write fails
+    ``401 Bad credentials``.
+
+    ``current`` keeps the freshest token so callers that need the raw credential
+    (a re-clone, say) don't have to re-request it."""
+
+    def __init__(self, url: Optional[str], callback_token: Optional[str], initial: str):
+        self._url = (url or "").strip() or None
+        self._callback_token = callback_token
+        self.current = initial
+        self._session = requests.Session()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._url)
+
+    def __call__(self) -> str:
+        """Return a freshly minted token, or the current one if serge can't be
+        reached / isn't configured for refresh. Raises nothing: the caller
+        (``_AuthRetrySession``) treats an unchanged token as "no refresh
+        available" and surfaces the original 401."""
+        if not self._url:
+            return self.current
+        headers = {"Content-Type": "application/json"}
+        if self._callback_token:
+            headers["Authorization"] = f"Bearer {self._callback_token}"
+        try:
+            r = self._session.post(self._url, headers=headers, timeout=30)
+            r.raise_for_status()
+            token = str((r.json() or {}).get("token") or "")
+        except (requests.RequestException, ValueError):
+            log.warning("could not refresh the GitHub token", exc_info=True)
+            return self.current
+        if token:
+            log.info("refreshed the GitHub installation token")
+            self.current = token
+        return self.current
+
+
 # ---------------------------------------------------------------------------
 # Config / request assembly
 # ---------------------------------------------------------------------------
@@ -254,7 +306,18 @@ def run(spec: RunnerSpec) -> int:
         cfg = build_runner_config(spec)
         req = build_task_request(spec)
         clone_cache = CloneCache(cfg.web_clone_cache_dir)
-        gh = GitHubClient(spec.github_token)
+        refresher = TokenRefresher(
+            spec.callback.get("token_url"),
+            spec.callback.get("token"),
+            spec.github_token,
+        )
+        if not refresher.enabled:
+            log.warning(
+                "the spec carries no callback token_url; this task cannot refresh "
+                "its GitHub token, so a run past the one-hour token lifetime will "
+                "fail to publish"
+            )
+        gh = GitHubClient(spec.github_token, token_provider=refresher)
 
         existing_diff: Optional[str] = None
         if req.mode == "existing_pr":

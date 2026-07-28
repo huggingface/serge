@@ -66,6 +66,9 @@ RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
     "llm_max_input_tokens",
     "tool_max_iterations",
     "tool_max_iterations_strict",
+    "tool_repeat_limit",
+    "task_scope_commit_to_patch",
+    "task_commit_always_include",
     "verify_on_gpu",
     "verify_reproduce_first",
     "verify_workflow_file",
@@ -97,6 +100,7 @@ def build_spec(
     llm: dict[str, Any],
     callback_url: str,
     callback_token: str,
+    token_url: Optional[str] = None,
     config: Optional[dict[str, Any]] = None,
     repo_remote_url: Optional[str] = None,
     request_type: str = "task",
@@ -107,7 +111,11 @@ def build_spec(
     ``stream``); ``config`` is the resolved-worker-Config subset (see
     :func:`runner_config`) the runner applies over its env-built base;
     ``github_token`` is the short-lived installation token serge minted for this
-    task."""
+    task, and ``token_url`` is where the runner asks for a replacement once that
+    token expires (installation tokens last an hour; long tasks outlive them)."""
+    callback: dict[str, Any] = {"url": callback_url, "token": callback_token}
+    if token_url:
+        callback["token_url"] = token_url
     spec: dict[str, Any] = {
         "job_id": job_id,
         "request": request,
@@ -115,7 +123,7 @@ def build_spec(
         "request_type": request_type,
         "llm": llm,
         "config": config or {},
-        "callback": {"url": callback_url, "token": callback_token},
+        "callback": callback,
     }
     if repo_remote_url:
         spec["repo_remote_url"] = repo_remote_url

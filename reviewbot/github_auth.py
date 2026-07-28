@@ -71,6 +71,18 @@ def installation_id_for_repo(
     return iid
 
 
+def installation_token_for_repo(
+    app_id: str, private_key: str, owner: str, repo: str
+) -> str:
+    """Mint a fresh installation token for ``owner/repo``.
+
+    The two-step (look up the installation, then mint) that every caller wanting
+    "a token for this repo" needs. Used by the token-refresh endpoint when a long
+    task's one-hour token expires mid-flight."""
+    iid = installation_id_for_repo(app_id, private_key, owner, repo)
+    return installation_token(app_id, private_key, iid)
+
+
 def user_is_org_member(app_id: str, private_key: str, org: str, username: str) -> bool:
     """Return True if ``username`` belongs to ``org``.
 

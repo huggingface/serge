@@ -600,6 +600,104 @@ class PublishFallbackNormalizeTests(unittest.TestCase):
         self.assertEqual(sorted(result.changed_files), ["extra.txt", "hello.txt"])
         self.assertIsNotNone(gh.created_pr)
 
+    def test_unrelated_normalizer_output_is_left_out_of_the_commit(self):
+        # The prod shape (task 433e8274): the base is stale, so the normalizer
+        # rewrites files in directories the patch never touched. Those must not
+        # land in the PR — one prod task patched 1 file and committed 32.
+        co = self._checkout()
+        cfg = self._cfg(
+            task_normalize_command=[
+                "sh",
+                "-c",
+                "mkdir -p models/other && echo drift > models/other/regen.py "
+                "&& echo generated > extra.txt",
+            ],
+            task_normalize_timeout=30,
+        )
+        plan = TaskPlan(title="Fix hello", body="desc", patch=self._PATCH)
+        gh = _FakeGH()
+        events: list[tuple[str, str]] = []
+        with patch("reviewbot.tasks.post_task_pr_created_notification"):
+            result = publish_task(
+                cfg,
+                gh,
+                self._req(),
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+                emit=lambda kind, text: events.append((kind, text)),
+            )
+        self.assertFalse(result.no_change)
+        # hello.txt (patched) and extra.txt (root, alongside it) ship;
+        # models/other/regen.py is drift from a stale base and does not.
+        self.assertEqual(sorted(result.changed_files), ["extra.txt", "hello.txt"])
+        logs = [text for kind, text in events if kind == "log"]
+        self.assertTrue(
+            any("Left 1 unrelated file(s) out of the commit" in line for line in logs),
+            logs,
+        )
+        self.assertTrue(any("models/other/regen.py" in line for line in logs))
+
+    def test_scoping_applies_to_the_prepared_worktree_path(self):
+        """The path prod task 433e8274 actually took: validation accepted the
+        patch in-loop (worktree_prepared=True), so publish_task commits the
+        worktree as-is. The scope comes from plan.patch, which is set on both
+        paths — without that this fix would no-op exactly where it is needed."""
+        co = self._checkout()
+        # Stand in for what the in-loop validation left behind: the patch applied
+        # plus normalizer drift in an unrelated directory.
+        self.cache.apply_patch(co, self._PATCH)
+        os.makedirs(os.path.join(co.path, "models", "other"), exist_ok=True)
+        with open(os.path.join(co.path, "models", "other", "regen.py"), "w") as f:
+            f.write("drift\n")
+        cfg = self._cfg(task_normalize_command=["true"], task_normalize_timeout=30)
+        plan = TaskPlan(
+            title="Fix hello",
+            body="desc",
+            patch=self._PATCH,
+            worktree_prepared=True,
+        )
+        gh = _FakeGH()
+        with patch("reviewbot.tasks.post_task_pr_created_notification"):
+            result = publish_task(
+                cfg,
+                gh,
+                self._req(),
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+        self.assertEqual(result.changed_files, ["hello.txt"])
+
+    def test_scoping_can_be_turned_off(self):
+        co = self._checkout()
+        cfg = self._cfg(
+            task_normalize_command=[
+                "sh",
+                "-c",
+                "mkdir -p models/other && echo drift > models/other/regen.py",
+            ],
+            task_normalize_timeout=30,
+            task_scope_commit_to_patch=False,
+        )
+        plan = TaskPlan(title="Fix hello", body="desc", patch=self._PATCH)
+        gh = _FakeGH()
+        with patch("reviewbot.tasks.post_task_pr_created_notification"):
+            result = publish_task(
+                cfg,
+                gh,
+                self._req(),
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+        self.assertEqual(
+            sorted(result.changed_files), ["hello.txt", "models/other/regen.py"]
+        )
+
     def test_fallback_refuses_when_normalizer_rejects(self):
         # Normalizer exits non-zero on the raw patch -> no PR, worktree reset.
         co = self._checkout()

@@ -426,11 +426,13 @@ class _CfgStub:
         tool_max_iterations: int = 30,
         llm_max_input_tokens: int = 0,
         llm_reasoning_effort: str | None = None,
+        tool_repeat_limit: int = 0,
     ) -> None:
         self.llm_max_tokens = llm_max_tokens
         self.tool_max_iterations = tool_max_iterations
         self.llm_max_input_tokens = llm_max_input_tokens
         self.llm_reasoning_effort = llm_reasoning_effort
+        self.tool_repeat_limit = tool_repeat_limit
 
 
 class _FakeLLM:
@@ -508,6 +510,123 @@ class InputTokenBudgetTests(unittest.TestCase):
         )
         self.assertEqual(metrics.turns, 1)
         self.assertEqual(len(llm.calls), 1)
+
+
+class ToolRepeatGuardLoopTests(unittest.TestCase):
+    """The repeat guard has to cut the loop off, not just annotate results.
+
+    Prod task 433e8274 spent ~55 turns and its whole 2M input-token budget on two
+    greps it kept re-issuing verbatim, then was forced into a tool-less answer
+    with nothing learned. Here the same shape stops after a handful of turns.
+    """
+
+    def _repeating_llm(self, tool_turns: int = 4) -> _FakeLLM:
+        # Each of the first ``tool_turns`` turns re-issues the identical grep;
+        # the trailing entry answers the forced final turn and is reused for any
+        # turn beyond it (see _FakeLLM).
+        repeat = ChatResult(
+            content="",
+            usage={"prompt_tokens": 40_000, "completion_tokens": 40},
+            tool_calls=[
+                ToolCall(
+                    id="t", name="grep", arguments='{"pattern": "Foo", "path": "."}'
+                )
+            ],
+        )
+        final = ChatResult(
+            content='{"summary": "stuck", "comments": []}',
+            usage={"prompt_tokens": 40_000, "completion_tokens": 20},
+        )
+        return _FakeLLM([repeat] * tool_turns + [final])
+
+    def test_repeated_calls_break_the_loop_early(self) -> None:
+        cfg = _CfgStub(tool_max_iterations=0, tool_repeat_limit=3)
+        llm = self._repeating_llm()
+        chat, metrics = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "review this"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        # 1 original + 3 repeats = 4 tool turns, then the forced final answer.
+        self.assertEqual(len(llm.calls), 5)
+        self.assertNotIn("tools", llm.calls[-1])
+        self.assertEqual(chat.content, '{"summary": "stuck", "comments": []}')
+        self.assertEqual(metrics.tool_calls, 4)
+
+    def test_the_model_is_told_it_is_repeating(self) -> None:
+        cfg = _CfgStub(tool_max_iterations=0, tool_repeat_limit=3)
+        llm = self._repeating_llm()
+        _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "review this"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        tool_messages = [
+            m for m in llm.calls[-1]["messages"] if m.get("role") == "tool"
+        ]
+        # First result is clean; every repeat carries the correction.
+        self.assertNotIn("[serge]", tool_messages[0]["content"])
+        self.assertIn("already made this exact grep call", tool_messages[1]["content"])
+        self.assertIn("You are in a loop", tool_messages[-1]["content"])
+
+    def test_emits_the_loop_reason_not_budget_exhausted(self) -> None:
+        """Operators read these events to tell a real budget exhaustion from a
+        stuck loop — the generic message must not mask the specific one."""
+        events: list[tuple[str, str]] = []
+        cfg = _CfgStub(tool_max_iterations=0, tool_repeat_limit=3)
+        _run_agentic_loop(
+            self._repeating_llm(),  # type: ignore[arg-type]
+            [{"role": "user", "content": "review this"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+            emit=lambda kind, text: events.append((kind, text)),
+        )
+        logs = [text for kind, text in events if kind == "log"]
+        self.assertTrue(any("Stuck in a tool-call loop" in line for line in logs))
+        self.assertFalse(any("Agent budget exhausted" in line for line in logs))
+
+    def test_disabled_guard_lets_the_loop_run_to_its_other_caps(self) -> None:
+        cfg = _CfgStub(tool_max_iterations=4, tool_repeat_limit=0)
+        llm = self._repeating_llm()
+        _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "review this"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        # Blind-turn cap (4) governs instead of the repeat guard.
+        self.assertEqual(len(llm.calls), 5)
+
+    def test_distinct_calls_are_not_cut_off(self) -> None:
+        """A genuine investigation making different calls must be untouched."""
+        turns = [
+            ChatResult(
+                content="",
+                usage={"prompt_tokens": 1_000, "completion_tokens": 10},
+                tool_calls=[
+                    ToolCall(
+                        id=f"t{i}", name="grep", arguments='{"pattern": "P%d"}' % i
+                    )
+                ],
+            )
+            for i in range(8)
+        ]
+        final = ChatResult(
+            content='{"summary": "ok", "comments": []}',
+            usage={"prompt_tokens": 1_000, "completion_tokens": 10},
+        )
+        llm = _FakeLLM(turns + [final])
+        cfg = _CfgStub(tool_max_iterations=0, tool_repeat_limit=3)
+        chat, metrics = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "review this"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.tool_calls, 8)
+        self.assertEqual(chat.content, '{"summary": "ok", "comments": []}')
 
 
 class ValidationGateTests(unittest.TestCase):
