@@ -34,6 +34,7 @@ from .llm_client import ChatCompletionClient
 from .normalize import NormalizeError, run_normalize
 from .prompts import build_task_system_prompt, build_task_user_prompt
 from .reviewer import (
+    TASK_JSON_KEYS,
     _extract_json,
     _format_aggregated_metrics,
     _make_tool_env,
@@ -403,7 +404,7 @@ def _validate_patch(
     assert command is not None
 
     try:
-        result = _extract_json(content)
+        result = _extract_json(content, TASK_JSON_KEYS)
     except ValueError:
         # Unparseable — not something the normalizer can speak to. Accept here
         # and let prepare_task's own extraction raise the proper error.
@@ -580,7 +581,7 @@ def prepare_task(
     _emit("log", f"LLM done: {metrics_line}")
 
     try:
-        result = _extract_json(chat.content)
+        result = _extract_json(chat.content, TASK_JSON_KEYS)
     except ValueError as exc:
         raise _UnparseableLLMOutput(
             content=chat.content or "",
