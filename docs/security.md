@@ -91,12 +91,19 @@ repo build code (e.g. `make style`). Its egress is therefore locked down:
 
 ## Private Repositories
 
-The login allowlist (`WEB_ALLOWED_USERS` / `WEB_ALLOWED_ORG`) governs who may
-use the web app at all. For a private repository that is not enough — an org
-member is not necessarily allowed to read every private repo in the org — so
-serge additionally requires the user to be a collaborator on the target
-repository before it will submit a review for it or serve an existing
-review/task's content. This is the UI counterpart of the webhook's
+Neither of the pre-existing web-app gates authorizes access to a *repository*:
+
+- `WEB_ALLOWED_USERS` / `WEB_ALLOWED_ORG` bootstrap the deployment at setup
+  time. They decide who gets an account, not what those accounts may read, and
+  org membership does not imply access to every private repo in the org.
+- Provider configs (in the database, edited from the web UI) decide which LLM
+  key a given repository runs on. Any signed-in user may create one for any
+  repository pattern, so they route keys rather than fence users off from each
+  other.
+
+For a private repository serge therefore requires the user to be a collaborator
+on the target repository before it will submit a review for it or serve an
+existing review/task's content. This is the UI counterpart of the webhook's
 `author_association` gate (`MEMBER`, `OWNER`, `COLLABORATOR`).
 
 The collaborator lookup uses the GitHub App installation token

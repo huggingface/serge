@@ -288,12 +288,15 @@ def _user_is_allowed(login: str, orgs: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 # Private-repo gate.
 #
-# The login allowlist says who may use serge at all; on a public repo that
-# is enough, since the diff serge shows is public anyway. A private repo is
-# different: its diff, draft and task patch must not reach a user GitHub
-# itself wouldn't show them to. So for private repos serge additionally
-# requires the submitter/viewer to be a collaborator — the UI equivalent of
-# the webhook's ``author_association`` check.
+# Nothing upstream of this authorizes access to a *repository*: the
+# WEB_ALLOWED_USERS / WEB_ALLOWED_ORG allowlist bootstraps the deployment
+# (who gets an account), and a provider_config picks which LLM key a repo
+# runs on — any signed-in user can create one for any repo pattern. On a
+# public repo that is fine, since the diff serge shows is public anyway. A
+# private repo is different: its diff, draft and task patch must not reach
+# a user GitHub itself wouldn't show them to. So for private repos serge
+# asks GitHub whether the submitter/viewer is a collaborator — the UI
+# equivalent of the webhook's ``author_association`` check.
 #
 # The check is App-side (installation token + ``Metadata: read``), so it
 # needs no extra OAuth scope from the user and is not defeated by SAML SSO.
