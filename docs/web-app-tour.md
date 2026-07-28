@@ -34,9 +34,12 @@ run it:
 - **Trigger comment** — plays the role of the comment you'd post on GitHub;
   start it with `@askserge` (the trigger must be the first word), plus any extra
   instructions for this run.
-- **Provider / Model** — pick the provider and model. For Hugging Face the model
-  field becomes a dropdown of tool-capable models from the
-  [HF Inference Providers](https://router.huggingface.co) router.
+- **Provider / Model** — pick the provider and model. The model field is a
+  dropdown of that provider's models: for Hugging Face, the tool-capable models
+  from the [HF Inference Providers](https://router.huggingface.co) router; for
+  the keyed providers, the models their `/models` route advertises, listed
+  server-side with a stored key you're authorized to use. Typing a PR re-lists
+  against the config that actually matches that repo.
 - **Max input tokens** — the cumulative input-token budget for the whole review.
   Blank uses the deployment default; presets (First-pass, New model addition, Bug
   fix, Documentation) fill in a sensible starting point.
@@ -45,7 +48,8 @@ run it:
 ![New review page]({{ "/assets/webapp/new-review.png" | relative_url }})
 
 For a Hugging Face provider, the **Model** field is a searchable dropdown of the
-tool-capable models served by the router:
+tool-capable models served by the router (the other providers get the same
+control, populated from their own catalogue):
 
 ![Model dropdown on the new review page]({{ "/assets/webapp/new-review-models.png" | relative_url }})
 

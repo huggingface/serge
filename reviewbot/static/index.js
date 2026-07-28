@@ -185,9 +185,33 @@
     modelEl.required = true;
   }
 
+  // Models for the selected provider, listed server-side against any config
+  // the user is authorized to use with it (the key never reaches the browser).
+  // This is what makes the Model field a dropdown before a PR is typed;
+  // cached per provider. [] means "no config, or the listing failed" — the
+  // form then keeps the free-text box.
+  const providerModels = {};
+
+  async function ensureProviderModels(provider) {
+    if (providerModels[provider]) return providerModels[provider];
+    providerModels[provider] = (async () => {
+      try {
+        const qs = new URLSearchParams({ provider });
+        const r = await fetch(`/llm-options/models?${qs}`);
+        const data = r.ok ? await r.json() : {};
+        return Array.isArray(data.models) ? data.models : [];
+      } catch {
+        return [];
+      }
+    })();
+    return providerModels[provider];
+  }
+
   // Models for the provider config that matches the entered repo, fetched
   // server-side (the key never reaches the browser). Keyed by repo+provider so
-  // a stale list is never shown after either changes.
+  // a stale list is never shown after either changes. Takes precedence over
+  // the provider-wide list above: once the repo resolves, its config is the
+  // one that will actually serve the review.
   let repoModels = [];
   let repoModelsSig = "";
 
@@ -212,12 +236,14 @@
     return repoModels;
   }
 
-  // HF has a public, tool-filtered catalogue and needs no repo/key, so it
-  // populates directly. Every other provider lists the matched config's models
-  // (fetched by ensureRepoModels once the repo resolves); until then — or when
-  // nothing matches / the fetch fails — it stays a free-text box.
+  // HF has a public, tool-filtered catalogue and needs no repo/key. Every
+  // other provider lists the matched config's models once the repo resolves,
+  // and otherwise the provider-wide list — so the dropdown is there on page
+  // load, not only after a PR is typed. Falls back to the free-text box when
+  // no list can be had (no config for the provider, or the fetch failed).
   async function updateModelControl() {
-    if (providerEl.value === "hf") {
+    const provider = providerEl.value;
+    if (provider === "hf") {
       const models = await ensureHfModels();
       // Guard against the provider changing while the fetch was in flight.
       if (providerEl.value === "hf" && models.length) {
@@ -230,9 +256,14 @@
     const parsed = parseOwnerRepo(prEl.value);
     if (parsed && repoModelSig(parsed) === repoModelsSig && repoModels.length) {
       showModelDropdown(repoModels);
-    } else {
-      showModelInput();
+      return;
     }
+    const models = await ensureProviderModels(provider);
+    if (providerEl.value === provider && models.length) {
+      showModelDropdown(models);
+      return;
+    }
+    showModelInput();
   }
 
   function ingestProviderDefaults(providers) {

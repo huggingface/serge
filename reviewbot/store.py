@@ -611,6 +611,37 @@ class JobStore:
                 return best_exact
         return best_exact or best_wild
 
+    def find_provider_config_for_provider(
+        self,
+        *,
+        user: str,
+        user_orgs: list[str],
+        provider: str,
+    ) -> Optional[dict[str, Any]]:
+        """Pick a config the user is authorized for on ``provider``,
+        ignoring ``repo_pattern`` entirely. Used by the submit form to
+        list a provider's models before a PR has been typed — any key
+        the user may already use with that provider serves the same
+        catalogue. Most-recently-updated wins; None when none match."""
+        user_lc = user.lower()
+        orgs_lc = {o.lower() for o in user_orgs}
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM provider_configs
+                 WHERE provider = ?
+                 ORDER BY updated_at DESC
+                """,
+                (provider,),
+            ).fetchall()
+        for row in rows:
+            cfg = _decode_provider_config(row)
+            allowed_users = {u.lower() for u in cfg["allowed_users"]}
+            allowed_orgs = {o.lower() for o in cfg["allowed_orgs"]}
+            if user_lc in allowed_users or (allowed_orgs & orgs_lc):
+                return cfg
+        return None
+
     def find_provider_config_for_repo(
         self,
         *,

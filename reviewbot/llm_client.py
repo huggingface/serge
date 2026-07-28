@@ -54,6 +54,15 @@ def _is_parameter_rejection(param: str, body_preview: str) -> bool:
     )
 
 
+# Anthropic requires this header on its native routes (notably /v1/models,
+# which backs the model dropdown); the OpenAI-compat chat route ignores it.
+_ANTHROPIC_VERSION = "2023-06-01"
+
+
+def _is_anthropic_base(api_base: str) -> bool:
+    return "api.anthropic.com" in api_base.lower()
+
+
 class LLMResponseError(requests.HTTPError):
     """Non-OK HTTP response from the chat-completions endpoint that
     exhausted retries (or wasn't retryable to begin with). Carries the
@@ -151,6 +160,11 @@ class ChatCompletionClient:
         if self.bill_to:
             # HF Router: route inference billing to an org the token has access to.
             headers["X-HF-Bill-To"] = self.bill_to
+        if _is_anthropic_base(self.api_base):
+            # /v1/chat/completions is Anthropic's OpenAI shim, but /v1/models is
+            # the native route and rejects requests without anthropic-version.
+            # The shim ignores the extra header, so send it unconditionally.
+            headers["anthropic-version"] = _ANTHROPIC_VERSION
         return headers
 
     def _discover_model(self) -> str:

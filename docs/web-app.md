@@ -63,10 +63,12 @@ The most-specific matching config wins when a review is submitted.
 1. Open the New Review page.
 2. Enter a PR URL or `owner/repo#123`.
 3. Enter a trigger comment, for example `@askserge please review`.
-4. Pick the provider and model. When the provider is Hugging Face, the model
-   field becomes a dropdown of tool-capable models served by the
-   [HF Inference Providers](https://router.huggingface.co) router; other
-   providers keep a free-text model field.
+4. Pick the provider and model. The model field is a dropdown of the models that
+   provider serves: for Hugging Face, the tool-capable models on the
+   [HF Inference Providers](https://router.huggingface.co) router; for the keyed
+   providers, whatever their `/models` route advertises, listed server-side with
+   a stored key you're authorized to use (the key never reaches the browser). It
+   falls back to a free-text field when no list can be fetched.
 5. Start the review and watch the stream.
 6. Edit the summary and comments.
 7. Publish or discard the draft.

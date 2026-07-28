@@ -783,6 +783,29 @@ class ChatCompletionClientTests(unittest.TestCase):
 
         mock_post.assert_not_called()
 
+    def test_list_models_sends_anthropic_version_header(self) -> None:
+        with patch("reviewbot.llm_client.requests.get") as mock_get:
+            mock_get.return_value = Mock(
+                ok=True,
+                status_code=200,
+                json=Mock(return_value={"data": [{"id": "claude-opus-5"}]}),
+            )
+            client = ChatCompletionClient("https://api.anthropic.com", "sk-ant")
+            models = client.list_models()
+
+        self.assertEqual(models, ["claude-opus-5"])
+        headers = mock_get.call_args.kwargs["headers"]
+        self.assertEqual(headers["anthropic-version"], "2023-06-01")
+
+    def test_list_models_omits_anthropic_version_for_other_bases(self) -> None:
+        with patch("reviewbot.llm_client.requests.get") as mock_get:
+            mock_get.return_value = Mock(
+                ok=True, status_code=200, json=Mock(return_value={"data": []})
+            )
+            ChatCompletionClient("https://api.openai.com/v1", "sk").list_models()
+
+        self.assertNotIn("anthropic-version", mock_get.call_args.kwargs["headers"])
+
 
 if __name__ == "__main__":
     unittest.main()
