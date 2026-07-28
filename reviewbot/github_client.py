@@ -1,5 +1,6 @@
 import base64
 import logging
+import time
 from typing import Any, Callable, Optional
 
 import requests
@@ -15,48 +16,165 @@ SERGE_GIT_NAME = "serge[bot]"
 SERGE_GIT_EMAIL = "serge[bot]@users.noreply.github.com"
 
 
+# api.github.com returns these when a gateway or backend hiccups, with no bearing
+# on the request itself — a replay usually succeeds. Prod lost a finished,
+# GPU-verified fix to a single `502 Bad Gateway` on a *read*
+# (``GET /git/commits/<sha>``) at the commit step (transformers#47605).
+_TRANSIENT_STATUSES = frozenset({500, 502, 503, 504})
+_TRANSIENT_EXCEPTIONS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+# POST endpoints where a replay cannot duplicate anything: both are
+# content-addressed, so re-sending identical bytes returns the same SHA and
+# creates nothing new. Everything else that writes is left alone — see
+# :func:`_is_replay_safe`.
+_REPLAY_SAFE_POST_PATHS = ("/git/blobs", "/git/trees")
+_MAX_ATTEMPTS = 3
+_BACKOFF_SECONDS = (1.0, 3.0)
+_MAX_RETRY_AFTER = 30.0
+
+
+def _is_replay_safe(method: str, url: str) -> bool:
+    """Whether replaying this request cannot duplicate a side effect.
+
+    Reads are always safe. Writes are deliberately *not*, because a 5xx is
+    ambiguous — the write may well have landed and only the response got lost, so
+    a blind replay could double-post a review comment or turn a successful
+    ``create_ref`` into a confusing 422. The two exceptions are blobs and trees:
+    Git object creation is content-addressed, so replaying returns the identical
+    SHA and creates nothing.
+
+    Consequence: a 502 on ``create_ref``/``create_commit``/a comment still fails
+    the task. That is the safe direction — a lost run is recoverable, a duplicate
+    comment or a mangled branch is noise a human has to clean up."""
+    verb = method.upper()
+    if verb in ("GET", "HEAD"):
+        return True
+    if verb == "POST":
+        return any(url.endswith(path) for path in _REPLAY_SAFE_POST_PATHS)
+    return False
+
+
+def _retry_delay(response: Optional[requests.Response], attempt: int) -> float:
+    """Backoff before attempt ``attempt`` (1-based), honouring ``Retry-After``."""
+    if response is not None:
+        raw = response.headers.get("Retry-After")
+        if raw:
+            try:
+                return min(float(raw), _MAX_RETRY_AFTER)
+            except (TypeError, ValueError):
+                pass
+    index = min(attempt - 1, len(_BACKOFF_SECONDS) - 1)
+    return _BACKOFF_SECONDS[index]
+
+
 class _AuthRetrySession(requests.Session):
-    """A session that re-mints its token on a ``401`` and replays the request.
+    """A session that repairs the two failures that cost prod finished work.
 
-    GitHub App installation tokens are valid for **one hour**. A ``/tasks`` run
-    that spends longer than that in the agentic loop plus the repo normalizer
-    reaches the publish step holding a dead token, and every write fails with
-    ``401 Bad credentials`` — the fix is finished but unpublishable, and the
-    whole run is wasted. Observed repeatedly in prod on runs of 65-67 minutes.
+    **Expired token (401).** GitHub App installation tokens are valid for exactly
+    one hour. A ``/tasks`` run that spends longer than that in the agentic loop
+    plus the repo normalizer reaches the publish step holding a dead token, and
+    every write fails ``401 Bad credentials`` — the fix is written, validated and
+    GPU-verified, then thrown away. Rather than refresh on a timer (which needs a
+    clock nobody owns and still races a request in flight), the request that
+    *discovers* the expiry fixes it: ask ``token_provider`` for a fresh token,
+    restamp the header, replay. Confirmed firing in prod at 60m01s.
 
-    Rather than refresh on a timer (which needs a clock nobody owns and still
-    races a request in flight), let the request that *discovers* the expiry fix
-    it: ask ``token_provider`` for a fresh token, restamp the header, replay
-    once. Overriding :meth:`requests.Session.request` — the single funnel every
+    **Transient gateway error (5xx / dropped connection).** Same shape, different
+    cause: a single ``502 Bad Gateway`` from api.github.com killed a finished
+    qwen3_omni_moe fix at its commit step (transformers#47605). Retried with a
+    short backoff, but *only* where a replay cannot duplicate a side effect (see
+    :func:`_is_replay_safe`).
+
+    Overriding :meth:`requests.Session.request` — the single funnel every
     ``get``/``post``/``patch`` helper goes through — covers every call site in
     :class:`GitHubClient`, present and future, with no per-method plumbing.
 
-    Only ever replays once, and only when the fresh token actually differs: a
-    401 from a genuinely bad token (wrong App, revoked install) must surface as
-    a 401 rather than double every request."""
+    The two cases are replayed under deliberately different rules. A **401 is
+    unambiguous**: the request was rejected, so nothing happened, so replaying any
+    method is safe — including a comment or a ref update. A **5xx is ambiguous**:
+    the write may have landed with only the response lost, so replaying is
+    restricted to requests where that cannot matter.
+
+    The token is re-minted at most once per request, and only when the fresh one
+    actually differs: a 401 from a genuinely bad token (wrong App, revoked
+    install) must surface as a 401 rather than double every request."""
 
     def __init__(self, token_provider: Optional[Callable[[], str]] = None):
         super().__init__()
         self._token_provider = token_provider
 
-    def request(  # type: ignore[override]
-        self, method: str, url: str, **kwargs: Any
-    ) -> requests.Response:
-        response = super().request(method, url, **kwargs)
-        if response.status_code != 401 or self._token_provider is None:
-            return response
+    def _refreshed_token(self) -> Optional[str]:
+        """A replacement token that differs from the one in use, else ``None``."""
+        if self._token_provider is None:
+            return None
         try:
             token = self._token_provider()
         except Exception:  # noqa: BLE001
-            # Refresh is best-effort: on failure return the original 401 so the
-            # caller reports the real GitHub error, not a refresh stacktrace.
+            # Refresh is best-effort: on failure keep the original response so
+            # the caller reports the real GitHub error, not a refresh stacktrace.
             log.warning("token refresh after 401 failed", exc_info=True)
-            return response
+            return None
         if not token or self.headers.get("Authorization") == f"Bearer {token}":
+            return None
+        return token
+
+    def request(  # type: ignore[override]
+        self, method: str, url: str, **kwargs: Any
+    ) -> requests.Response:
+        refreshed = False
+        attempt = 0
+        while True:
+            try:
+                response: Optional[requests.Response] = super().request(
+                    method, url, **kwargs
+                )
+            except _TRANSIENT_EXCEPTIONS as exc:
+                attempt += 1
+                if attempt >= _MAX_ATTEMPTS or not _is_replay_safe(method, url):
+                    raise
+                delay = _retry_delay(None, attempt)
+                log.warning(
+                    "%s %s failed (%s); retrying in %.1fs (attempt %d/%d)",
+                    method,
+                    url,
+                    exc.__class__.__name__,
+                    delay,
+                    attempt + 1,
+                    _MAX_ATTEMPTS,
+                )
+                time.sleep(delay)
+                continue
+
+            assert response is not None
+            if response.status_code == 401 and not refreshed:
+                refreshed = True
+                token = self._refreshed_token()
+                if token is not None:
+                    log.info("got 401 from %s; re-minted the token and retrying", url)
+                    self.headers["Authorization"] = f"Bearer {token}"
+                    continue
+                return response
+
+            if response.status_code in _TRANSIENT_STATUSES:
+                attempt += 1
+                if attempt < _MAX_ATTEMPTS and _is_replay_safe(method, url):
+                    delay = _retry_delay(response, attempt)
+                    log.warning(
+                        "%s %s returned %d; retrying in %.1fs (attempt %d/%d)",
+                        method,
+                        url,
+                        response.status_code,
+                        delay,
+                        attempt + 1,
+                        _MAX_ATTEMPTS,
+                    )
+                    time.sleep(delay)
+                    continue
+
             return response
-        log.info("got 401 from %s; re-minted the token and retrying once", url)
-        self.headers["Authorization"] = f"Bearer {token}"
-        return super().request(method, url, **kwargs)
 
 
 class GitHubClient:
