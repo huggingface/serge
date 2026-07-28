@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -527,6 +528,22 @@ class ChatCompletionClient:
                 )
                 time.sleep(2**attempt)
                 continue
+            # Structured `tool_calls` always wins; only fall back to scraping
+            # the content when the provider sent none. Covers both the
+            # streaming and buffered paths, which converge here.
+            if not tool_calls and content:
+                recovered, content = _parse_text_tool_calls(content)
+                if recovered:
+                    tool_calls = recovered
+                    log.warning(
+                        "Model wrote %d tool call(s) into content as special "
+                        "tokens instead of the tool_calls field (model=%s, "
+                        "finish=%s); recovered %s as a tool turn",
+                        len(recovered),
+                        self.model,
+                        finish_reason,
+                        ", ".join(tc.name for tc in recovered),
+                    )
             latency = time.monotonic() - started
             log.info(
                 "LLM call ok in %.1fs (prompt=%s, completion=%s, stream=%s, "
@@ -904,6 +921,90 @@ def _extract_thought_signature(tc: dict[str, Any]) -> Optional[str]:
         return None
     sig = google.get("thought_signature")
     return sig if isinstance(sig, str) and sig else None
+
+
+# Kimi (Moonshot) models served through the HF Router sometimes serialize a
+# tool call into `message.content` as their raw chat-template special tokens
+# and leave the structured `tool_calls` field empty, with
+# `finish_reason="stop"`. The agent loop reads that as "no tool calls, so this
+# is the final answer" and publishes the markup verbatim — that is how a review
+# body of nothing but `<|tool_calls_section_begin|>...` reached serge#79. Parse
+# the markup back into real ToolCall objects so the turn stays a tool turn.
+_TEXT_TOOL_CALLS_SECTION_BEGIN = "<|tool_calls_section_begin|>"
+_TEXT_TOOL_CALLS_SECTION_END = "<|tool_calls_section_end|>"
+_TEXT_TOOL_CALL_BEGIN = "<|tool_call_begin|>"
+_TEXT_TOOL_CALL_ARGUMENT_BEGIN = "<|tool_call_argument_begin|>"
+_TEXT_TOOL_CALL_END = "<|tool_call_end|>"
+
+# The id between the begin and argument markers, e.g. `functions.read_file:6`.
+# Both the `functions.` namespace prefix and the `:index` suffix are optional,
+# so a bare `read_file` still parses.
+_TEXT_TOOL_CALL_ID_RE = re.compile(
+    r"\A(?:functions?[.:])?(?P<name>[A-Za-z0-9_.\-]+?)(?::(?P<index>\d+))?\Z"
+)
+
+
+def _split_text_tool_call_id(raw: str) -> str:
+    """The function name out of a Kimi-style text tool-call id, or "" when the
+    id doesn't look like one (so the caller drops the call rather than
+    inventing a tool that doesn't exist)."""
+    match = _TEXT_TOOL_CALL_ID_RE.match(raw.strip())
+    return match.group("name") if match else ""
+
+
+def _parse_text_tool_calls(content: str) -> tuple[list[ToolCall], str]:
+    """Recover tool calls a model wrote into ``content`` as special tokens.
+
+    Returns ``(calls, content_without_the_markup)``. Returns ``([], content)``
+    unchanged when no marker is present, which is every well-behaved
+    provider — so the common path costs one substring check.
+
+    Tolerant of a truncated tail: a trailing call whose ``<|tool_call_end|>``
+    never arrived still yields a ToolCall from the rest of the content, since
+    the arguments are usually complete by then and re-asking would throw the
+    turn away.
+    """
+    if _TEXT_TOOL_CALL_BEGIN not in content:
+        return [], content
+
+    calls: list[ToolCall] = []
+    kept: list[str] = []
+    pos = 0
+    while True:
+        begin = content.find(_TEXT_TOOL_CALL_BEGIN, pos)
+        if begin < 0:
+            break
+        kept.append(content[pos:begin])
+        after_begin = begin + len(_TEXT_TOOL_CALL_BEGIN)
+        arg_sep = content.find(_TEXT_TOOL_CALL_ARGUMENT_BEGIN, after_begin)
+        if arg_sep < 0:
+            # No argument marker after this begin marker — nothing parseable
+            # is left, and whatever follows is not review prose either.
+            pos = len(content)
+            break
+        end = content.find(_TEXT_TOOL_CALL_END, arg_sep)
+        args_start = arg_sep + len(_TEXT_TOOL_CALL_ARGUMENT_BEGIN)
+        arguments = content[args_start : end if end >= 0 else len(content)].strip()
+        raw_id = content[after_begin:arg_sep].strip()
+        name = _split_text_tool_call_id(raw_id)
+        if name:
+            calls.append(
+                ToolCall(
+                    id=raw_id or f"call_{len(calls)}",
+                    name=name,
+                    arguments=arguments,
+                )
+            )
+        if end < 0:
+            pos = len(content)
+            break
+        pos = end + len(_TEXT_TOOL_CALL_END)
+    kept.append(content[pos:])
+
+    cleaned = "".join(kept)
+    for marker in (_TEXT_TOOL_CALLS_SECTION_BEGIN, _TEXT_TOOL_CALLS_SECTION_END):
+        cleaned = cleaned.replace(marker, "")
+    return calls, cleaned.strip()
 
 
 def _parse_tool_calls_from_message(raw: Any) -> list[ToolCall]:

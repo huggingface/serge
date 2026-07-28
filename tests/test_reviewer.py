@@ -1,7 +1,10 @@
 import json
+import os
+import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
-from reviewbot.llm_client import ChatResult, ToolCall
+from reviewbot.llm_client import ChatCompletionClient, ChatResult, ToolCall
 from reviewbot.patch import parse_patch
 from reviewbot.tools import ToolEnv
 from reviewbot.reviewer import (
@@ -13,8 +16,10 @@ from reviewbot.reviewer import (
     _content_preview,
     _emit_chat_message,
     _final_recovery_message,
+    _is_model_markup_only,
     _needs_final_salvage,
     _extract_json,
+    _REVIEW_JSON_KEYS,
     _merge_chunk_event,
     _merge_chunk_summaries,
     _prose_outside_json,
@@ -225,6 +230,84 @@ class ExtractJsonTests(unittest.TestCase):
             _extract_json(content),
             {"summary": "use { and } carefully", "comments": []},
         )
+
+
+class ExtractJsonRequiredKeysTests(unittest.TestCase):
+    """`require_any_key` stops the forgiving raw_decode pass from returning
+    incidental JSON. Without it a leaked tool call's own argument object was
+    accepted as a review, yielding an empty summary that got published as raw
+    special-token markup (serge#79)."""
+
+    # The tool-call arguments Kimi leaked into content on the serge#79 run.
+    LEAKED_ARGS = (
+        '{"path": "reviewbot/reviewer.py", "start_line": 248, "end_line": 280}'
+    )
+
+    def test_leaked_tool_arguments_are_rejected_as_a_review(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _extract_json(self.LEAKED_ARGS, _REVIEW_JSON_KEYS)
+        msg = str(ctx.exception)
+        self.assertIn("did not contain a JSON object", msg)
+        self.assertIn("summary", msg)
+
+    def test_same_content_is_still_accepted_without_the_filter(self) -> None:
+        # Default behaviour is unchanged for callers that don't opt in.
+        self.assertEqual(
+            _extract_json(self.LEAKED_ARGS)["path"], "reviewbot/reviewer.py"
+        )
+
+    def test_review_object_passes_the_filter(self) -> None:
+        content = '{"summary": "ok", "comments": [], "event": "COMMENT"}'
+        self.assertEqual(_extract_json(content, _REVIEW_JSON_KEYS)["summary"], "ok")
+
+    def test_any_single_contract_key_is_enough(self) -> None:
+        self.assertEqual(
+            _extract_json('{"event": "APPROVE"}', _REVIEW_JSON_KEYS),
+            {"event": "APPROVE"},
+        )
+
+    def test_skips_a_non_review_object_and_finds_the_review_after_it(self) -> None:
+        content = f'Reading: {self.LEAKED_ARGS}\n\n{{"summary": "the real review"}}'
+        self.assertEqual(
+            _extract_json(content, _REVIEW_JSON_KEYS),
+            {"summary": "the real review"},
+        )
+
+    def test_filter_also_applies_to_fenced_blocks(self) -> None:
+        content = (
+            f'```json\n{self.LEAKED_ARGS}\n```\n```json\n{{"summary": "real"}}\n```'
+        )
+        self.assertEqual(_extract_json(content, _REVIEW_JSON_KEYS), {"summary": "real"})
+
+
+class ModelMarkupOnlyTests(unittest.TestCase):
+    def test_leaked_tool_call_markup_is_markup_only(self) -> None:
+        # What actually got published on serge#79, once `_prose_outside_json`
+        # had removed the JSON arguments from the middle of it.
+        self.assertTrue(
+            _is_model_markup_only(
+                "<|tool_calls_section_begin|><|tool_call_begin|>"
+                "functions.read_file:6<|tool_call_argument_begin|>\n\n"
+                "<|tool_call_end|><|tool_calls_section_end|>"
+            )
+        )
+
+    def test_real_review_is_not_markup_only(self) -> None:
+        self.assertFalse(_is_model_markup_only("This patch looks correct."))
+
+    def test_review_quoting_a_special_token_is_not_markup_only(self) -> None:
+        # A tokenizer review may legitimately mention these tokens; we must
+        # not treat such a review as garbage.
+        self.assertFalse(
+            _is_model_markup_only(
+                "The test asserts `<|endoftext|>` is appended, which is right."
+            )
+        )
+
+    def test_empty_and_whitespace_are_not_markup_only(self) -> None:
+        # "" means "no summary", which the publish gate handles separately.
+        self.assertFalse(_is_model_markup_only(""))
+        self.assertFalse(_is_model_markup_only("   \n\t "))
 
 
 class ProseOutsideJsonTests(unittest.TestCase):
@@ -845,6 +928,83 @@ class TruncationRecoveryTests(unittest.TestCase):
         # Initial answer + _MAX_TRUNCATION_RETRIES recovery attempts.
         self.assertEqual(len(llm.calls), 1 + _MAX_TRUNCATION_RETRIES)
         self.assertEqual(chat.finish_reason, "length")
+
+
+class LeakedTextToolCallLoopTests(unittest.TestCase):
+    """End-to-end regression for serge#79: Kimi wrote a tool call into
+    `message.content` as special tokens with an empty `tool_calls` field and
+    finish_reason="stop". The loop read that as the final answer and the markup
+    was published as the review body. Drives the *real* client (mocked HTTP) so
+    the whole chain — parse, recover, execute, continue — is covered."""
+
+    LEAKED = (
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.read_file:6"
+        '<|tool_call_argument_begin|>{"path": "hello.py"}<|tool_call_end|>'
+        "<|tool_calls_section_end|>"
+    )
+
+    @staticmethod
+    def _response(body: dict) -> Mock:
+        return Mock(
+            status_code=200, raise_for_status=Mock(), json=Mock(return_value=body)
+        )
+
+    def _turn(self, content: str) -> Mock:
+        return self._response(
+            {
+                "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10},
+            }
+        )
+
+    def test_leaked_tool_call_keeps_the_loop_going(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            with open(os.path.join(repo, "hello.py"), "w") as fh:
+                fh.write("print('the file the model asked for')\n")
+
+            final = '{"summary": "reviewed hello.py", "comments": []}'
+            with patch(
+                "reviewbot.llm_client.requests.post",
+                side_effect=[self._turn(self.LEAKED), self._turn(final)],
+            ) as mock_post:
+                llm = ChatCompletionClient(
+                    "https://example.com/v1", "token", "moonshotai/Kimi-K2.6"
+                )
+                chat, metrics = _run_agentic_loop(
+                    llm,
+                    [{"role": "user", "content": "review this"}],
+                    cfg=_CfgStub(),  # type: ignore[arg-type]
+                    tool_env=ToolEnv(repo_root=repo),
+                )
+
+            # The turn was treated as a tool turn, not as the final answer.
+            self.assertEqual(metrics.tool_calls, 1)
+            self.assertEqual(chat.content, final)
+            self.assertEqual(mock_post.call_count, 2)
+
+            # The second request carried the executed tool's output back, so the
+            # model actually got the file it asked for.
+            follow_up = json.loads(mock_post.call_args_list[1].kwargs["data"])
+            tool_msgs = [m for m in follow_up["messages"] if m["role"] == "tool"]
+            self.assertEqual(len(tool_msgs), 1)
+            self.assertEqual(tool_msgs[0]["name"], "read_file")
+            self.assertIn("the file the model asked for", tool_msgs[0]["content"])
+
+            # The assistant turn that requested it round-trips as a structured
+            # tool_calls message, with the markup stripped from its content.
+            assistant = [
+                m
+                for m in follow_up["messages"]
+                if m["role"] == "assistant" and m.get("tool_calls")
+            ]
+            self.assertEqual(len(assistant), 1)
+            self.assertIsNone(assistant[0]["content"])
+
+    def test_final_review_is_parsed_not_the_leaked_tool_arguments(self) -> None:
+        # The second half of the serge#79 chain: even if the markup does reach
+        # the parser, the leaked arguments must not pass as a review.
+        with self.assertRaises(ValueError):
+            _extract_json(self.LEAKED, _REVIEW_JSON_KEYS)
 
 
 if __name__ == "__main__":

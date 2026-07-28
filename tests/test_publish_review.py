@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 from reviewbot.config import Config
 from reviewbot.reviewer import (
     DraftComment,
+    EmptyReviewError,
     ReviewDraft,
     ReviewEdits,
     ReviewRequest,
@@ -212,6 +213,106 @@ class PublishReviewTests(unittest.TestCase):
         publish_review(cfg, gh, draft)
         body = gh.create_review.call_args.kwargs["body"]
         self.assertIn("(no overall summary provided)", body)
+
+
+class EmptyReviewGateTests(unittest.TestCase):
+    """A review with nothing in it must not reach GitHub. serge#79 published a
+    body of raw `<|tool_call_begin|>` markup with zero inline comments; the
+    fallback line "(no overall summary provided)" with zero comments is just as
+    useless. Refuse both, so the failure is reported instead of posted."""
+
+    # The summary that actually reached the PR on serge#79.
+    LEAKED_MARKUP = (
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.read_file:6"
+        "<|tool_call_argument_begin|>\n\n<|tool_call_end|>"
+        "<|tool_calls_section_end|>"
+    )
+
+    def test_leaked_markup_summary_with_no_comments_is_refused(self) -> None:
+        cfg = _make_cfg()
+        draft = _make_draft(summary=self.LEAKED_MARKUP, comments=[])
+        gh = MagicMock()
+        with self.assertRaises(EmptyReviewError):
+            publish_review(cfg, gh, draft)
+        gh.create_review.assert_not_called()
+
+    def test_no_summary_and_no_comments_is_refused(self) -> None:
+        cfg = _make_cfg()
+        draft = _make_draft(summary="", comments=[])
+        gh = MagicMock()
+        with self.assertRaises(EmptyReviewError) as ctx:
+            publish_review(cfg, gh, draft)
+        self.assertIn("acme/widgets#42", str(ctx.exception))
+        gh.create_review.assert_not_called()
+
+    def test_whitespace_summary_and_no_comments_is_refused(self) -> None:
+        cfg = _make_cfg()
+        draft = _make_draft(summary="   \n\t ", comments=[])
+        gh = MagicMock()
+        with self.assertRaises(EmptyReviewError):
+            publish_review(cfg, gh, draft)
+
+    def test_all_comments_discarded_leaves_nothing_to_publish(self) -> None:
+        cfg = _make_cfg()
+        draft = _make_draft(summary="")
+        gh = MagicMock()
+        edits = ReviewEdits(discarded_comment_ids={"c0", "c1"})
+        with self.assertRaises(EmptyReviewError):
+            publish_review(cfg, gh, draft, edits=edits)
+        gh.create_review.assert_not_called()
+
+    def test_summary_only_review_still_publishes(self) -> None:
+        cfg = _make_cfg()
+        draft = _make_draft(summary="No issues found.", comments=[])
+        gh = MagicMock()
+        publish_review(cfg, gh, draft)
+        self.assertIn("No issues found.", gh.create_review.call_args.kwargs["body"])
+
+    def test_comments_only_review_still_publishes(self) -> None:
+        cfg = _make_cfg()
+        draft = _make_draft(summary="")
+        gh = MagicMock()
+        publish_review(cfg, gh, draft)
+        self.assertEqual(len(gh.create_review.call_args.kwargs["comments"]), 2)
+
+    def test_markup_summary_with_comments_renders_fallback_not_markup(self) -> None:
+        # Real inline comments carry the review, so publishing is right — but
+        # the leaked tokens must not become the body.
+        cfg = _make_cfg()
+        draft = _make_draft(summary=self.LEAKED_MARKUP)
+        gh = MagicMock()
+        publish_review(cfg, gh, draft)
+        body = gh.create_review.call_args.kwargs["body"]
+        self.assertNotIn("tool_call_begin", body)
+        self.assertIn("(no overall summary provided)", body)
+
+    def test_review_quoting_a_special_token_is_published_verbatim(self) -> None:
+        cfg = _make_cfg()
+        summary = "The test appends `<|endoftext|>`, which matches the tokenizer."
+        draft = _make_draft(summary=summary, comments=[])
+        gh = MagicMock()
+        publish_review(cfg, gh, draft)
+        self.assertIn(summary, gh.create_review.call_args.kwargs["body"])
+
+    def test_run_review_reports_an_empty_review_to_the_pr(self) -> None:
+        cfg = _make_cfg()
+        draft = _make_draft(summary="", comments=[])
+        gh = MagicMock()
+        req = ReviewRequest(
+            owner="acme",
+            repo="widgets",
+            number=42,
+            trigger_comment_id=123,
+            trigger_comment_body="@askserge please review",
+            commenter="reviewer",
+        )
+        with patch("reviewbot.reviewer.prepare_review", return_value=draft):
+            run_review(cfg, gh, req)
+
+        gh.create_review.assert_not_called()
+        gh.post_issue_comment.assert_called_once()
+        posted = gh.post_issue_comment.call_args.args[-1]
+        self.assertIn("did not produce a usable review", posted)
 
     def test_run_review_can_force_comment_event_for_direct_publish(self) -> None:
         cfg = _make_cfg()
