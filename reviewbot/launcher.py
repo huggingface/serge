@@ -66,6 +66,7 @@ RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
     "llm_max_input_tokens",
     "tool_max_iterations",
     "tool_max_iterations_strict",
+    "tool_repeat_limit",
     "verify_on_gpu",
     "verify_reproduce_first",
     "verify_workflow_file",

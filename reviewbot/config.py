@@ -89,6 +89,11 @@ class Config:
     # stop the agentic loop, ask the model for a final review with tools
     # off, and skip any remaining diff chunks. Set to 0 to disable.
     llm_max_input_tokens: int = 2_000_000
+    # How many *repeated* (byte-identical) tool calls to tolerate before
+    # declaring the agent stuck and forcing a final answer. Each repeat is told
+    # it is repeating; past this many the loop stops rather than spending the
+    # rest of the input-token budget re-running the same search. 0 disables.
+    tool_repeat_limit: int = 6
 
     # When true, published reviews carry a note that they came from a
     # non-production (staging) deployment. Set via the STAGING env var.
@@ -479,6 +484,7 @@ class Config:
             # PRs complete without being forced to truncate.
             tool_max_iterations=_int_env("TOOL_MAX_ITERATIONS", 30),
             llm_max_input_tokens=_int_env("LLM_MAX_INPUT_TOKENS", 2_000_000),
+            tool_repeat_limit=_int_env("TOOL_REPEAT_LIMIT", 6),
             is_staging=_bool_env("STAGING", False),
             github_oauth_client_id=oauth_client_id,
             github_oauth_client_secret=oauth_client_secret,

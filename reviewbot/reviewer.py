@@ -17,6 +17,7 @@ from .prompts import (
     build_system_prompt,
     build_user_prompt,
 )
+from .tool_repeat import ToolRepeatGuard
 from .tools import (
     RepoHelperTool,
     ToolEnv,
@@ -800,6 +801,10 @@ def _run_agentic_loop(
     # calls indefinitely while still leaving real investigations room
     # to grow when the operator raises tool_max_iterations.
     ABSOLUTE_ITER_CEILING = max(60, (iter_cap or 0) * 2)
+    # Stops a model that has started re-issuing the *same* tool call from eating
+    # the whole input-token budget on it. Each repeat is told it is repeating;
+    # past the limit we break out and spend what's left on an answer.
+    repeat_guard = ToolRepeatGuard(getattr(cfg, "tool_repeat_limit", 0) or 0)
     iteration = 0
     blind_tool_turns = 0
     validation_retries = 0
@@ -970,6 +975,18 @@ def _run_agentic_loop(
                 emit("tool", f"{tc.name}({_summarize_args_str(tc.arguments)})")
                 _emit_metrics(emit, metrics)
             result = _execute_tool_call(tool_env, tc)
+            # An identical re-run still executes (a re-read after an edit must
+            # see the new content) — but the model is told it is repeating, so
+            # it can break out before the repeat budget runs down.
+            repeat_note = repeat_guard.observe(tc.name, tc.arguments)
+            if repeat_note is not None:
+                result = f"{result}{repeat_note}"
+                log.info(
+                    "Repeated tool call %s (%s); %s",
+                    tc.name,
+                    _summarize_args_str(tc.arguments),
+                    repeat_guard.summary(),
+                )
             # Kimi-K2 (and some other engines) require ``name`` on tool
             # replies; OpenAI's spec ignores it. Always sending it is
             # the safer cross-provider choice.
@@ -983,6 +1000,21 @@ def _run_agentic_loop(
             )
             _emit_chat_message(emit, "tool", content=result, tool_name=tc.name)
 
+        if repeat_guard.tripped:
+            log.warning(
+                "Tool-repeat guard tripped (%s, limit=%d); asking for a final "
+                "answer instead of spending the rest of the budget looping",
+                repeat_guard.summary(),
+                repeat_guard.trip_after,
+            )
+            if emit is not None:
+                emit(
+                    "log",
+                    f"Stuck in a tool-call loop ({repeat_guard.summary()}); "
+                    "asking for a final answer without tools",
+                )
+            break
+
     # Iteration budget hit — force a final answer with tools disabled.
     # Only reachable when ``tool_max_iterations > 0`` and the model
     # used up its content-turn allowance, or when the absolute ceiling
@@ -995,7 +1027,8 @@ def _run_agentic_loop(
         iteration,
         cfg.tool_max_iterations,
     )
-    if emit is not None:
+    if emit is not None and not repeat_guard.tripped:
+        # The repeat guard already emitted its own, more specific reason.
         emit("log", "Agent budget exhausted; asking for a final review without tools")
     messages.append(
         {
