@@ -191,7 +191,10 @@ class WebappReviewsTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         data = r.json()
         self.assertEqual(data["models"], [])
-        self.assertIn("401", data["error"])
+        # One generic message, never the upstream text (it can leak).
+        self.assertEqual(data["error"], "Could not retrieve list of models")
+        self.assertEqual(data["error_code"], 500)
+        self.assertNotIn("401", r.text)
 
     def test_provider_models_listed_without_a_repo(self):
         """The dropdown must be populated on page load, before any PR has
@@ -252,7 +255,25 @@ class WebappReviewsTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         data = r.json()
         self.assertEqual(data["models"], [])
-        self.assertIn("401", data["error"])
+        self.assertEqual(data["error"], "Could not retrieve list of models")
+        self.assertEqual(data["error_code"], 500)
+        self.assertNotIn("401", r.text)
+
+    def test_provider_models_error_code_carries_http_status(self):
+        """An unconfigured base URL raises HTTPException — its status is
+        what ``error_code`` is for."""
+        client = TestClient(self.webapp.app)
+        with patch.object(
+            self.webapp,
+            "_api_base_for_provider",
+            side_effect=self.webapp.HTTPException(status_code=400, detail="no_base"),
+        ):
+            r = client.get("/llm-options/models", params={"provider": "hf"})
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["models"], [])
+        self.assertEqual(data["error"], "Could not retrieve list of models")
+        self.assertEqual(data["error_code"], 400)
 
     # --- effective_draft (single source of truth for what gets posted) ---
     def _sample_draft(self, **overrides):
