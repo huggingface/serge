@@ -2,6 +2,23 @@
 {{- if not .Values.backups.repository }}
 {{- fail "backups.repository is required when backups.enabled=true" }}
 {{- end }}
+{{- $backupServiceAccountName := .Values.backups.serviceAccountName }}
+{{- if .Values.backups.serviceAccount.create }}
+{{- $backupServiceAccountName = (.Values.backups.serviceAccount.name | default (printf "%s-backup" .Release.Name)) }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $backupServiceAccountName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "labels.standard" . | nindent 4 }}
+    component: backup
+  {{- with .Values.backups.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -26,7 +43,7 @@ spec:
             component: backup
         spec:
           restartPolicy: OnFailure
-          {{- with .Values.backups.serviceAccountName }}
+          {{- with $backupServiceAccountName }}
           serviceAccountName: {{ . }}
           {{- end }}
           affinity:

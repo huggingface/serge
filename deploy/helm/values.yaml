@@ -195,6 +195,12 @@ backups:
     apiVersion: ""
     kind: ""
     spec: {}
+  serviceAccount:
+    create: false
+    # Defaults to "<release>-backup" when empty and create=true.
+    name: ""
+    annotations: {}
+  # Existing ServiceAccount to use when serviceAccount.create=false.
   serviceAccountName: ""
   restoreCache:
     sizeLimit: 512Mi
