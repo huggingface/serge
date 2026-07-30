@@ -185,6 +185,17 @@ backups:
     repository: restic/restic
     tag: "0.17.3"
     pullPolicy: IfNotPresent
+  awsCredentials:
+    image:
+      repository: amazon/aws-cli
+      tag: "2.17.51"
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
   # Example: s3:s3.amazonaws.com/my-bucket/serge
   repository: ""
   existingSecret: serge-backup
