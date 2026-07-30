@@ -170,3 +170,43 @@ taskExecution:
       namespace: kube-system
       podLabels:
         k8s-app: kube-dns
+
+# Daily Restic backup of Serge's persistent SQLite volume to S3.
+# `existingSecret` must provide RESTIC_PASSWORD and either AWS_* credentials, or
+# the backup pod must run under an IAM-bound service account.
+backups:
+  enabled: false
+  schedule: "0 2 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  image:
+    repository: restic/restic
+    tag: "0.17.3"
+    pullPolicy: IfNotPresent
+  # Example: s3:s3.amazonaws.com/my-bucket/serge
+  repository: ""
+  existingSecret: serge-backup
+  externalSecret:
+    enabled: false
+    # Optional; defaults to backups.existingSecret when empty.
+    name: ""
+    apiVersion: ""
+    kind: ""
+    spec: {}
+  serviceAccount:
+    create: false
+    # Defaults to "<release>-backup" when empty and create=true.
+    name: ""
+    annotations: {}
+  # Existing ServiceAccount to use when serviceAccount.create=false.
+  serviceAccountName: ""
+  restoreCache:
+    sizeLimit: 512Mi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
