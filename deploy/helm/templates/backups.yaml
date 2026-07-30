@@ -91,9 +91,11 @@ spec:
                   value: "{{ .Values.backups.repository }}/sqlite"
                 - name: RESTIC_CACHE_DIR
                   value: /.cache/restic
-              envFrom:
-                - secretRef:
-                    name: {{ .Values.backups.existingSecret }}
+                - name: RESTIC_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.backups.existingSecret }}
+                      key: RESTIC_PASSWORD
               resources:
                 {{- toYaml .Values.backups.resources | nindent 16 }}
               volumeMounts:
