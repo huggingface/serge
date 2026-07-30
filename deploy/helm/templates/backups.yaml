@@ -1,0 +1,80 @@
+{{- if .Values.backups.enabled }}
+{{- if not .Values.backups.repository }}
+{{- fail "backups.repository is required when backups.enabled=true" }}
+{{- end }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "name" . }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "labels.standard" . | nindent 4 }}
+    component: backup
+spec:
+  schedule: {{ .Values.backups.schedule | quote }}
+  concurrencyPolicy: {{ .Values.backups.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.backups.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backups.failedJobsHistoryLimit }}
+  startingDeadlineSeconds: {{ .Values.backups.startingDeadlineSeconds }}
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "labels.standard" . | nindent 12 }}
+            component: backup
+        spec:
+          restartPolicy: OnFailure
+          {{- with .Values.backups.serviceAccountName }}
+          serviceAccountName: {{ . }}
+          {{- end }}
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      release: {{ .Release.Name | quote }}
+                      app: "{{ include "app.name" . }}"
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: restic
+              image: "{{ .Values.backups.image.repository }}:{{ .Values.backups.image.tag }}"
+              imagePullPolicy: {{ .Values.backups.image.pullPolicy }}
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  restic snapshots >/dev/null || restic init
+                  restic backup {{ .Values.persistence.mountPath }} \
+                    --host {{ .Release.Namespace }} \
+                    --tag serge
+                  restic forget \
+                    --host {{ .Release.Namespace }} \
+                    --tag serge \
+                    --keep-daily 7 \
+                    --prune
+              env:
+                - name: RESTIC_REPOSITORY
+                  value: "{{ .Values.backups.repository }}/sqlite"
+                - name: RESTIC_CACHE_DIR
+                  value: /.cache/restic
+              envFrom:
+                - secretRef:
+                    name: {{ .Values.backups.existingSecret }}
+              resources:
+                {{- toYaml .Values.backups.resources | nindent 16 }}
+              volumeMounts:
+                - name: data
+                  mountPath: {{ .Values.persistence.mountPath }}
+                  readOnly: true
+                - name: cache
+                  mountPath: /.cache/restic
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: {{ include "name" . }}-data
+            - name: cache
+              emptyDir:
+                sizeLimit: {{ .Values.backups.restoreCache.sizeLimit }}
+{{- end }}
