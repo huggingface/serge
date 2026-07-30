@@ -247,6 +247,83 @@ class WebappTasksTests(unittest.TestCase):
         self.assertIn("prompt_tokens", body)
         self.assertIn("completion_tokens", body)
 
+    def test_status_endpoint_exposes_last_normalize_error(self):
+        # The normalize gate is the most common reason a task opens no PR, and
+        # on the error path the terminal `error` names only the last symptom
+        # ("unparseable output") — the normalizer failure that actually doomed
+        # the run is only in the history. /status surfaces it so the dispatcher
+        # can explain the outcome without a dashboard round trip.
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._seed_task_job(webapp, status="error")
+        webapp._store.save_terminal(
+            "task-status-1",
+            status="error",
+            error="LLM returned unparseable output (finish_reason=stop)",
+            raw_llm_output=None,
+            draft=None,
+            history=[
+                {
+                    "kind": "normalize_error",
+                    "text": "Normalizer failed (exit 1): first",
+                },
+                {"kind": "log", "text": "noise"},
+                {
+                    "kind": "normalize_error",
+                    "text": "Normalizer failed (exit 1):\n1 failed: docstrings",
+                },
+            ],
+        )
+        with patch.object(webapp, "verify_token", return_value=_Claims()):
+            client = TestClient(webapp.app)
+            r = client.get(
+                "/tasks/acme/widgets/task-status-1/status",
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertEqual(r.status_code, 200)
+        # The LAST failure, not the first — that is the one the run died on.
+        self.assertIn("1 failed: docstrings", r.json()["normalizer_error"])
+
+    def test_status_endpoint_normalize_error_null_when_gate_never_failed(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._seed_task_job(webapp, status="no_fix")
+        with patch.object(webapp, "verify_token", return_value=_Claims()):
+            client = TestClient(webapp.app)
+            r = client.get(
+                "/tasks/acme/widgets/task-status-1/status",
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertIsNone(r.json()["normalizer_error"])
+
+    def test_last_normalize_error_keeps_the_informative_tail(self):
+        # Checker output is tail-informative (traceback, then "N failed: …"),
+        # so a bounded payload must drop the head.
+        webapp = self._import_webapp()
+        text = (
+            "HEAD-MARKER\n"
+            + "x" * webapp._NORMALIZE_STATUS_CHARS
+            + "\n1 failed: docstrings"
+        )
+        out = webapp._last_normalize_error(
+            {"history": [{"kind": "normalize_error", "text": text}]}
+        )
+        self.assertIn("1 failed: docstrings", out)
+        self.assertNotIn("HEAD-MARKER", out)
+        self.assertIn("omitted", out)
+
+    def test_last_normalize_error_tolerates_missing_history(self):
+        webapp = self._import_webapp()
+        self.assertIsNone(webapp._last_normalize_error(None))
+        self.assertIsNone(webapp._last_normalize_error({}))
+        self.assertIsNone(
+            webapp._last_normalize_error(
+                {"history": [{"kind": "normalize_error", "text": "  "}]}
+            )
+        )
+
     def test_status_endpoint_rejects_foreign_repo_claim(self):
         if TestClient is None:
             self.skipTest("fastapi not installed")
