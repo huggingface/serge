@@ -99,7 +99,19 @@ envVars:
   # command in-process (formerly the separate normalize Job). Unset = gate is
   # skipped entirely, so it MUST be set. Argv is shlex-split; bash -lc runs the
   # repo's own normalizer. Mirrors the retired normalize.kubernetes settings.
-  TASK_NORMALIZE_COMMAND: "bash -lc 'make style && python utils/checkers.py ruff_check,ruff_format,init_isort,sort_auto_mappings,types,modeling_structure,auto_mappings,imports,import_complexity,copies,modular_conversion,doc_toc,modeling_rules_doc,docstrings,dummies,repo,inits,pipeline_typing,config_docstrings,config_attributes,doctest_list,update_metadata,deps_table --fix --keep-going'"
+  #
+  # The leading `uv pip install -e . --system` is LOAD-BEARING — do not drop it.
+  # transformers is a src/ layout, so without an editable install every checker
+  # that imports transformers (docstrings, pipeline_typing, config_*) validates
+  # the copy baked into the task-runner image instead of the worktree being
+  # patched. The moment main gains a model the image predates, the gate hard-
+  # fails for EVERY task on a checker unrelated to the patch (2026-07-30
+  # nightly: `No module named 'transformers.models.granitemoe_swa'` →
+  # `1 failed: docstrings` → blip_2 burned its whole correction budget on it).
+  # `--system` is equally required: the runner strips the image's UV_PYTHON from
+  # the normalizer env, so without it uv exits 2 with "No virtual environment
+  # found" and, again, every task fails.
+  TASK_NORMALIZE_COMMAND: "bash -lc 'uv pip install -e . --system --no-deps --no-build-isolation && make style && python utils/checkers.py ruff_check,ruff_format,init_isort,sort_auto_mappings,types,modeling_structure,auto_mappings,imports,import_complexity,copies,modular_conversion,doc_toc,modeling_rules_doc,docstrings,dummies,repo,inits,pipeline_typing,config_docstrings,config_attributes,doctest_list,update_metadata,deps_table --fix --keep-going'"
   TASK_NORMALIZE_TIMEOUT: "1800"
   TASK_NORMALIZE_MAX_RETRIES: "2"
   REVIEW_RULES_PATH: ".ai/AGENTS.md"
