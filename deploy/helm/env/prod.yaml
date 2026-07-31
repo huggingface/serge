@@ -100,18 +100,44 @@ envVars:
   # skipped entirely, so it MUST be set. Argv is shlex-split; bash -lc runs the
   # repo's own normalizer. Mirrors the retired normalize.kubernetes settings.
   #
-  # The leading `uv pip install -e . --system` is LOAD-BEARING — do not drop it.
-  # transformers is a src/ layout, so without an editable install every checker
-  # that imports transformers (docstrings, pipeline_typing, config_*) validates
-  # the copy baked into the task-runner image instead of the worktree being
-  # patched. The moment main gains a model the image predates, the gate hard-
-  # fails for EVERY task on a checker unrelated to the patch (2026-07-30
-  # nightly: `No module named 'transformers.models.granitemoe_swa'` →
-  # `1 failed: docstrings` → blip_2 burned its whole correction budget on it).
-  # `--system` is equally required: the runner strips the image's UV_PYTHON from
-  # the normalizer env, so without it uv exits 2 with "No virtual environment
-  # found" and, again, every task fails.
-  TASK_NORMALIZE_COMMAND: "bash -lc 'uv pip install -e . --system --no-deps --no-build-isolation && make style && python utils/checkers.py ruff_check,ruff_format,init_isort,sort_auto_mappings,types,modeling_structure,auto_mappings,imports,import_complexity,copies,modular_conversion,doc_toc,modeling_rules_doc,docstrings,dummies,repo,inits,pipeline_typing,config_docstrings,config_attributes,doctest_list,update_metadata,deps_table --fix --keep-going'"
+  # Written as a real script rather than a one-liner: `bash -lc` takes its whole
+  # script as ONE argument, and shlex keeps a quoted token intact across
+  # newlines, so the gate stays editable and reviewable in place. Two rules when
+  # editing: the body is single-quoted, so it must contain no apostrophe, and
+  # every line must keep the block indent (a flush-left line ends the scalar).
+  TASK_NORMALIZE_COMMAND: |-
+    bash -lc '
+    set -euo pipefail
+
+    # LOAD-BEARING, do not drop either flag. transformers is a src/ layout, so
+    # without an editable install every checker that imports transformers
+    # (docstrings, pipeline_typing, config_*) validates the copy baked into the
+    # task-runner image instead of the worktree being patched. The moment main
+    # gains a model the image predates, the gate hard-fails for EVERY task on a
+    # checker unrelated to the patch: the 2026-07-30 nightly died on
+    # "No module named transformers.models.granitemoe_swa" -> "1 failed:
+    # docstrings", and blip_2 spent its whole correction budget on it.
+    # --system is equally required: the runner strips the image UV_PYTHON from
+    # the normalizer env, so without it uv exits 2 with "No virtual environment
+    # found" and, again, every task fails.
+    uv pip install -e . --system --no-deps --no-build-isolation
+
+    # ruff lint + format over the whole repo.
+    make style
+
+    # The repo consistency checkers, in the order transformers itself runs them.
+    # --fix rewrites what it can (check-only checkers are skipped in fix mode);
+    # --keep-going reports every failure instead of stopping at the first, so one
+    # gate run tells the model everything it has to correct.
+    CHECKERS=ruff_check,ruff_format,init_isort,sort_auto_mappings
+    CHECKERS=$CHECKERS,types,modeling_structure,auto_mappings,imports
+    CHECKERS=$CHECKERS,import_complexity,copies,modular_conversion,doc_toc
+    CHECKERS=$CHECKERS,modeling_rules_doc,docstrings,dummies,repo,inits
+    CHECKERS=$CHECKERS,pipeline_typing,config_docstrings,config_attributes
+    CHECKERS=$CHECKERS,doctest_list,update_metadata,deps_table
+
+    python utils/checkers.py "$CHECKERS" --fix --keep-going
+    '
   TASK_NORMALIZE_TIMEOUT: "1800"
   TASK_NORMALIZE_MAX_RETRIES: "2"
   REVIEW_RULES_PATH: ".ai/AGENTS.md"
