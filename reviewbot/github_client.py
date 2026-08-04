@@ -195,6 +195,32 @@ class GitHubClient:
             }
         )
 
+    def get_repo(self, owner: str, repo: str) -> dict:
+        r = self.session.get(
+            f"https://api.github.com/repos/{owner}/{repo}",
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def is_collaborator(self, owner: str, repo: str, username: str) -> Optional[bool]:
+        """True/False when GitHub answers 204/404; None when the answer is
+        inconclusive (App lacks ``Metadata: read`` on the repo, GitHub 5xx,
+        …). Callers gating private-repo content treat None as a denial.
+
+        ``allow_redirects=False`` so GitHub's 302 fallback (permission
+        missing) doesn't get followed into a misleading answer."""
+        r = self.session.get(
+            f"https://api.github.com/repos/{owner}/{repo}/collaborators/{username}",
+            timeout=30,
+            allow_redirects=False,
+        )
+        if r.status_code == 204:
+            return True
+        if r.status_code == 404:
+            return False
+        return None
+
     def get_pr(self, owner: str, repo: str, number: int) -> dict:
         r = self.session.get(
             f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}",

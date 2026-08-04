@@ -89,6 +89,32 @@ repo build code (e.g. `make style`). Its egress is therefore locked down:
   secrets present while untrusted code runs), which this design deliberately
   trades away for simplicity and speed.
 
+## Private Repositories
+
+Neither of the pre-existing web-app gates authorizes access to a *repository*:
+
+- `WEB_ALLOWED_USERS` / `WEB_ALLOWED_ORG` bootstrap the deployment at setup
+  time. They decide who gets an account, not what those accounts may read, and
+  org membership does not imply access to every private repo in the org.
+- Provider configs (in the database, edited from the web UI) decide which LLM
+  key a given repository runs on. Any signed-in user may create one for any
+  repository pattern, so they route keys rather than fence users off from each
+  other.
+
+For a private repository serge therefore requires the user to be a collaborator
+on the target repository before it will submit a review for it or serve an
+existing review/task's content. This is the UI counterpart of the webhook's
+`author_association` gate (`MEMBER`, `OWNER`, `COLLABORATOR`).
+
+The collaborator lookup uses the GitHub App installation token
+(`Metadata: read`), not a user token, so it works under SAML SSO and needs no
+extra OAuth scope. It is fail-closed: an unreachable GitHub, a missing
+installation, or an inconclusive answer denies access. Verdicts are cached for
+five minutes per (user, repository).
+
+Public repositories keep the previous posture: any signed-in user may review
+them and follow anyone's review of them.
+
 ## Web App Sessions
 
 Production web app deployments should use OAuth, a strong

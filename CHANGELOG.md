@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Private repositories are supported in the web app. Submitting a review for a
+  private repo, and opening an existing review or task on one, now require the
+  signed-in user to be a collaborator on that repo — checked App-side via
+  `Metadata: read`, cached for five minutes, and fail-closed. Public repos are
+  unchanged.
 - GitHub App mode is documented as the zero-config default: installed repos need
   no workflow file or secret, with instructions for overriding gating via an
   explicit workflow and a note on the forked-PR limitation.
