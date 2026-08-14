@@ -153,6 +153,42 @@ class BuildTaskRequestTests(unittest.TestCase):
         with self.assertRaises(TaskError):
             build_task_request({"context": "x"}, owner="a", repo="b")
 
+    def test_test_links_are_accepted_and_sanitized(self):
+        req = build_task_request(
+            {
+                "instruction": "x",
+                "test_links": {
+                    "tests/a.py::T::test_x": [
+                        {"label": "Dashboard", "url": "https://grafana/d/x?a=b"},
+                        {"label": "bad", "url": "javascript:alert(1)"},
+                    ]
+                },
+            },
+            owner="a",
+            repo="b",
+        )
+        self.assertEqual(
+            req.test_links,
+            {
+                "tests/a.py::T::test_x": [
+                    {"label": "Dashboard", "url": "https://grafana/d/x?a=b"}
+                ]
+            },
+        )
+
+    def test_test_links_are_optional_and_junk_is_not_fatal(self):
+        # Links are decoration: a caller that sends none, or sends nonsense, still
+        # gets its task run.
+        self.assertEqual(
+            build_task_request({"instruction": "x"}, owner="a", repo="b").test_links, {}
+        )
+        self.assertEqual(
+            build_task_request(
+                {"instruction": "x", "test_links": "not-a-map"}, owner="a", repo="b"
+            ).test_links,
+            {},
+        )
+
     def test_bad_mode(self):
         with self.assertRaises(TaskError):
             build_task_request(

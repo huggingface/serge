@@ -393,6 +393,29 @@ class RunnerConfigPassthroughTest(unittest.TestCase):
             f"classify_* Config fields not threaded to the runner pod: {missing}",
         )
 
+    def test_test_links_reach_the_runner_pod(self):
+        # The runner pod is what opens the PR, so the "where to watch it" links
+        # are rendered there, from the request rather than from config. They ride
+        # the serialized TaskRequest (dataclasses.asdict in webapp) — a field the
+        # dataclass does not declare would be dropped on the way in.
+        import dataclasses
+        import types
+
+        from reviewbot.task_runner import build_task_request
+        from reviewbot.tasks import TaskRequest
+
+        links = {"tests/a.py::T::test_x": [{"label": "Dashboard", "url": "https://x"}]}
+        req = TaskRequest(
+            owner="huggingface",
+            repo="transformers",
+            base_ref="main",
+            instruction="fix it",
+            context="",
+            test_links=links,
+        )
+        spec = types.SimpleNamespace(request=dataclasses.asdict(req))
+        self.assertEqual(build_task_request(spec).test_links, links)
+
     def test_classify_bail_on_environment_is_threaded_to_the_runner(self):
         # `_maybe_reproduce_first` reads this in the runner pod to decide whether an
         # `environment_issue` verdict stops the flow; unthreaded, the pod would
