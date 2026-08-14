@@ -140,6 +140,44 @@ review pages use.
   class as a PR body). The prompt marks them untrusted, the model can only emit a
   patch, and the result is a PR a human reviews before merge.
 
+## What the PR body says
+
+serge wraps the model's explanation in the evidence a reviewer needs to judge it
+without opening the CI logs:
+
+1. **Original CI failure** — the failure group, the failing test, and the
+   traceback CI actually produced, in a collapsed `<details>` block.
+2. **Where to watch it** — the links the dispatcher sent in `test_links` (see
+   below) for the tests this PR fixes, typically a per-test dashboard view.
+   Omitted when the task carried none.
+3. **The model's explanation** of the root cause and the patch.
+4. **Verified on GPU** — the runs that failed before and passed after, when the
+   GPU verify gate (`VERIFY_ON_GPU`) is on.
+5. **Possibly related** — existing issues/PRs in the target repo that mention the
+   failing test, found with one `GET /search/issues` call at PR-open time. It is
+   a keyword match, labelled as such: serge does not check that they share a root
+   cause, and it drops its own earlier task PRs. A failed or rate-limited search
+   silently renders nothing rather than holding up the PR.
+
+### `test_links` — where the dispatcher observes its failures
+
+serge does not know which dashboard a caller watches its CI in, and deliberately
+holds no monitoring config of its own. A task may therefore carry an optional
+node-id-keyed map of finished links, which serge renders (and only renders):
+
+```json
+"test_links": {
+  "tests/models/foo/test_modeling_foo.py::FooIntegrationTest::test_bar": [
+    {"label": "Dashboard", "url": "https://grafana.example/d/…?var-test_nodeid=…"}
+  ]
+}
+```
+
+Keyed by node-id because one task can carry several candidate failure groups and
+the PR fixes only the group serge's patch matched — links for the others would be
+noise. Validated on the way in (`http(s)` only, single-line labels, capped
+counts); anything malformed is dropped, never fatal. Absent field, no section.
+
 ## Configuration
 
 | Env var | Default | Description |

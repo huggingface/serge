@@ -25,7 +25,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from . import __version__
+from . import __version__, pr_links
 from .clone_cache import Checkout, CloneCache, FileChange
 from .commit_scope import describe_dropped, scope_paths
 from .compression import MessageCompressor
@@ -117,6 +117,11 @@ class TaskRequest:
     # confirmed the failure at the base commit. Surfaced in the PR body as the
     # "failed before" evidence.
     reproduce_run_url: Optional[str] = None
+    # Optional, from the /tasks payload: node-id → [{label, url}] links to where
+    # the dispatcher observes each failing test (a dashboard, a run page). serge
+    # renders them in the PR body and knows nothing about what they point at —
+    # see :func:`pr_links.sanitize_test_links`.
+    test_links: dict[str, list[dict[str, str]]] = field(default_factory=dict)
 
     @property
     def repo_full_name(self) -> str:
@@ -268,6 +273,7 @@ def build_task_request(
         slack_channel=slack_channel,
         slack_notify_pr_created=slack_notify_pr_created,
         slack_notify_task_finished=slack_notify_task_finished,
+        test_links=pr_links.sanitize_test_links(payload.get("test_links")),
     )
 
 
@@ -660,24 +666,42 @@ def _failure_blocks(context: str) -> list[list[str]]:
 def _select_failure_block(req: TaskRequest, plan: TaskPlan) -> list[str]:
     """The single failure block most relevant to the produced patch (scored by
     word overlap with the patch/title/body). Shared by the PR-body decorator and
-    the GPU verify gate, so both target the same group's node-ids."""
+    the GPU verify gate, so both target the same group's node-ids.
+
+    Scoring reads the bullet *and* the CI traceback rendered under it. The
+    traceback is not part of the block (:func:`_failure_blocks` stops at the
+    fence, so the verify targets stay the bullets alone), but it is where the
+    identifiers a patch echoes actually live — without it every fenced bullet
+    scores zero and the group's first failure wins by position."""
     blocks = _failure_blocks(req.context)
     if not blocks:
         return []
     haystack = f"{plan.title}\n{plan.body}\n{plan.patch}".lower()
+    tracebacks = pr_links.failure_tracebacks(req.context)
 
     def _score(block: list[str]) -> int:
-        words = set(re.findall(r"[a-z0-9_]{5,}", "\n".join(block).lower()))
+        node_ids, _, _ = extract_verify_targets(block, "")
+        text = "\n".join(block + [tracebacks.get(nid, "") for nid in node_ids])
+        words = set(re.findall(r"[a-z0-9_]{5,}", text.lower()))
         return sum(1 for word in words if word in haystack)
 
     return max(blocks, key=_score)
 
 
 def _selected_failure_context(req: TaskRequest, plan: TaskPlan) -> str:
+    """The "Original CI failure" header of the PR body: which group this fixes,
+    the failing test, the error CI actually raised, and where to watch it.
+
+    The bullet alone says a test failed; the traceback (parsed separately, since
+    :func:`_failure_blocks` stops at the fence) says *how*, which is what a
+    reviewer needs to judge the patch without opening the CI log."""
     heading = ""
     for line in req.context.splitlines():
         if _CANDIDATE_HEADING_RE.match(line):
             heading = line.removeprefix("## Serge candidate failure group ").strip()
+            # Drop the dispatcher's "3/5: " counter — it means nothing to a
+            # reviewer, who only sees this one group's PR.
+            heading = re.sub(r"^\d+/\d+:\s*", "", heading)
             break
 
     selected = _select_failure_block(req, plan)
@@ -688,11 +712,41 @@ def _selected_failure_context(req: TaskRequest, plan: TaskPlan) -> str:
     if heading:
         lines.append(f"- Failure group: `{heading}`")
     lines.extend(selected)
+
+    node_ids, _, _ = extract_verify_targets(selected, "")
+    error = pr_links.error_section(req.context, node_ids)
+    if error:
+        lines += ["", error]
+    links = pr_links.test_links_section(req.test_links, node_ids)
+    if links:
+        lines += ["", links]
     return "\n".join(lines)
 
 
+def _related_issues_section(
+    gh: Optional[GitHubClient], req: TaskRequest, plan: TaskPlan
+) -> str:
+    """Prior reports of this failure, looked up when the PR is opened so the
+    reviewer sees them at their freshest. Never blocks the PR: no client, no
+    node-ids or a failing search all render nothing."""
+    if gh is None:
+        return ""
+    selected = _select_failure_block(req, plan)
+    if not selected:
+        return ""
+    node_ids, model, _ = extract_verify_targets(selected, "")
+    related = pr_links.find_related_issues(
+        gh, req.owner, req.repo, node_ids=node_ids, model=model
+    )
+    return pr_links.related_section(related, node_ids)
+
+
 def _decorate_body(
-    cfg: Config, plan: TaskPlan, req: TaskRequest, verification_footer: str = ""
+    cfg: Config,
+    plan: TaskPlan,
+    req: TaskRequest,
+    verification_footer: str = "",
+    gh: Optional[GitHubClient] = None,
 ) -> str:
     body = plan.body or "Automated fix produced by serge."
     failure_context = _selected_failure_context(req, plan)
@@ -703,6 +757,9 @@ def _decorate_body(
     # the serge footer (not tacked on after them).
     if verification_footer:
         body += f"\n{verification_footer}"
+    related = _related_issues_section(gh, req, plan)
+    if related:
+        body += f"\n\n{related}"
     body += (
         "\n\n---\n_This change was produced automatically by serge from a "
         "CI failure report. The patch was generated by an LLM and applied by "
@@ -967,6 +1024,7 @@ def _commit_changes(
             verification_footer=_verification_footer(
                 verify_run_url, req.reproduce_run_url, runs=verify_runs
             ),
+            gh=gh,
         ),
         draft=True,
     )

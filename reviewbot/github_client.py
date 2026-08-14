@@ -542,6 +542,34 @@ class GitHubClient:
             )
         return r.json()
 
+    def search_issues(
+        self,
+        query: str,
+        *,
+        sort: str = "updated",
+        order: str = "desc",
+        per_page: int = 20,
+    ) -> list[dict]:
+        """Issue/PR search (``GET /search/issues``), newest activity first.
+
+        Used to surface existing reports of a CI failure in a task PR body.
+        Search has its own rate budget (30 req/min for an installation token),
+        so callers treat any failure as "no hits" rather than retrying.
+        ``advanced_search`` opts into the current query parser explicitly."""
+        r = self.session.get(
+            "https://api.github.com/search/issues",
+            params={
+                "q": query,
+                "sort": sort,
+                "order": order,
+                "per_page": per_page,
+                "advanced_search": "true",
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        return (r.json() or {}).get("items", [])
+
     def mark_pull_request_ready(self, node_id: str) -> None:
         """Transition a draft PR to ready-for-review via the GraphQL
         ``markPullRequestReadyForReview`` mutation. The REST ``PATCH /pulls``
