@@ -37,6 +37,19 @@ _MODEL_RE = re.compile(r"tests/models/([^/]+)/")
 _MULTI_GPU = "aws-g5-12xlarge-cache"
 _SINGLE_GPU = "aws-g5-4xlarge-cache"
 
+# What to send as the workflow's `model` input when the group's tests do not live
+# under `tests/models/<model>/` — e.g. `tests/generation/test_utils.py`.
+#
+# The input is only used to pick the optional collateral suite (and to label the
+# run), and `run_collateral` is already forced off without a model, so any
+# placeholder works. It must NOT be empty: `model` is `required: true` on
+# serge-verify-caller.yml, and GitHub's workflow_dispatch API counts an empty
+# string as absent, answering 422 `Required input 'model' not provided`. That
+# fails BOTH the reproduce dispatch (which then fails open) and the verify
+# dispatch, so the 2026-08-16 nightly spent 904k tokens investigating the
+# `generation` group blind and threw the resulting patch away for want of a PR.
+_NO_MODEL = "none"
+
 # GitHub's run-scoped artifact listing lags the run's "completed" status: the
 # artifact is uploaded before completion, but `GET /runs/{id}/artifacts` can keep
 # returning an empty list for MINUTES afterwards (observed ~3 min in prod across a
@@ -194,7 +207,7 @@ def run_gpu_verify(
         "base_sha": base_sha,
         "commit_sha": commit_sha,
         "test_nodeids": " ".join(node_ids),
-        "model": model,
+        "model": model or _NO_MODEL,
         "machine_type": machine_type,
         "run_collateral": "true" if (run_collateral and model) else "false",
         "transformersci_ref": transformersci_ref,
@@ -259,7 +272,7 @@ def run_gpu_reproduce(
         "mode": "reproduce",
         "base_sha": base_sha,
         "test_nodeids": " ".join(node_ids),
-        "model": model,
+        "model": model or _NO_MODEL,
         "machine_type": machine_type,
         "run_collateral": "false",
         "transformersci_ref": transformersci_ref,

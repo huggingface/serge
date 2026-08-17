@@ -324,3 +324,57 @@ def test_run_reproduce_no_targets_skips_dispatch():
 def test_run_reproduce_dispatch_failed():
     gh = FakeGH(dispatch_exc=RuntimeError("no actions:write"))
     assert _run_repro(gh).verdict == verify.DISPATCH_FAILED
+
+
+# ---- groups whose tests are not under tests/models/<model>/ ------------------
+
+# `tests/generation/test_utils.py` has no model folder, so extract_verify_targets
+# returns model="". Sending that empty string is a hard 422 from GitHub
+# ("Required input 'model' not provided"), which broke both dispatches for this
+# group on the 2026-08-16 nightly.
+NO_MODEL_BLOCK = [
+    "- `tests/generation/test_utils.py::GenerationIntegrationTests"
+    "::test_green_red_watermark_generation` [multi-gpu] (other, seen 7/7)",
+]
+
+
+def test_extract_targets_has_no_model_outside_tests_models():
+    nodeids, model, _machine = verify.extract_verify_targets(
+        NO_MODEL_BLOCK, "default-mt"
+    )
+    assert nodeids == [
+        "tests/generation/test_utils.py::GenerationIntegrationTests"
+        "::test_green_red_watermark_generation"
+    ]
+    assert model == ""
+
+
+def test_verify_sends_a_placeholder_model_never_an_empty_string():
+    # The clock jumps past the deadline so the poll gives up immediately; the
+    # dispatch is already recorded and its inputs are all we assert on here.
+    gh, clock = FakeGH(), Clock([0, 10**6])
+    _run(gh, block_lines=NO_MODEL_BLOCK, monotonic=clock)
+    (_o, _r, _wf, _ref, inputs) = gh.dispatched[0]
+    assert inputs["model"] == verify._NO_MODEL
+    assert inputs["model"]  # the point: `model` is required: true on the caller
+    # No model folder means there is no collateral suite to run either.
+    assert inputs["run_collateral"] == "false"
+
+
+def test_reproduce_sends_a_placeholder_model_never_an_empty_string():
+    # The clock jumps past the deadline so the poll gives up immediately; the
+    # dispatch is already recorded and its inputs are all we assert on here.
+    gh, clock = FakeGH(), Clock([0, 10**6])
+    _run_repro(gh, block_lines=NO_MODEL_BLOCK, monotonic=clock)
+    (_o, _r, _wf, _ref, inputs) = gh.dispatched[0]
+    assert inputs["model"] == verify._NO_MODEL
+
+
+def test_a_real_model_is_still_passed_through():
+    # The clock jumps past the deadline so the poll gives up immediately; the
+    # dispatch is already recorded and its inputs are all we assert on here.
+    gh, clock = FakeGH(), Clock([0, 10**6])
+    _run(gh, block_lines=BLOCK, run_collateral=True, monotonic=clock)
+    (_o, _r, _wf, _ref, inputs) = gh.dispatched[0]
+    assert inputs["model"] == "whisper"
+    assert inputs["run_collateral"] == "true"
