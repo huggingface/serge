@@ -145,6 +145,12 @@ class TaskRequest:
     # renders them in the PR body and knows nothing about what they point at —
     # see :func:`pr_links.sanitize_test_links`.
     test_links: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    # Optional, from the /tasks payload: GitHub logins to request a review from
+    # on a newly opened PR. The dispatcher decides who is relevant — for the
+    # integration-failure triage that is the author of the commit its bisect
+    # blamed — and serge only forwards the request. See
+    # :func:`sanitize_reviewers`.
+    reviewers: tuple[str, ...] = ()
 
     @property
     def repo_full_name(self) -> str:
@@ -297,7 +303,42 @@ def build_task_request(
         slack_notify_pr_created=slack_notify_pr_created,
         slack_notify_task_finished=slack_notify_task_finished,
         test_links=pr_links.sanitize_test_links(payload.get("test_links")),
+        reviewers=sanitize_reviewers(payload.get("reviewers")),
     )
+
+
+# GitHub caps a single review request at 15 logins; stay under it and never ping
+# a crowd because a dispatcher sent a long list.
+MAX_REVIEWERS = 10
+# A GitHub login: 1-39 chars of alphanumerics and single inner hyphens. Bot
+# accounts (`dependabot[bot]`) deliberately fail this — a bot cannot review, and
+# requesting one 422s the whole call, taking the valid logins down with it.
+_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
+
+
+def sanitize_reviewers(raw: Any) -> tuple[str, ...]:
+    """Validate an inbound ``reviewers`` list of GitHub logins.
+
+    Anything malformed is dropped rather than raising, for the same reason as
+    :func:`pr_links.sanitize_test_links`: a review request is a courtesy on top
+    of the fix, and a bad entry must not cost a PR. Order is preserved and
+    duplicates collapse (case-insensitively — GitHub logins are unique
+    case-insensitively, and requesting both spellings is one wasted 422)."""
+    if not isinstance(raw, list):
+        return ()
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        login = entry.strip().lstrip("@")
+        if not _LOGIN_RE.match(login) or login.lower() in seen:
+            continue
+        seen.add(login.lower())
+        out.append(login)
+        if len(out) == MAX_REVIEWERS:
+            break
+    return tuple(out)
 
 
 def _notification_bool(
@@ -1125,6 +1166,20 @@ def _commit_changes(
     emit_fn(
         "log", f"Opened PR #{pr.get('number')} (draft->ready): {pr.get('html_url')}"
     )
+    # Reviewers the dispatcher named — for the integration-failure triage, the
+    # author of the commit its bisect blamed for the regression. They are the one
+    # person who knows what the change was meant to do, so a fix PR that touches
+    # it should land in their queue rather than waiting for someone to notice.
+    #
+    # New PRs only: an existing_pr follow-up pushes onto a branch whose review is
+    # already requested, and re-requesting resets a review the author may have
+    # already given. Requested AFTER draft->ready, so this adds to whatever
+    # `assign-reviewers.yml` routes rather than racing it. Fail-soft (see
+    # `GitHubClient.request_reviewers`) — never lose a published PR over it.
+    if req.reviewers and pr.get("number"):
+        requested = gh.request_reviewers(owner, repo, pr["number"], req.reviewers)
+        if requested:
+            emit_fn("log", f"Requested review from {', '.join(requested)}")
     if req.slack_notify_pr_created:
         post_task_pr_created_notification(
             token=cfg.slack_bot_token,

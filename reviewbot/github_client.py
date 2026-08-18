@@ -1,7 +1,7 @@
 import base64
 import logging
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import requests
 
@@ -541,6 +541,47 @@ class GitHubClient:
                 response=r,
             )
         return r.json()
+
+    def request_reviewers(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        reviewers: Sequence[str],
+    ) -> list[str]:
+        """Request reviews on a PR. Returns the logins GitHub accepted.
+
+        **Fail-soft by contract**: a reviewer request is a courtesy on top of an
+        already-published PR, so every failure is logged and swallowed rather
+        than raised. GitHub 422s the whole call for reasons that are none of the
+        PR's business — the login is not a collaborator, it is the PR's own
+        author, it no longer exists — and losing the PR over that would be
+        absurd. Returns ``[]`` when nothing was requested."""
+        if not reviewers:
+            return []
+        try:
+            r = self.session.post(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/requested_reviewers",
+                json={"reviewers": list(reviewers)},
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            log.warning(
+                "could not request reviewers on %s/%s#%s: %s", owner, repo, number, exc
+            )
+            return []
+        if not r.ok:
+            log.warning(
+                "%d requesting reviewers %s on %s/%s#%s: %s",
+                r.status_code,
+                list(reviewers),
+                owner,
+                repo,
+                number,
+                r.text[:300],
+            )
+            return []
+        return list(reviewers)
 
     def search_issues(
         self,
