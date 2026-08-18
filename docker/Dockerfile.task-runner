@@ -32,6 +32,24 @@ RUN if ! (command -v git >/dev/null && command -v make >/dev/null); then \
       && rm -rf /var/lib/apt/lists/*; \
     fi
 
+# Re-resolve the target repo's quality toolchain from its main branch.
+#
+# LOAD-BEARING, do not drop. The base image installs `transformers[quality]` at
+# ITS OWN build time (nightly), so every pin in it freezes on that date. When a
+# pin then moves on main, the normalize gate fails for EVERY task on a checker
+# unrelated to the patch, and the gate cannot repair it: it installs the worktree
+# with `--no-deps` (mandatory — the task pod's egress allowlist has no PyPI).
+# Twice in two days:
+#   2026-08-17  tokenizers 0.22.2 in-image vs main's new >=0.23.1 pin
+#               -> 6 checkers dead on the version guard, 3 groups lost, ~3.5M tokens
+#   2026-08-18  transformers-mlinter 0.1.2 in-image vs main's 0.1.4 rule schema
+#               -> "Invalid rule spec for TRF054: default_enabled must be bool"
+# Resolving here makes the gate's env only as stale as *this* image, which a
+# rebuild fixes on demand — instead of waiting for the base's next nightly.
+ARG TRANSFORMERS_REF=main
+RUN pip install --no-cache-dir --upgrade \
+      "transformers[quality] @ git+https://github.com/huggingface/transformers@${TRANSFORMERS_REF}"
+
 # Layer serge on top of the toolchain, into the base image's Python environment
 # so `reviewbot-task-runner` is on PATH and its imports resolve. Only the base
 # deps are needed (requests/pyjwt/flask) — not the [web] server extras.
