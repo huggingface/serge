@@ -13,6 +13,7 @@ from reviewbot.clone_cache import Checkout, CloneCache
 from reviewbot.config import Config
 from reviewbot.github_client import SERGE_GIT_EMAIL
 from reviewbot.tasks import (
+    MAX_REVIEWERS,
     NormalizeGateBroken,
     TaskError,
     TaskPlan,
@@ -95,6 +96,7 @@ class _FakeGH:
         self.created_pr = None
         self.updated_refs = []
         self.created_refs = []
+        self.requested_reviewers = []
 
     def get_pr(self, owner, repo, number):
         self.calls.append(("get_pr", number))
@@ -149,6 +151,10 @@ class _FakeGH:
     def mark_pull_request_ready(self, node_id):
         self.marked_ready = node_id
 
+    def request_reviewers(self, owner, repo, number, reviewers):
+        self.requested_reviewers.append((number, list(reviewers)))
+        return list(reviewers)
+
 
 class BuildTaskRequestTests(unittest.TestCase):
     def test_minimal_new_pr(self):
@@ -200,6 +206,47 @@ class BuildTaskRequestTests(unittest.TestCase):
             ).test_links,
             {},
         )
+
+    def test_reviewers_are_accepted_and_sanitized(self):
+        req = build_task_request(
+            {
+                "instruction": "x",
+                "reviewers": [
+                    "@octocat",  # a leading @ is stripped
+                    "octocat",  # dupe (case-insensitive) collapses
+                    "OCTOCAT",
+                    "dependabot[bot]",  # a bot cannot review, and 422s the call
+                    "not a login",
+                    "",
+                    42,
+                    "second-user",
+                ],
+            },
+            owner="a",
+            repo="b",
+        )
+        self.assertEqual(req.reviewers, ("octocat", "second-user"))
+
+    def test_reviewers_are_optional_and_junk_is_not_fatal(self):
+        # Same contract as test_links: a review request is a courtesy on top of
+        # the fix, so a malformed field must never cost a PR.
+        self.assertEqual(
+            build_task_request({"instruction": "x"}, owner="a", repo="b").reviewers, ()
+        )
+        self.assertEqual(
+            build_task_request(
+                {"instruction": "x", "reviewers": "octocat"}, owner="a", repo="b"
+            ).reviewers,
+            (),
+        )
+
+    def test_reviewers_are_capped(self):
+        req = build_task_request(
+            {"instruction": "x", "reviewers": [f"user{i}" for i in range(25)]},
+            owner="a",
+            repo="b",
+        )
+        self.assertEqual(len(req.reviewers), MAX_REVIEWERS)
 
     def test_bad_mode(self):
         with self.assertRaises(TaskError):
@@ -447,6 +494,61 @@ class PublishTaskTests(unittest.TestCase):
         self.assertEqual(result.changed_files, ["hello.txt"])
         notify.assert_called_once()
 
+    def test_new_pr_requests_the_reviewers_the_dispatcher_named(self):
+        # The triage blames a commit for the regression; its author is the one
+        # person who knows what that change meant to do, so the fix PR should
+        # land in their queue instead of waiting to be noticed.
+        co = self._checkout("main")
+        req = TaskRequest(
+            owner="acme",
+            repo="widget",
+            base_ref="main",
+            instruction="fix",
+            context="",
+            mode="new_pr",
+            reviewers=("octocat",),
+        )
+        plan = TaskPlan(title="Fix hello", body="desc", patch=self._PATCH)
+        gh = _FakeGH()
+        with patch("reviewbot.tasks.post_task_pr_created_notification"):
+            publish_task(
+                self.cfg,
+                gh,
+                req,
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+        self.assertEqual(gh.requested_reviewers, [(99, ["octocat"])])
+        # After the draft->ready transition, so it adds to whatever the repo's
+        # own reviewer-assignment workflow routes rather than racing it.
+        self.assertEqual(gh.marked_ready, "PR_node_99")
+
+    def test_no_reviewers_means_no_call(self):
+        co = self._checkout("main")
+        req = TaskRequest(
+            owner="acme",
+            repo="widget",
+            base_ref="main",
+            instruction="fix",
+            context="",
+            mode="new_pr",
+        )
+        plan = TaskPlan(title="Fix hello", body="desc", patch=self._PATCH)
+        gh = _FakeGH()
+        with patch("reviewbot.tasks.post_task_pr_created_notification"):
+            publish_task(
+                self.cfg,
+                gh,
+                req,
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+        self.assertEqual(gh.requested_reviewers, [])
+
     def test_new_pr_notification_uses_request_slack_channel(self):
         co = self._checkout("main")
         req = TaskRequest(
@@ -506,6 +608,34 @@ class PublishTaskTests(unittest.TestCase):
         self.assertEqual(result.branch, "serge/fix-1")
         self.assertEqual(gh.updated_refs[0][0], "heads/serge/fix-1")
         self.assertIsNone(gh.created_pr)
+
+    def test_existing_pr_follow_up_does_not_re_request_reviewers(self):
+        # The review was requested when the PR was opened. Re-requesting on every
+        # follow-up push would reset a review the author may already have given.
+        co = self._checkout("serge/fix-1")
+        req = TaskRequest(
+            owner="acme",
+            repo="widget",
+            base_ref="main",
+            instruction="fix",
+            context="",
+            mode="existing_pr",
+            pr_number=5,
+            head_branch="serge/fix-1",
+            reviewers=("octocat",),
+        )
+        plan = TaskPlan(title="Fix again", body="desc", patch=self._PATCH)
+        gh = _FakeGH()
+        publish_task(
+            self.cfg,
+            gh,
+            req,
+            plan,
+            checkout=co,
+            clone_cache=self.cache,
+            job_id="abcd1234",
+        )
+        self.assertEqual(gh.requested_reviewers, [])
 
     def test_empty_patch_is_no_change(self):
         co = self._checkout("main")

@@ -124,6 +124,112 @@ class ChatResult:
         return v if isinstance(v, int) else None
 
 
+# Rate-limit headers, in the spellings the OpenAI-compatible endpoints serge
+# talks to actually use. Request budgets only: a token budget resets on a
+# different clock and pacing on it would stall the loop for a limit it is not
+# hitting.
+_REMAINING_HEADERS = (
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-remaining",
+    "ratelimit-remaining",
+)
+_RESET_HEADERS = (
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset",
+    "ratelimit-reset",
+)
+# "6m0s", "1.5s", "300ms" — the duration form OpenAI-style resets use.
+_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h)")
+# A reset given as an absolute epoch rather than a duration. Anything past this
+# is a timestamp, not "wait 1.7 billion seconds".
+_EPOCH_THRESHOLD = 1_000_000_000
+
+
+def _header(response: Optional["requests.Response"], names: tuple[str, ...]) -> str:
+    """First present value among ``names``, or ``""``. Tolerates a Mock
+    ``headers`` (tests) and a response that never arrived."""
+    headers = getattr(response, "headers", None)
+    if not hasattr(headers, "get"):
+        return ""
+    for name in names:
+        value = headers.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _parse_duration(raw: str) -> Optional[float]:
+    """Seconds from a rate-limit reset value: ``"20"``, ``"6m0s"``, ``"300ms"``,
+    or an absolute epoch. ``None`` when it is not any of those."""
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        pass
+    else:
+        if value >= _EPOCH_THRESHOLD:  # absolute timestamp
+            return max(0.0, value - time.time())
+        return max(0.0, value)
+    total = 0.0
+    matched = False
+    for amount, unit in _DURATION_RE.findall(raw):
+        matched = True
+        total += float(amount) * {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}[unit]
+    return total if matched else None
+
+
+def _retry_after_seconds(response: Optional["requests.Response"]) -> Optional[float]:
+    """``Retry-After`` in seconds, from either the delta or HTTP-date form."""
+    raw = _header(response, ("Retry-After", "retry-after"))
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        return max(0.0, parsedate_to_datetime(raw).timestamp() - time.time())
+    except Exception:  # noqa: BLE001 - a malformed date is simply no answer
+        return None
+
+
+def _reset_seconds(response: Optional["requests.Response"]) -> Optional[float]:
+    """Seconds until the request budget resets, per the server's own headers."""
+    return _parse_duration(_header(response, _RESET_HEADERS))
+
+
+def _budget_interval(response: Optional["requests.Response"]) -> Optional[float]:
+    """Spacing that spends the *reported* remaining requests evenly over the
+    window they reset in — the provider's own numbers, not a guess.
+
+    ``None`` when the endpoint publishes no budget (most do not), or when there
+    is enough headroom that pacing would only slow the loop down for nothing."""
+    remaining_raw = _header(response, _REMAINING_HEADERS)
+    if not remaining_raw:
+        return None
+    try:
+        remaining = int(float(remaining_raw))
+    except ValueError:
+        return None
+    reset = _reset_seconds(response)
+    if reset is None or reset <= 0:
+        return None
+    if remaining <= 0:
+        # Budget spent: the whole window is the wait.
+        return reset
+    if remaining > _PACE_WHEN_REMAINING_BELOW:
+        return None
+    return reset / remaining
+
+
+# Only pace when the reported headroom is this tight. Above it the loop runs at
+# full speed: a limit we are nowhere near is not worth a single second.
+_PACE_WHEN_REMAINING_BELOW = 10
+
+
 class ChatCompletionClient:
     """Minimal OpenAI-compatible /v1/chat/completions client.
 
@@ -147,6 +253,11 @@ class ChatCompletionClient:
         self.bill_to = bill_to or None
         self.stream = stream
         self.compressor = compressor
+        # Adaptive pacing, learned from 429s (see :meth:`_throttle_wait`). One
+        # client serves one agentic loop, so this is per-task state: the loop
+        # that tripped a rate limit is the loop that must slow down.
+        self._min_interval = 0.0
+        self._next_earliest = 0.0
 
     def _api_base_v1(self) -> str:
         if self.api_base.endswith("/v1"):
@@ -327,30 +438,96 @@ class ChatCompletionClient:
     # without letting a misbehaving upstream pin a worker forever.
     _RETRY_WAIT_CEILING_SECONDS = 120.0
 
+    # A 429 gets its OWN, much larger budget than the 3 attempts a 5xx or a
+    # dropped connection gets, because it is a different kind of failure. A
+    # server error may never clear, so failing fast is right. A rate limit
+    # clears by *waiting* — and what we throw away by giving up is the whole
+    # agentic loop that came before it: one 429 ended the `deepseek_vl` task on
+    # 2026-08-18 after it had already spent 1.13M input tokens (transformers#48050).
+    # 6 attempts of backed-off waiting is minutes of patience against an hour of
+    # wasted work.
+    _RATE_LIMIT_ATTEMPTS = 6
+    # Pacing after a rate limit. Retrying the one rejected call is not enough:
+    # the loop is about to issue the same burst of tool turns that tripped the
+    # limit, so the next calls have to be spaced out too. The interval doubles
+    # per 429 and decays on success, which converges on whatever rate the
+    # provider is actually willing to serve without needing to know its limit.
+    _THROTTLE_FIRST_SECONDS = 2.0
+    _THROTTLE_CEILING_SECONDS = 30.0
+    _THROTTLE_DECAY = 0.5
+    # Below this the pacing is noise; drop it entirely so a loop that hit one
+    # transient 429 returns to full speed instead of limping forever.
+    _THROTTLE_FLOOR_SECONDS = 0.25
+
+    def _throttle_wait(self) -> None:
+        """Block until this client is allowed to issue its next request.
+
+        No-op until a 429 has been seen — an endpoint that never rate-limits us
+        is never slowed down."""
+        if self._min_interval <= 0.0:
+            return
+        remaining = self._next_earliest - time.monotonic()
+        if remaining > 0:
+            log.info("pacing LLM call: waiting %.1fs after a rate limit", remaining)
+            time.sleep(remaining)
+
+    def _note_rate_limited(self, response: "requests.Response") -> None:
+        """Widen the spacing between requests after a 429.
+
+        Prefer what the server said. ``Retry-After`` (or an ``x-ratelimit-reset``
+        family header) is the window it wants us to sit out, which beats any
+        number we could invent; the doubling heuristic is only the fallback for
+        providers that send neither."""
+        told = _retry_after_seconds(response)
+        if told is None:
+            told = _reset_seconds(response)
+        if told is not None:
+            self._min_interval = min(
+                max(told, self._THROTTLE_FLOOR_SECONDS), self._THROTTLE_CEILING_SECONDS
+            )
+            return
+        widened = max(self._min_interval * 2, self._THROTTLE_FIRST_SECONDS)
+        self._min_interval = min(widened, self._THROTTLE_CEILING_SECONDS)
+
+    def _note_request_done(
+        self, response: Optional["requests.Response"] = None, *, rate_limited: bool
+    ) -> None:
+        """Record when the next request may go out.
+
+        When the provider publishes its budget (the ``x-ratelimit-*`` family),
+        pace from it directly: spreading the remaining allowance over the window
+        it resets in keeps the loop UNDER the limit instead of discovering the
+        limit by being rejected. Only headroom the server reports as tight
+        actually slows anything down.
+
+        Otherwise a successful call decays the spacing, so the loop speeds back
+        up as the provider lets it — driven by real successes rather than
+        wall-clock optimism."""
+        paced = None if rate_limited else _budget_interval(response)
+        if paced is not None:
+            self._min_interval = min(paced, self._THROTTLE_CEILING_SECONDS)
+        elif not rate_limited and self._min_interval > 0.0:
+            self._min_interval *= self._THROTTLE_DECAY
+            if self._min_interval < self._THROTTLE_FLOOR_SECONDS:
+                self._min_interval = 0.0
+        self._next_earliest = time.monotonic() + self._min_interval
+
     @staticmethod
     def _retry_delay(attempt: int, response: "requests.Response") -> float:
-        """Compute how long to sleep before retrying. Honors ``Retry-After``
-        (seconds or HTTP-date form) when the server provides one; otherwise
-        falls back to exponential backoff (2,4,8,...)."""
-        ra = response.headers.get("Retry-After")
-        # Guard against non-string values (e.g. Mock objects in tests).
-        # Real ``requests.Response`` only ever returns ``str | None`` here.
-        if isinstance(ra, str) and ra:
-            try:
-                return min(float(ra), ChatCompletionClient._RETRY_WAIT_CEILING_SECONDS)
-            except ValueError:
-                # HTTP-date form (rare on LLM endpoints) — parse it.
-                try:
-                    from email.utils import parsedate_to_datetime
+        """How long to sleep before retrying.
 
-                    target = parsedate_to_datetime(ra)
-                    secs = target.timestamp() - time.time()
-                    if secs > 0:
-                        return min(
-                            secs, ChatCompletionClient._RETRY_WAIT_CEILING_SECONDS
-                        )
-                except Exception:  # noqa: BLE001
-                    pass
+        Ask the server first: ``Retry-After`` (delta or HTTP-date), then the
+        ``x-ratelimit-reset`` family, which says when the budget refills and is
+        the honest answer when the endpoint sends no ``Retry-After``. Exponential
+        backoff (2, 4, 8, …) is the last resort, for a server that says nothing.
+
+        Always bounded by the per-wait ceiling — a server is allowed to be wrong
+        or hostile, and no single wait should pin a worker."""
+        told = _retry_after_seconds(response)
+        if told is None:
+            told = _reset_seconds(response)
+        if told is not None and told > 0:
+            return min(told, ChatCompletionClient._RETRY_WAIT_CEILING_SECONDS)
         return float(2**attempt)
 
     @staticmethod
@@ -397,7 +574,11 @@ class ChatCompletionClient:
         est_input_tokens: int = 0,
     ) -> ChatResult:
         body = json.dumps(payload)
-        for attempt in range(1, attempts + 1):
+        attempt = 0  # 5xx / transport failures, budget `attempts`
+        rate_limits = 0  # 429s, budget `_RATE_LIMIT_ATTEMPTS` — see below
+        while True:
+            attempt += 1
+            self._throttle_wait()
             try:
                 r = requests.post(
                     url,
@@ -406,14 +587,31 @@ class ChatCompletionClient:
                     timeout=300,
                     stream=self.stream,
                 )
-                # 429 (rate limit) and 5xx are retryable. 429 in particular
-                # gets hit during agentic tool loops on providers with
-                # bursty-traffic dynamic limits (e.g. Together.ai via HF
-                # Router, where a few quick tool turns can exceed a 1 RPM
-                # cap). Honor Retry-After when the server provides it.
-                if (
-                    r.status_code == 429 or r.status_code >= 500
-                ) and attempt < attempts:
+                # 429 (rate limit) gets hit during agentic tool loops on
+                # providers with bursty dynamic limits (e.g. Together.ai via HF
+                # Router, where a few quick tool turns can exceed a 1 RPM cap).
+                # It spends its own budget, NOT the error budget: a rate limit
+                # is a "come back later", so waiting it out is the correct
+                # response, and a persistent 5xx must still fail fast.
+                if r.status_code == 429 and rate_limits < self._RATE_LIMIT_ATTEMPTS:
+                    rate_limits += 1
+                    attempt -= 1
+                    # Widen the spacing for the calls that FOLLOW, but let the
+                    # explicit delay below govern this retry — pacing on top of
+                    # Retry-After would just wait twice for the same rejection.
+                    self._note_rate_limited(r)
+                    delay = self._retry_delay(rate_limits, r)
+                    log.warning(
+                        "LLM call rate-limited (429) %d/%d; retrying in %.1fs, "
+                        "then pacing calls %.1fs apart",
+                        rate_limits,
+                        self._RATE_LIMIT_ATTEMPTS,
+                        delay,
+                        self._min_interval,
+                    )
+                    time.sleep(delay)
+                    continue
+                if r.status_code >= 500 and attempt < attempts:
                     delay = self._retry_delay(attempt, r)
                     log.warning(
                         "LLM call attempt %d/%d returned %d; retrying in %.1fs",
@@ -424,6 +622,8 @@ class ChatCompletionClient:
                     )
                     time.sleep(delay)
                     continue
+                # Pace from this response's own budget headers when it has them.
+                self._note_request_done(r, rate_limited=False)
                 if not r.ok:
                     # Surface the upstream error body so the action log
                     # explains *why* the request was rejected (e.g. "tools
@@ -510,7 +710,8 @@ class ChatCompletionClient:
                                 "chunk_callback raised; suppressing", exc_info=True
                             )
             except retryable as exc:
-                if attempt == attempts:
+                self._note_request_done(rate_limited=False)
+                if attempt >= attempts:
                     log.error(
                         "LLM call attempt %d/%d failed during %s: %s; giving up",
                         attempt,

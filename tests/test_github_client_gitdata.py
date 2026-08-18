@@ -128,6 +128,33 @@ class GitDataMethodsTests(unittest.TestCase):
         with self.assertRaises(requests.HTTPError):
             self.gh.create_blob("o", "r", b"x")
 
+    def test_request_reviewers(self):
+        self.gh.session.post.return_value = _resp(payload={"number": 7})
+        got = self.gh.request_reviewers("o", "r", 7, ["octocat"])
+        self.assertEqual(got, ["octocat"])
+        url = self.gh.session.post.call_args[0][0]
+        self.assertTrue(url.endswith("/pulls/7/requested_reviewers"))
+        self.assertEqual(
+            self.gh.session.post.call_args.kwargs["json"], {"reviewers": ["octocat"]}
+        )
+
+    def test_request_reviewers_swallows_a_rejection(self):
+        # GitHub 422s the whole call when a login is not a collaborator (or is
+        # the PR's own author). The PR is already published by then, so this
+        # must never raise — it is a courtesy, not part of publishing.
+        self.gh.session.post.return_value = _resp(ok=False, status=422)
+        self.assertEqual(self.gh.request_reviewers("o", "r", 7, ["ghost"]), [])
+
+    def test_request_reviewers_swallows_a_transport_error(self):
+        import requests
+
+        self.gh.session.post.side_effect = requests.ConnectionError("nope")
+        self.assertEqual(self.gh.request_reviewers("o", "r", 7, ["octocat"]), [])
+
+    def test_request_reviewers_skips_the_call_when_empty(self):
+        self.assertEqual(self.gh.request_reviewers("o", "r", 7, []), [])
+        self.gh.session.post.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
