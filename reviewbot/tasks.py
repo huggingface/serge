@@ -97,6 +97,29 @@ class TaskError(Exception):
         self.status_code = status_code
 
 
+class NormalizeGateBroken(TaskError):
+    """The repo normalizer fails on the *pristine* checkout, before any patch
+    is applied — the gate is broken, so no patch can ever pass it.
+
+    Raised instead of feeding the failure back to the model, because the model
+    cannot fix it: every correction is rejected by the same environment error
+    and the task ends with a misleading "the patch does not pass the
+    normalizer" after burning the whole correction budget. Observed 2026-08-17
+    (transformers#48037): transformers' `main` moved its `tokenizers` pin to
+    >=0.23.1 while the task-runner image still had 0.22.2, and the gate's
+    `uv pip install -e . --no-deps` cannot upgrade a dependency, so every
+    checker that imports transformers died on the version guard. Three groups
+    reported "no fix" and ~3.5M input tokens were spent on an error no patch
+    could address.
+
+    Deliberately NOT status 422: 422 means "this candidate's patch does not
+    apply", which makes the runner move on to the next candidate group. A
+    broken gate breaks every group, so the task must fail loudly instead."""
+
+    def __init__(self, message: str):
+        super().__init__(message, status_code=500)
+
+
 @dataclass
 class TaskRequest:
     owner: str
@@ -389,6 +412,62 @@ def _run_repo_normalizer(
         return None, ""
 
 
+def _check_normalizer_baseline(
+    cfg: Config,
+    *,
+    checkout: Checkout,
+    clone_cache: CloneCache,
+    emit: Callable[[str, str], None],
+    state: dict,
+) -> None:
+    """Tell a bad patch apart from a broken gate, after a normalizer failure.
+
+    Resets the worktree to the pristine checkout and runs the normalizer on it.
+    A clean exit means the gate works and the patch really is at fault, so this
+    returns and the caller feeds the failure back to the model. A non-zero exit
+    means the normalizer rejects the *unpatched* base too — no patch can pass —
+    so this raises :class:`NormalizeGateBroken`.
+
+    Runs at most once per task: the answer is cached in ``state`` and replayed,
+    because the normalizer is the expensive step (transformers' takes minutes).
+    Only ever called on the failure path, so a healthy task pays nothing.
+
+    Leaves the worktree pristine either way — the normalizer's fixers rewrite
+    files, and a base that is not itself normalizer-clean legitimately produces
+    changes here, which is why the *exit code* is the signal and not the diff.
+    """
+    if state.get("checked"):
+        broken = state.get("broken")
+        if broken:
+            raise NormalizeGateBroken(broken)
+        return
+    state["checked"] = True
+
+    emit(
+        "log",
+        "Normalizer rejected the patch; re-running it on the unpatched "
+        "checkout to tell a bad patch from a broken gate…",
+    )
+    clone_cache.reset_worktree(checkout)
+    returncode, output = _run_repo_normalizer(cfg, checkout, emit)
+    clone_cache.reset_worktree(checkout)
+    if returncode in (None, 0):
+        return
+
+    cmd = " ".join(cfg.task_normalize_command or [])
+    message = (
+        f"The repository's normalizer (`{cmd}`) fails on the unpatched "
+        f"checkout (exit {returncode}), so no patch can pass it — this is a "
+        "broken gate, not a bad patch, and it needs an operator. Common cause: "
+        "the task-runner image has drifted from the target repo's `main` (a "
+        "dependency pin moved, and the gate's editable install runs with "
+        f"`--no-deps`).\n\n{_bounded_normalize_feedback(output)}"
+    )
+    state["broken"] = message
+    emit("normalize_error", f"Normalizer fails on the pristine checkout:\n{output}")
+    raise NormalizeGateBroken(message)
+
+
 def _validate_patch(
     cfg: Config,
     *,
@@ -396,6 +475,7 @@ def _validate_patch(
     clone_cache: CloneCache,
     content: Optional[str],
     emit: Callable[[str, str], None],
+    baseline_state: Optional[dict] = None,
 ) -> tuple[Optional[str], bool]:
     """Validate the model's final answer by applying its patch to a clean
     worktree and running the repo normalizer.
@@ -452,6 +532,15 @@ def _validate_patch(
         emit(
             "normalize_error",
             f"Normalizer failed (exit {returncode}) for `{cmd}`:\n{output}",
+        )
+        # Before spending a correction on it, make sure the patch is actually
+        # what the normalizer is unhappy about (raises when it is not).
+        _check_normalizer_baseline(
+            cfg,
+            checkout=checkout,
+            clone_cache=clone_cache,
+            emit=emit,
+            state=baseline_state if baseline_state is not None else {},
         )
         msg = (
             f"Your patch applied cleanly, but the repository's normalizer "
@@ -561,6 +650,9 @@ def prepare_task(
     # closure records whether the accepted answer left the worktree prepared.
     normalize_configured = bool(cfg.task_normalize_command)
     outcome = {"prepared": False}
+    # Shared across corrections so the pristine-checkout baseline (which costs a
+    # full normalizer run) is paid at most once per task.
+    baseline_state: dict = {}
 
     def _validate(chat) -> Optional[str]:
         feedback, prepared = _validate_patch(
@@ -569,6 +661,7 @@ def prepare_task(
             clone_cache=clone_cache,
             content=chat.content,
             emit=_emit,
+            baseline_state=baseline_state,
         )
         outcome["prepared"] = prepared
         return feedback
@@ -1115,6 +1208,16 @@ def publish_task(
                 _emit(
                     "normalize_error",
                     f"Normalizer failed (exit {returncode}) for `{cmd}`:\n{output}",
+                )
+                # Same distinction as the in-loop gate: if the normalizer also
+                # rejects the pristine checkout this is an operator problem,
+                # and reporting it as "the budget was exhausted" hides that.
+                _check_normalizer_baseline(
+                    cfg,
+                    checkout=checkout,
+                    clone_cache=clone_cache,
+                    emit=_emit,
+                    state={},
                 )
                 _emit("log", "Normalizer rejected the patch; not opening a PR.")
                 return TaskResult(

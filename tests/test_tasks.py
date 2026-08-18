@@ -13,6 +13,7 @@ from reviewbot.clone_cache import Checkout, CloneCache
 from reviewbot.config import Config
 from reviewbot.github_client import SERGE_GIT_EMAIL
 from reviewbot.tasks import (
+    NormalizeGateBroken,
     TaskError,
     TaskPlan,
     TaskRequest,
@@ -41,6 +42,17 @@ def _git(cwd, *args):
             "GIT_COMMITTER_EMAIL": "t@example.com",
         },
     )
+
+
+# Normalize commands for the gate tests. The distinction matters: a normalizer
+# that fails only once the patch is in the tree is rejecting the PATCH (feed it
+# back to the model), while one that fails on the pristine checkout is a BROKEN
+# GATE (no patch can pass; raise NormalizeGateBroken). Both test suites' _PATCH
+# rewrites hello.txt to "hi patched", so grepping for it tells them apart.
+_REJECTS_THE_PATCH = (
+    'grep -q "hi patched" hello.txt && { echo boom >&2; exit 3; }; exit 0'
+)
+_REJECTS_EVERYTHING = "echo boom >&2; exit 3"
 
 
 def _make_cfg(**overrides) -> Config:
@@ -736,9 +748,12 @@ class PublishFallbackNormalizeTests(unittest.TestCase):
 
     def test_fallback_refuses_when_normalizer_rejects(self):
         # Normalizer exits non-zero on the raw patch -> no PR, worktree reset.
+        # It must reject the PATCH specifically: one that fails on the pristine
+        # checkout too is a broken gate, which raises instead (see
+        # NormalizeBaselineTests).
         co = self._checkout()
         cfg = self._cfg(
-            task_normalize_command=["sh", "-c", "echo boom >&2; exit 3"],
+            task_normalize_command=["sh", "-c", _REJECTS_THE_PATCH],
             task_normalize_timeout=30,
         )
         plan = TaskPlan(title="Fix hello", body="desc", patch=self._PATCH)
@@ -757,6 +772,30 @@ class PublishFallbackNormalizeTests(unittest.TestCase):
         self.assertIn("normalizer", result.message.lower())
         self.assertIn("exit 3", result.message)
         # Worktree restored to the pristine checkout.
+        self.assertEqual(self.cache.collect_changes(co), [])
+
+    def test_fallback_raises_when_the_gate_itself_is_broken(self):
+        # The raw-apply fallback makes the same distinction: a normalizer that
+        # rejects the pristine checkout too is an operator problem, and
+        # reporting it as "the correction budget was exhausted" would hide it.
+        co = self._checkout()
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", _REJECTS_EVERYTHING],
+            task_normalize_timeout=30,
+        )
+        plan = TaskPlan(title="Fix hello", body="desc", patch=self._PATCH)
+        gh = _FakeGH()
+        with self.assertRaises(NormalizeGateBroken):
+            publish_task(
+                cfg,
+                gh,
+                self._req(),
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+        self.assertIsNone(gh.created_pr)
         self.assertEqual(self.cache.collect_changes(co), [])
 
     def test_no_normalizer_configured_commits_raw_patch(self):
@@ -853,10 +892,10 @@ class ValidatePatchTests(unittest.TestCase):
         self.assertEqual(changed, ["extra.txt", "hello.txt"])
 
     def test_normalizer_failure_feeds_back_and_resets(self):
-        # Non-zero normalizer exit -> feedback to the model, worktree reset
-        # clean (so the next attempt starts pristine).
+        # Non-zero normalizer exit ON THE PATCH -> feedback to the model,
+        # worktree reset clean (so the next attempt starts pristine).
         cfg = self._cfg(
-            task_normalize_command=["sh", "-c", "echo boom >&2; exit 3"],
+            task_normalize_command=["sh", "-c", _REJECTS_THE_PATCH],
             task_normalize_timeout=30,
         )
         events = []
@@ -885,13 +924,99 @@ class ValidatePatchTests(unittest.TestCase):
 
     def test_operator_guidance_is_appended_to_feedback(self):
         cfg = self._cfg(
-            task_normalize_command=["sh", "-c", "echo boom >&2; exit 3"],
+            task_normalize_command=["sh", "-c", _REJECTS_THE_PATCH],
             task_normalize_timeout=30,
             task_normalize_guidance="HOUSE RULE: never add new dependencies.",
         )
         feedback, prepared = self._validate(cfg, self._content(self._PATCH))
         self.assertFalse(prepared)
         self.assertIn("HOUSE RULE: never add new dependencies.", feedback)
+
+    def test_broken_gate_raises_instead_of_blaming_the_patch(self):
+        # The prod shape (transformers#48037): the normalizer fails for a reason
+        # that has nothing to do with the patch — a stale dependency in the
+        # runner image — so it fails on the pristine checkout too. Feeding that
+        # back would burn the whole correction budget and then report "the patch
+        # does not pass the normalizer", so it must raise instead.
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", _REJECTS_EVERYTHING],
+            task_normalize_timeout=30,
+        )
+        events = []
+        with self.assertRaises(NormalizeGateBroken) as caught:
+            _validate_patch(
+                cfg,
+                checkout=self.co,
+                clone_cache=self.cache,
+                content=self._content(self._PATCH),
+                emit=lambda kind, text: events.append((kind, text)),
+            )
+        message = str(caught.exception)
+        self.assertIn("unpatched checkout", message)
+        self.assertIn("boom", message)
+        # Not 422: that would make the runner skip to the next candidate group,
+        # but a broken gate fails every group.
+        self.assertEqual(caught.exception.status_code, 500)
+        self.assertTrue(
+            any(
+                kind == "normalize_error" and "pristine checkout" in text
+                for kind, text in events
+            )
+        )
+        # Worktree still pristine for whatever runs next.
+        self.assertEqual(self.cache.collect_changes(self.co), [])
+
+    def test_baseline_runs_once_per_task(self):
+        # The baseline costs a full normalizer run, so the answer is cached
+        # across corrections rather than re-run for each one.
+        marker = os.path.join(self._tmp.name, "runs")
+        cfg = self._cfg(
+            task_normalize_command=[
+                "sh",
+                "-c",
+                f'echo x >> "{marker}"; echo boom >&2; exit 3',
+            ],
+            task_normalize_timeout=30,
+        )
+        state: dict = {}
+
+        def _run():
+            return _validate_patch(
+                cfg,
+                checkout=self.co,
+                clone_cache=self.cache,
+                content=self._content(self._PATCH),
+                emit=lambda *a: None,
+                baseline_state=state,
+            )
+
+        with self.assertRaises(NormalizeGateBroken):
+            _run()
+        with open(marker) as f:
+            after_first = len(f.read().split())
+        # Patch run + baseline run.
+        self.assertEqual(after_first, 2)
+
+        # A second correction attempt replays the cached verdict: it still
+        # raises, but without paying for another baseline run.
+        with self.assertRaises(NormalizeGateBroken):
+            _run()
+        with open(marker) as f:
+            after_second = len(f.read().split())
+        self.assertEqual(after_second, 3)
+
+    def test_healthy_gate_pays_nothing_on_the_happy_path(self):
+        # A clean normalizer never triggers the baseline check at all.
+        marker = os.path.join(self._tmp.name, "runs")
+        cfg = self._cfg(
+            task_normalize_command=["sh", "-c", f'echo x >> "{marker}"; exit 0'],
+            task_normalize_timeout=30,
+        )
+        feedback, prepared = self._validate(cfg, self._content(self._PATCH))
+        self.assertIsNone(feedback)
+        self.assertTrue(prepared)
+        with open(marker) as f:
+            self.assertEqual(len(f.read().split()), 1)
 
     def test_unapplyable_patch_feeds_back(self):
         cfg = self._cfg(
