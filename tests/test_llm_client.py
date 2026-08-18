@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -242,7 +243,194 @@ class ChatCompletionClientTests(unittest.TestCase):
         self.assertEqual(result.content, "ok")
         self.assertEqual(mock_post.call_count, 2)
         # Honored the Retry-After: 1 header, capped to the per-wait ceiling.
+        # Only ONE sleep: the pacing this 429 arms governs the calls that
+        # FOLLOW, not the retry the server just told us when to make.
         mock_sleep.assert_called_once_with(1.0)
+
+    def _rate_limited(self, retry_after="1"):
+        return Mock(
+            status_code=429,
+            ok=False,
+            reason="Too Many Requests",
+            text="rate limit",
+            headers={"Retry-After": retry_after},
+        )
+
+    def _ok(self, content="ok"):
+        return Mock(
+            status_code=200,
+            json=Mock(return_value={"choices": [{"message": {"content": content}}]}),
+            raise_for_status=Mock(),
+        )
+
+    def test_rate_limits_do_not_spend_the_error_budget(self) -> None:
+        # The old loop gave 429 the same 3 attempts as a 5xx, so a burst ended
+        # the task — `deepseek_vl` lost 1.13M input tokens of finished work to
+        # one rate limit (transformers#48050). A 429 clears by waiting, so it
+        # gets its own, larger budget.
+        responses = [self._rate_limited() for _ in range(5)] + [self._ok()]
+        with (
+            patch("reviewbot.llm_client.time.sleep"),
+            patch(
+                "reviewbot.llm_client.requests.post", side_effect=responses
+            ) as mock_post,
+        ):
+            client = ChatCompletionClient("https://example.com/v1", "t", "m")
+            result = client.complete([{"role": "user", "content": "hi"}])
+        self.assertEqual(result.content, "ok")
+        self.assertEqual(mock_post.call_count, 6)
+
+    def test_a_persistent_rate_limit_still_gives_up(self) -> None:
+        responses = [
+            self._rate_limited()
+            for _ in range(ChatCompletionClient._RATE_LIMIT_ATTEMPTS + 1)
+        ]
+        with (
+            patch("reviewbot.llm_client.time.sleep"),
+            patch(
+                "reviewbot.llm_client.requests.post", side_effect=responses
+            ) as mock_post,
+        ):
+            client = ChatCompletionClient("https://example.com/v1", "t", "m")
+            with self.assertRaises(LLMResponseError) as caught:
+                client.complete([{"role": "user", "content": "hi"}])
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual(
+            mock_post.call_count, ChatCompletionClient._RATE_LIMIT_ATTEMPTS + 1
+        )
+
+    def test_server_errors_keep_their_small_budget(self) -> None:
+        # A 5xx may never clear, so it must still fail fast — the bigger budget
+        # is for rate limits only.
+        error = Mock(
+            status_code=503,
+            ok=False,
+            reason="Service Unavailable",
+            text="down",
+            headers={},
+        )
+        with (
+            patch("reviewbot.llm_client.time.sleep"),
+            patch(
+                "reviewbot.llm_client.requests.post", side_effect=[error] * 4
+            ) as mock_post,
+        ):
+            client = ChatCompletionClient("https://example.com/v1", "t", "m")
+            with self.assertRaises(LLMResponseError):
+                client.complete([{"role": "user", "content": "hi"}])
+        self.assertEqual(mock_post.call_count, 3)
+
+    def test_a_429_paces_the_following_calls(self) -> None:
+        # Retrying the rejected call is not enough: the loop is about to issue
+        # the same burst that tripped the limit, so the NEXT call waits too.
+        with (
+            patch("reviewbot.llm_client.time.sleep") as mock_sleep,
+            patch(
+                "reviewbot.llm_client.requests.post",
+                side_effect=[self._rate_limited(), self._ok(), self._ok("second")],
+            ),
+        ):
+            client = ChatCompletionClient("https://example.com/v1", "t", "m")
+            client.complete([{"role": "user", "content": "hi"}])
+            self.assertGreater(client._min_interval, 0)
+            mock_sleep.reset_mock()
+            result = client.complete([{"role": "user", "content": "again"}])
+        self.assertEqual(result.content, "second")
+        # The second call was paced rather than fired immediately.
+        self.assertTrue(mock_sleep.called)
+
+    def test_pacing_decays_back_to_full_speed(self) -> None:
+        # A server that says nothing: the doubling heuristic is the fallback.
+        silent = Mock(headers={})
+        client = ChatCompletionClient("https://example.com/v1", "t", "m")
+        client._note_rate_limited(silent)
+        self.assertEqual(client._min_interval, client._THROTTLE_FIRST_SECONDS)
+        # Consecutive rate limits widen it, bounded by the ceiling.
+        for _ in range(10):
+            client._note_rate_limited(silent)
+        self.assertEqual(client._min_interval, client._THROTTLE_CEILING_SECONDS)
+        # Successes decay it, and it drops to zero rather than limping forever.
+        for _ in range(20):
+            client._note_request_done(rate_limited=False)
+        self.assertEqual(client._min_interval, 0.0)
+
+    def test_pacing_uses_what_the_server_said_not_a_guess(self) -> None:
+        # Retry-After is the server telling us when to come back; it beats any
+        # interval we could invent, so it sets the pacing directly.
+        client = ChatCompletionClient("https://example.com/v1", "t", "m")
+        client._note_rate_limited(Mock(headers={"Retry-After": "9"}))
+        self.assertEqual(client._min_interval, 9.0)
+
+    def test_pacing_falls_back_to_the_reset_header(self) -> None:
+        # No Retry-After, but the endpoint publishes when the budget refills.
+        client = ChatCompletionClient("https://example.com/v1", "t", "m")
+        client._note_rate_limited(Mock(headers={"x-ratelimit-reset-requests": "6m0s"}))
+        # Bounded by the ceiling — a server may be wrong or hostile.
+        self.assertEqual(client._min_interval, client._THROTTLE_CEILING_SECONDS)
+
+    def test_retry_delay_prefers_the_server_over_backoff(self) -> None:
+        delay = ChatCompletionClient._retry_delay(1, Mock(headers={"Retry-After": "7"}))
+        self.assertEqual(delay, 7.0)
+        # Then the reset family, then exponential backoff as a last resort.
+        delay = ChatCompletionClient._retry_delay(
+            1, Mock(headers={"x-ratelimit-reset": "12"})
+        )
+        self.assertEqual(delay, 12.0)
+        self.assertEqual(ChatCompletionClient._retry_delay(3, Mock(headers={})), 8.0)
+
+    def test_reset_header_formats(self) -> None:
+        from reviewbot import llm_client as mod
+
+        self.assertEqual(mod._parse_duration("20"), 20.0)
+        self.assertEqual(mod._parse_duration("300ms"), 0.3)
+        self.assertEqual(mod._parse_duration("6m0s"), 360.0)
+        self.assertEqual(mod._parse_duration("1h30m"), 5400.0)
+        self.assertIsNone(mod._parse_duration("soon"))
+        self.assertIsNone(mod._parse_duration(""))
+        # An absolute epoch is a deadline, not a 1.7-billion-second wait.
+        self.assertLess(mod._parse_duration(str(int(time.time()) + 30)), 31)
+
+    def test_low_headroom_paces_before_being_rejected(self) -> None:
+        # The whole point of throttling: stay UNDER the limit rather than
+        # discovering it by being refused. 4 requests left in a 20s window ->
+        # ~5s apart.
+        client = ChatCompletionClient("https://example.com/v1", "t", "m")
+        client._note_request_done(
+            Mock(
+                headers={
+                    "x-ratelimit-remaining-requests": "4",
+                    "x-ratelimit-reset-requests": "20",
+                }
+            ),
+            rate_limited=False,
+        )
+        self.assertEqual(client._min_interval, 5.0)
+
+    def test_plenty_of_headroom_is_not_paced(self) -> None:
+        client = ChatCompletionClient("https://example.com/v1", "t", "m")
+        client._note_request_done(
+            Mock(
+                headers={
+                    "x-ratelimit-remaining-requests": "900",
+                    "x-ratelimit-reset-requests": "60",
+                }
+            ),
+            rate_limited=False,
+        )
+        self.assertEqual(client._min_interval, 0.0)
+
+    def test_an_endpoint_that_never_rate_limits_is_never_paced(self) -> None:
+        with (
+            patch("reviewbot.llm_client.time.sleep") as mock_sleep,
+            patch(
+                "reviewbot.llm_client.requests.post",
+                side_effect=[self._ok(), self._ok()],
+            ),
+        ):
+            client = ChatCompletionClient("https://example.com/v1", "t", "m")
+            client.complete([{"role": "user", "content": "hi"}])
+            client.complete([{"role": "user", "content": "hi again"}])
+        mock_sleep.assert_not_called()
 
     def test_complete_raises_llmresponseerror_with_status_and_body_after_4xx(
         self,
