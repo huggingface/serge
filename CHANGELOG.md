@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/v1/models` is called with the `anthropic-version` header it requires.
 - The trigger gate now ignores comments authored by a bot, so the App never
   reacts to its own output (no self-trigger loops in App mode).
+- `grep` no longer under-reports silently. It ran `git grep --max-count=10`, a
+  cap that applies *per file* and left no trace in the output, so a
+  single-file search returned ten matches that looked like the complete set —
+  a rules file with 57 `description` lines came back as ten. The per-file cap
+  is now derived from `max_results` (one above it, so a partial answer is
+  distinguishable from a complete one), the output is streamed and stopped at
+  the cap instead of captured whole and sliced, and a truncated result ends
+  with an explicit note telling the model not to treat the count as final. The
+  note used to be passed to the 8000-char truncator as a suffix, which dropped
+  it whenever the output was under 8000 chars — i.e. on exactly the results
+  that looked trustworthy. A single match line is also clipped at 300
+  characters so one minified line cannot spend the whole output budget.
 
 ## [0.1.0] - 2026-06-17
 

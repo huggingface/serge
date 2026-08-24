@@ -45,6 +45,18 @@ MAX_TOOL_OUTPUT_CHARS = 8000
 # even if the model asks for more.
 MAX_READ_LINES = 400
 
+# Grep bounds. ``max_results`` is the model-facing cap; this is the ceiling
+# it may ask for. A single match line is clipped too: one minified bundle or
+# generated fixture line must not spend the whole output budget by itself.
+MAX_GREP_RESULTS = 200
+DEFAULT_GREP_RESULTS = 50
+MAX_MATCH_LINE_CHARS = 300
+GREP_TIMEOUT_SECONDS = 20
+# Room reserved inside MAX_TOOL_OUTPUT_CHARS for the header and the
+# "there are more matches" note, so the note can never be the thing that
+# gets cut off.
+GREP_NOTE_RESERVE_CHARS = 400
+
 # Directories we never expose to the model. ``.git`` would let it read
 # refs / object data; the rest are caches that bloat output without
 # adding signal.
@@ -242,7 +254,11 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "description": (
                 "Search for a regex pattern across the checked-out PR head "
                 "using git grep. Returns matches as `path:line:text`. Use this "
-                "to find call sites, definitions, or references not visible in the diff."
+                "to find call sites, definitions, or references not visible in "
+                "the diff. At most `max_results` matches come back, and when "
+                "more exist the result says so on its last line — a result "
+                "without that note is the complete set of matches, so you can "
+                "count them and rely on the count."
             ),
             "parameters": {
                 "type": "object",
@@ -258,7 +274,12 @@ TOOL_SPECS: list[dict[str, Any]] = [
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Cap on returned matches. Defaults to 50, hard max 200.",
+                        "description": (
+                            f"Cap on returned matches. Defaults to "
+                            f"{DEFAULT_GREP_RESULTS}, hard max {MAX_GREP_RESULTS}. "
+                            f"Raise it when you need to count every match rather "
+                            f"than find one."
+                        ),
                     },
                 },
                 "required": ["pattern"],
@@ -683,6 +704,93 @@ def _list_dir(env: ToolEnv, args: dict[str, Any]) -> str:
 _SAFE_PATTERN_RE = re.compile(r"^[\x20-\x7E]+$")
 
 
+@dataclass
+class _GrepResult:
+    lines: list[str]
+    # True when we stopped early: there is at least one match we did not
+    # return. Observed, never guessed.
+    more: bool = False
+    timed_out: bool = False
+    returncode: int | None = None
+    stderr: str = ""
+
+
+def _clip_match_line(line: str) -> str:
+    if len(line) <= MAX_MATCH_LINE_CHARS:
+        return line
+    return f"{line[:MAX_MATCH_LINE_CHARS]} [... line clipped ...]"
+
+
+def _stream_grep(cmd: list[str], max_lines: int, char_budget: int) -> _GrepResult:
+    """Run ``cmd``, reading its output until one of the caps is reached.
+
+    Streamed rather than captured whole: a pattern that matches half of a
+    monorepo would otherwise land in memory in full, only to be sliced down
+    to fifty lines. Stopping at the cap also means ``more`` is something we
+    saw (the line after the last one we kept exists) instead of something we
+    inferred, which is what lets the caller tell the model the truth.
+    """
+    timed_out = threading.Event()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise _ToolError("git is not installed in the runner") from exc
+
+    def _on_timeout() -> None:
+        timed_out.set()
+        proc.kill()
+
+    timer = threading.Timer(GREP_TIMEOUT_SECONDS, _on_timeout)
+    timer.start()
+    lines: list[str] = []
+    used = 0
+    more = False
+    try:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            if len(lines) >= max_lines:
+                more = True
+                break
+            line = _clip_match_line(raw.rstrip("\n"))
+            if used + len(line) + 1 > char_budget and lines:
+                more = True
+                break
+            lines.append(line)
+            used += len(line) + 1
+        stderr = ""
+        if proc.stderr is not None:
+            try:
+                stderr = proc.stderr.read(1000)
+            except OSError:
+                stderr = ""
+        if more:
+            # We are done reading but git is still producing matches; it
+            # would otherwise block on a full pipe until the timer fires.
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    finally:
+        timer.cancel()
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+    return _GrepResult(
+        lines=lines,
+        more=more,
+        timed_out=timed_out.is_set(),
+        returncode=proc.returncode,
+        stderr=stderr.strip(),
+    )
+
+
 def _grep(env: ToolEnv, args: dict[str, Any]) -> str:
     pattern = args.get("pattern")
     if not isinstance(pattern, str) or not pattern:
@@ -694,8 +802,8 @@ def _grep(env: ToolEnv, args: dict[str, Any]) -> str:
     path_arg = args.get("path")
     pathspec = _resolve_path(env, path_arg, default=".") if path_arg else env.repo_root
     rel_pathspec = os.path.relpath(pathspec, env.repo_root) or "."
-    max_results = int(args.get("max_results") or 50)
-    max_results = max(1, min(max_results, 200))
+    max_results = int(args.get("max_results") or DEFAULT_GREP_RESULTS)
+    max_results = max(1, min(max_results, MAX_GREP_RESULTS))
     cmd = [
         "git",
         "-C",
@@ -704,35 +812,39 @@ def _grep(env: ToolEnv, args: dict[str, Any]) -> str:
         "-n",
         "-I",
         "-E",
-        "--max-count=10",
+        # Per-file backstop, not the real cap: it keeps one pathological
+        # file from filling the whole result set. Deliberately one *above*
+        # max_results, so a file that genuinely holds more matches than was
+        # asked for still emits the extra line that proves there are more.
+        # A cap at or below max_results would make a partial answer
+        # indistinguishable from a complete one.
+        f"--max-count={max_results + 1}",
         "--",
         pattern,
     ]
     if path_arg:
         cmd.append(rel_pathspec)
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise _ToolError("grep timed out (20s)") from exc
-    except FileNotFoundError as exc:
-        raise _ToolError("git is not installed in the runner") from exc
-    if proc.returncode == 1 and not proc.stdout:
-        return f"no matches for {pattern!r} in {rel_pathspec}"
-    if proc.returncode > 1:
-        return f"error: git grep exited {proc.returncode}: {proc.stderr.strip()[:300]}"
-    lines = proc.stdout.splitlines()
-    truncated = len(lines) > max_results
-    lines = lines[:max_results]
-    body = "\n".join(lines) if lines else "(no output)"
-    suffix = f"showing {len(lines)} of {len(lines)}+ matches" if truncated else ""
+
     header = f"git grep -E {pattern!r} -- {rel_pathspec}:"
-    return _truncate(f"{header}\n{body}", suffix_note=suffix)
+    char_budget = MAX_TOOL_OUTPUT_CHARS - len(header) - GREP_NOTE_RESERVE_CHARS
+    result = _stream_grep(cmd, max_results, max(1, char_budget))
+    if result.timed_out:
+        raise _ToolError(f"grep timed out ({GREP_TIMEOUT_SECONDS}s)")
+    if not result.lines:
+        if result.returncode is not None and result.returncode > 1:
+            return f"error: git grep exited {result.returncode}: {result.stderr[:300]}"
+        return f"no matches for {pattern!r} in {rel_pathspec}"
+    body = "\n".join(result.lines)
+    if not result.more:
+        return f"{header}\n{body}"
+    note = (
+        f"[serge] Showing the first {len(result.lines)} matches; there are "
+        f"more that are not listed. This is NOT the complete set — do not "
+        f"count these and conclude that is all there is. Narrow the pattern "
+        f"or the path, or re-call with a higher max_results "
+        f"(hard max {MAX_GREP_RESULTS})."
+    )
+    return f"{header}\n{body}\n{note}"
 
 
 def _fetch_url(args: dict[str, Any]) -> str:
