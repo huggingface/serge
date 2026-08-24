@@ -21,6 +21,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/v1/models` is called with the `anthropic-version` header it requires.
 - The trigger gate now ignores comments authored by a bot, so the App never
   reacts to its own output (no self-trigger loops in App mode).
+- `grep` no longer under-reports silently. It ran `git grep --max-count=10`, a
+  cap that applies *per file* and left no trace in the output, so a
+  single-file search returned ten matches that looked like the complete set —
+  a rules file with 57 `description` lines came back as ten. The per-file cap
+  is now derived from `max_results` (one above it, so a partial answer is
+  distinguishable from a complete one), the output is streamed and stopped at
+  the cap instead of captured whole and sliced, and a truncated result ends
+  with an explicit note telling the model not to treat the count as final. The
+  note used to be passed to the 8000-char truncator as a suffix, which dropped
+  it whenever the output was under 8000 chars — i.e. on exactly the results
+  that looked trustworthy. A single match line is also clipped at 300
+  characters so one minified line cannot spend the whole output budget.
+- `grep` runs Perl-compatible patterns where git supports PCRE2, falling back
+  to POSIX ERE otherwise. Under `-E` a pattern like `TRF\d+` or
+  `\bViolation\b` matched nothing and returned `no matches`, which reads as
+  "not in this repo" — worse than a truncated answer, because it invents an
+  absence. The result header now names the flag actually used, and a no-match
+  answer under ERE says so when the pattern needed a feature ERE lacks.
+- `grep` searches untracked files too, so a file created by an applied patch
+  is visible to the search that follows it (`/tasks` greps after patching).
+  Gitignored paths stay excluded, and matches under a denylisted directory
+  (`node_modules`, `.venv`, …) are dropped rather than handed to a model that
+  `read_file` would then refuse.
 
 ## [0.1.0] - 2026-06-17
 

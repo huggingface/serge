@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -12,6 +13,7 @@ from reviewbot.tools import (
     ALLOWED_FETCH_HOSTS,
     DENY_DIR_NAMES,
     MAX_FETCH_BODY_CHARS,
+    MAX_MATCH_LINE_CHARS,
     MAX_READ_LINES,
     MAX_TOOL_OUTPUT_CHARS,
     HelperInstallResult,
@@ -164,6 +166,137 @@ class ResolvePathTests(_TempRepo):
     def test_grep_rejects_non_ascii_pattern(self) -> None:
         out = run_tool(self.env, "grep", {"pattern": "héllo"})
         self.assertTrue(out.startswith("error:"), out)
+
+    @staticmethod
+    def _match_lines(out: str, name: str) -> int:
+        """Match lines only — the header echoes the pathspec too."""
+        return sum(1 for line in out.splitlines() if line.startswith(f"{name}:"))
+
+    def _write_tracked(self, name: str, body: str) -> None:
+        with open(os.path.join(self.repo_root, name), "w") as f:
+            f.write(body)
+        subprocess.run(["git", "add", name], cwd=self.repo_root, check=True)
+
+    def test_grep_returns_every_match_in_one_file_up_to_the_cap(self) -> None:
+        # The bug this covers: a per-file `git grep --max-count` well below
+        # max_results cut a single-file search down to a handful of matches
+        # and said nothing about it. A rules file with 57 `description =`
+        # lines came back looking like it had 10.
+        self._write_tracked(
+            "many.toml", "".join(f"description = {i}\n" for i in range(57))
+        )
+        out = run_tool(
+            self.env, "grep", {"pattern": "^description", "path": "many.toml"}
+        )
+        self.assertEqual(self._match_lines(out, "many.toml"), 50)
+        self.assertIn("not listed", out)
+
+    def test_grep_reports_all_matches_when_they_fit(self) -> None:
+        self._write_tracked(
+            "few.toml", "".join(f"description = {i}\n" for i in range(7))
+        )
+        out = run_tool(
+            self.env, "grep", {"pattern": "^description", "path": "few.toml"}
+        )
+        self.assertEqual(self._match_lines(out, "few.toml"), 7)
+        self.assertNotIn("not listed", out)
+
+    def test_grep_honours_raised_max_results_within_one_file(self) -> None:
+        self._write_tracked(
+            "many.toml", "".join(f"description = {i}\n" for i in range(57))
+        )
+        out = run_tool(
+            self.env,
+            "grep",
+            {"pattern": "^description", "path": "many.toml", "max_results": 200},
+        )
+        self.assertEqual(self._match_lines(out, "many.toml"), 57)
+        self.assertNotIn("not listed", out)
+
+    def test_grep_says_so_when_the_char_budget_stops_it(self) -> None:
+        # Truncation used to be handed to _truncate as a suffix_note, which
+        # only surfaced once the 8000-char cap tripped — so a result cut
+        # short by the match cap alone carried no note at all. Both limits
+        # must now announce themselves.
+        wide = "x" * 200
+        self._write_tracked(
+            "wide.txt", "".join(f"needle {wide} {i}\n" for i in range(120))
+        )
+        out = run_tool(
+            self.env,
+            "grep",
+            {"pattern": "needle", "path": "wide.txt", "max_results": 200},
+        )
+        self.assertLessEqual(len(out), MAX_TOOL_OUTPUT_CHARS)
+        self.assertIn("not listed", out)
+        self.assertLess(self._match_lines(out, "wide.txt"), 120)
+
+    def test_grep_clips_a_single_enormous_match_line(self) -> None:
+        self._write_tracked("minified.js", "var needle=" + "a" * 20000 + ";\n")
+        out = run_tool(self.env, "grep", {"pattern": "needle", "path": "minified.js"})
+        self.assertIn("line clipped", out)
+        self.assertLess(len(out), MAX_MATCH_LINE_CHARS + 1000)
+
+    def test_grep_supports_perl_classes(self) -> None:
+        # ERE answers `\d` with a confident "no matches", which reads as
+        # "the identifier is not in this repo".
+        self._write_tracked("ids.txt", "TRF058 = 1\nTRF012 = 2\n")
+        out = run_tool(self.env, "grep", {"pattern": r"TRF\d+", "path": "ids.txt"})
+        self.assertEqual(self._match_lines(out, "ids.txt"), 2)
+
+    def test_grep_finds_a_file_created_since_the_last_commit(self) -> None:
+        # /tasks applies a patch and then searches; a tracked-files-only grep
+        # cannot see a file the patch created.
+        with open(os.path.join(self.repo_root, "brand_new.py"), "w") as f:
+            f.write("def freshly_added():\n    pass\n")
+        out = run_tool(self.env, "grep", {"pattern": "freshly_added"})
+        self.assertIn("brand_new.py:1:", out)
+
+    def test_grep_skips_gitignored_files(self) -> None:
+        self._write_tracked(".gitignore", "build/\n")
+        os.makedirs(os.path.join(self.repo_root, "build"), exist_ok=True)
+        with open(os.path.join(self.repo_root, "build", "generated.py"), "w") as f:
+            f.write("GENERATED_MARKER = 1\n")
+        out = run_tool(self.env, "grep", {"pattern": "GENERATED_MARKER"})
+        self.assertIn("no matches", out)
+
+    def test_grep_hides_matches_under_denylisted_dirs(self) -> None:
+        # read_file refuses these paths, so returning them as matches would
+        # hand the model a lead it cannot follow.
+        os.makedirs(os.path.join(self.repo_root, "node_modules"), exist_ok=True)
+        with open(os.path.join(self.repo_root, "node_modules", "dep.js"), "w") as f:
+            f.write("var vendored_marker = 1;\n")
+        out = run_tool(self.env, "grep", {"pattern": "vendored_marker"})
+        self.assertIn("no matches", out)
+
+    def test_grep_falls_back_to_ere_and_explains_the_dialect(self) -> None:
+        self._write_tracked("ids.txt", "TRF058 = 1\n")
+        real_popen = subprocess.Popen
+
+        def fake_popen(cmd, *a, **kw):  # type: ignore[no-untyped-def]
+            if "-P" in cmd:
+                # What a git built without PCRE2 actually says.
+                cmd = [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stderr.write('fatal: cannot use "
+                    "Perl-compatible regexes when not compiled with "
+                    "USE_LIBPCRE\\n'); sys.exit(128)",
+                ]
+            return real_popen(cmd, *a, **kw)
+
+        with (
+            patch.object(tools_mod, "_git_grep_pcre", None),
+            patch.object(tools_mod.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            out = run_tool(self.env, "grep", {"pattern": r"TRF\d+", "path": "ids.txt"})
+        self.assertIn("no matches", out)
+        self.assertIn("POSIX ERE", out)
+        self.assertIn("[0-9]", out)
+
+    def test_grep_header_names_the_dialect(self) -> None:
+        out = run_tool(self.env, "grep", {"pattern": "def hello", "path": "src"})
+        self.assertIn("git grep -P", out)
 
     def test_unknown_tool_returns_error_message(self) -> None:
         out = run_tool(self.env, "delete_repo", {})
