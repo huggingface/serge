@@ -33,6 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it whenever the output was under 8000 chars — i.e. on exactly the results
   that looked trustworthy. A single match line is also clipped at 300
   characters so one minified line cannot spend the whole output budget.
+- `grep` runs Perl-compatible patterns where git supports PCRE2, falling back
+  to POSIX ERE otherwise. Under `-E` a pattern like `TRF\d+` or
+  `\bViolation\b` matched nothing and returned `no matches`, which reads as
+  "not in this repo" — worse than a truncated answer, because it invents an
+  absence. The result header now names the flag actually used, and a no-match
+  answer under ERE says so when the pattern needed a feature ERE lacks.
+- `grep` searches untracked files too, so a file created by an applied patch
+  is visible to the search that follows it (`/tasks` greps after patching).
+  Gitignored paths stay excluded, and matches under a denylisted directory
+  (`node_modules`, `.venv`, …) are dropped rather than handed to a model that
+  `read_file` would then refuse.
 
 ## [0.1.0] - 2026-06-17
 

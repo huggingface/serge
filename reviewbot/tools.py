@@ -57,6 +57,16 @@ GREP_TIMEOUT_SECONDS = 20
 # gets cut off.
 GREP_NOTE_RESERVE_CHARS = 400
 
+# Constructs a model reaches for out of PCRE habit and which POSIX ERE does
+# not have. Under -E they do not error: `TRF\d+` simply matches nothing, so
+# "no matches" reads as "not in the repo". Detected so the no-match answer
+# can say which it was.
+_PCRE_ONLY_RE = re.compile(r"\\[dDwWsSbBAZ]|\(\?")
+
+# Resolved once per process: whether this git is built with PCRE2. Probing
+# costs a process, so we let the first real -P call answer it instead.
+_git_grep_pcre: bool | None = None
+
 # Directories we never expose to the model. ``.git`` would let it read
 # refs / object data; the rest are caches that bloat output without
 # adding signal.
@@ -253,9 +263,13 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "name": "grep",
             "description": (
                 "Search for a regex pattern across the checked-out PR head "
-                "using git grep. Returns matches as `path:line:text`. Use this "
-                "to find call sites, definitions, or references not visible in "
-                "the diff. At most `max_results` matches come back, and when "
+                "using git grep, Perl-compatible (`\\d`, `\\b`, lookaround) "
+                "where git supports it. Returns matches as `path:line:text`. "
+                "Use this to find call sites, definitions, or references not "
+                "visible in the diff. The result header echoes the regex flag "
+                "actually used, and a no-match answer says so if the pattern "
+                "needed a feature the dialect lacks. "
+                "At most `max_results` matches come back, and when "
                 "more exist the result says so on its last line — a result "
                 "without that note is the complete set of matches, so you can "
                 "count them and rely on the count."
@@ -721,6 +735,22 @@ def _clip_match_line(line: str) -> str:
     return f"{line[:MAX_MATCH_LINE_CHARS]} [... line clipped ...]"
 
 
+def _is_denylisted_match(line: str) -> bool:
+    """True for a `path:line:text` match under a hidden directory.
+
+    ``--untracked`` widened grep past the tracked set, so grep can now reach
+    paths that ``read_file`` would refuse to open. Returning a match the model
+    cannot then read is worse than not returning it.
+    """
+    path = line.split(":", 1)[0]
+    return any(part in DENY_DIR_NAMES for part in path.split(os.sep))
+
+
+def _pcre_unavailable(stderr: str) -> bool:
+    lowered = stderr.lower()
+    return "libpcre" in lowered or "perl-compatible" in lowered
+
+
 def _stream_grep(cmd: list[str], max_lines: int, char_budget: int) -> _GrepResult:
     """Run ``cmd``, reading its output until one of the caps is reached.
 
@@ -804,6 +834,11 @@ def _grep(env: ToolEnv, args: dict[str, Any]) -> str:
     rel_pathspec = os.path.relpath(pathspec, env.repo_root) or "."
     max_results = int(args.get("max_results") or DEFAULT_GREP_RESULTS)
     max_results = max(1, min(max_results, MAX_GREP_RESULTS))
+    global _git_grep_pcre
+    # Perl-compatible where git has it: a model writes `\d`, `\b` and
+    # lookaround by reflex, and ERE answers those with a confident, wrong
+    # "no matches". Falls back to -E on a git built without PCRE2.
+    dialect = "-E" if _git_grep_pcre is False else "-P"
     cmd = [
         "git",
         "-C",
@@ -811,7 +846,11 @@ def _grep(env: ToolEnv, args: dict[str, Any]) -> str:
         "grep",
         "-n",
         "-I",
-        "-E",
+        # Tracked files miss anything a patch just created, and /tasks greps
+        # after applying one. Ignored files stay out: --untracked honours
+        # .gitignore unless --no-exclude-standard is passed.
+        "--untracked",
+        dialect,
         # Per-file backstop, not the real cap: it keeps one pathological
         # file from filling the whole result set. Deliberately one *above*
         # max_results, so a file that genuinely holds more matches than was
@@ -825,15 +864,42 @@ def _grep(env: ToolEnv, args: dict[str, Any]) -> str:
     if path_arg:
         cmd.append(rel_pathspec)
 
-    header = f"git grep -E {pattern!r} -- {rel_pathspec}:"
+    header = f"git grep {dialect} {pattern!r} -- {rel_pathspec}:"
     char_budget = MAX_TOOL_OUTPUT_CHARS - len(header) - GREP_NOTE_RESERVE_CHARS
     result = _stream_grep(cmd, max_results, max(1, char_budget))
+    if (
+        dialect == "-P"
+        and result.returncode is not None
+        and result.returncode > 1
+        and _pcre_unavailable(result.stderr)
+    ):
+        # First -P call on a git without PCRE2. Remember it, redo the search
+        # in ERE, and let the no-match path below explain the dialect if the
+        # pattern needed the features we just lost.
+        log.info("git grep has no PCRE2 support; falling back to -E")
+        _git_grep_pcre = False
+        dialect = "-E"
+        cmd[cmd.index("-P")] = "-E"
+        header = f"git grep {dialect} {pattern!r} -- {rel_pathspec}:"
+        result = _stream_grep(cmd, max_results, max(1, char_budget))
+    elif dialect == "-P" and _git_grep_pcre is None and result.returncode in (0, 1):
+        _git_grep_pcre = True
     if result.timed_out:
         raise _ToolError(f"grep timed out ({GREP_TIMEOUT_SECONDS}s)")
+    result.lines = [ln for ln in result.lines if not _is_denylisted_match(ln)]
     if not result.lines:
         if result.returncode is not None and result.returncode > 1:
             return f"error: git grep exited {result.returncode}: {result.stderr[:300]}"
-        return f"no matches for {pattern!r} in {rel_pathspec}"
+        answer = f"no matches for {pattern!r} in {rel_pathspec}"
+        if dialect == "-E" and _PCRE_ONLY_RE.search(pattern):
+            answer += (
+                "\n[serge] This git has no PCRE support, so the pattern ran as "
+                "POSIX ERE, which has no \\d, \\w, \\s, \\b or (?...) — they "
+                "match nothing rather than erroring, so this result does not "
+                "mean the text is absent. Re-run with bracket expressions "
+                "([0-9], [A-Za-z_]) instead."
+            )
+        return answer
     body = "\n".join(result.lines)
     if not result.more:
         return f"{header}\n{body}"

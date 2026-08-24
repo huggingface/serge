@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -235,6 +236,67 @@ class ResolvePathTests(_TempRepo):
         out = run_tool(self.env, "grep", {"pattern": "needle", "path": "minified.js"})
         self.assertIn("line clipped", out)
         self.assertLess(len(out), MAX_MATCH_LINE_CHARS + 1000)
+
+    def test_grep_supports_perl_classes(self) -> None:
+        # ERE answers `\d` with a confident "no matches", which reads as
+        # "the identifier is not in this repo".
+        self._write_tracked("ids.txt", "TRF058 = 1\nTRF012 = 2\n")
+        out = run_tool(self.env, "grep", {"pattern": r"TRF\d+", "path": "ids.txt"})
+        self.assertEqual(self._match_lines(out, "ids.txt"), 2)
+
+    def test_grep_finds_a_file_created_since_the_last_commit(self) -> None:
+        # /tasks applies a patch and then searches; a tracked-files-only grep
+        # cannot see a file the patch created.
+        with open(os.path.join(self.repo_root, "brand_new.py"), "w") as f:
+            f.write("def freshly_added():\n    pass\n")
+        out = run_tool(self.env, "grep", {"pattern": "freshly_added"})
+        self.assertIn("brand_new.py:1:", out)
+
+    def test_grep_skips_gitignored_files(self) -> None:
+        self._write_tracked(".gitignore", "build/\n")
+        os.makedirs(os.path.join(self.repo_root, "build"), exist_ok=True)
+        with open(os.path.join(self.repo_root, "build", "generated.py"), "w") as f:
+            f.write("GENERATED_MARKER = 1\n")
+        out = run_tool(self.env, "grep", {"pattern": "GENERATED_MARKER"})
+        self.assertIn("no matches", out)
+
+    def test_grep_hides_matches_under_denylisted_dirs(self) -> None:
+        # read_file refuses these paths, so returning them as matches would
+        # hand the model a lead it cannot follow.
+        os.makedirs(os.path.join(self.repo_root, "node_modules"), exist_ok=True)
+        with open(os.path.join(self.repo_root, "node_modules", "dep.js"), "w") as f:
+            f.write("var vendored_marker = 1;\n")
+        out = run_tool(self.env, "grep", {"pattern": "vendored_marker"})
+        self.assertIn("no matches", out)
+
+    def test_grep_falls_back_to_ere_and_explains_the_dialect(self) -> None:
+        self._write_tracked("ids.txt", "TRF058 = 1\n")
+        real_popen = subprocess.Popen
+
+        def fake_popen(cmd, *a, **kw):  # type: ignore[no-untyped-def]
+            if "-P" in cmd:
+                # What a git built without PCRE2 actually says.
+                cmd = [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stderr.write('fatal: cannot use "
+                    "Perl-compatible regexes when not compiled with "
+                    "USE_LIBPCRE\\n'); sys.exit(128)",
+                ]
+            return real_popen(cmd, *a, **kw)
+
+        with (
+            patch.object(tools_mod, "_git_grep_pcre", None),
+            patch.object(tools_mod.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            out = run_tool(self.env, "grep", {"pattern": r"TRF\d+", "path": "ids.txt"})
+        self.assertIn("no matches", out)
+        self.assertIn("POSIX ERE", out)
+        self.assertIn("[0-9]", out)
+
+    def test_grep_header_names_the_dialect(self) -> None:
+        out = run_tool(self.env, "grep", {"pattern": "def hello", "path": "src"})
+        self.assertIn("git grep -P", out)
 
     def test_unknown_tool_returns_error_message(self) -> None:
         out = run_tool(self.env, "delete_repo", {})
