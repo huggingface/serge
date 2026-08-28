@@ -4,6 +4,7 @@ verification and the task worker are stubbed so no network/LLM is touched —
 we assert the route's accept/reject behavior and that an accepted task is
 queued."""
 
+import contextlib
 import importlib
 import os
 import shutil
@@ -450,7 +451,9 @@ class WebappTasksTests(unittest.TestCase):
         self.assertEqual(notify.call_args.kwargs["channel"], "#dynamic-ci")
         self.assertEqual(notify.call_args.kwargs["pr_number"], 99)
 
-    def _run_task_worker_with(self, webapp, task_result):
+    def _run_task_worker_with(
+        self, webapp, task_result, *, side_effect=None, persist=False
+    ):
         """Drive _run_task_worker with the heavy deps stubbed so the only thing
         under test is how a TaskResult maps to the terminal job.status."""
         worker_cfg = webapp.dataclasses.replace(
@@ -480,6 +483,32 @@ class WebappTasksTests(unittest.TestCase):
         )
         # The per-candidate prepare+publish (incl. any GPU verify retry loop) is
         # stubbed to return the given result, so we only assert status mapping.
+        candidate = (
+            {"side_effect": side_effect}
+            if side_effect is not None
+            else {"return_value": task_result}
+        )
+        persist_ctx = (
+            contextlib.nullcontext()
+            if persist
+            else patch.object(webapp, "_persist_terminal")
+        )
+        if persist:
+            webapp._store.insert_job(
+                id=job.id,
+                user=job.user,
+                target_owner=job.target_owner,
+                target_repo=job.target_repo,
+                target_number=job.target_number,
+                trigger_comment=job.trigger_comment,
+                llm_provider=job.llm_provider,
+                llm_api_base=job.llm_api_base,
+                llm_model=job.llm_model,
+                created_at=job.created_at,
+                status="running",
+                source="task",
+                kind="task",
+            )
         with (
             patch.object(webapp, "installation_id_for_repo", return_value=1),
             patch.object(webapp, "installation_token", return_value="tok"),
@@ -490,10 +519,8 @@ class WebappTasksTests(unittest.TestCase):
                 return_value=types.SimpleNamespace(path="/tmp/co"),
             ),
             patch.object(webapp._clone_cache, "release"),
-            patch.object(webapp, "_persist_terminal"),
-            patch.object(
-                webapp, "prepare_and_publish_candidate", return_value=task_result
-            ),
+            persist_ctx,
+            patch.object(webapp, "prepare_and_publish_candidate", **candidate),
         ):
             webapp._run_task_worker(job, worker_cfg, req)
         return job
@@ -509,6 +536,55 @@ class WebappTasksTests(unittest.TestCase):
         result = webapp.TaskResult(mode="new_pr", no_change=True)
         job = self._run_task_worker_with(webapp, result)
         self.assertEqual(job.status, "no_fix")
+
+    def test_the_candidate_session_lands_on_the_job(self):
+        """A no_fix outcome reads completely differently depending on whether
+        the model concluded there was no fix or a guard cut it off mid-hunt, so
+        the counters have to reach the job, not just the run log."""
+        webapp = self._import_webapp()
+        session = {
+            "turns": 46,
+            "tool_calls": 48,
+            "prompt_tokens": 2_111_885,
+            "stop_reason": "input_token_cap",
+            "path_revisits": 137,
+            "rounds": 1,
+        }
+        result = webapp.TaskResult(mode="new_pr", no_change=True, session=session)
+        job = self._run_task_worker_with(webapp, result)
+        self.assertEqual(job.session["stop_reason"], "input_token_cap")
+        self.assertEqual(job.session["path_revisits"], 137)
+        # It also travels in the result, which is how a runner pod reports it.
+        self.assertEqual(job.task_result["session"], session)
+
+    def test_a_failed_candidate_still_reports_what_it_spent(self):
+        """ "Patch did not apply" is a terminated session too — its budget is
+        already gone, so losing its counters loses the expensive cases."""
+        webapp = self._import_webapp()
+        error = webapp.TaskError("patch did not apply", status_code=422)
+        error.session = {"turns": 27, "stop_reason": "repeat_guard", "rounds": 1}
+        webapp_module = webapp
+
+        def _raise(*args, **kwargs):
+            raise error
+
+        job = self._run_task_worker_with(webapp_module, None, side_effect=_raise)
+        self.assertEqual(job.status, "error")
+        self.assertEqual(job.session["stop_reason"], "repeat_guard")
+        self.assertEqual(job.session["turns"], 27)
+
+    def test_a_job_that_never_ran_the_loop_persists_a_zeroed_session(self):
+        """Reproduce-first classifying a group ENVIRONMENT costs 0 LLM turns.
+        Recording nothing would make it indistinguishable from a job that was
+        never dispatched."""
+        webapp = self._import_webapp()
+        result = webapp.TaskResult(mode="new_pr", no_change=True)
+        job = self._run_task_worker_with(webapp, result, persist=True)
+        row = webapp._store.load(job.id)
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["session"]["stop_reason"], "no_llm_turns")
+        self.assertEqual(row["session"]["rounds"], 0)
 
 
 class TaskLauncherTests(unittest.TestCase):

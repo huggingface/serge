@@ -76,10 +76,13 @@ from .reviewer import (
     ReviewEdits,
     ReviewRequest,
     _UnparseableLLMOutput,
+    merge_session_records,
+    no_llm_session_record,
     prepare_review,
     publish_review,
     run_followup,
 )
+from .metrics import render_job_metrics
 from .slack_tool import post_task_finished_notification
 from .store import JobStore, decode_draft
 from .tasks import (
@@ -325,6 +328,11 @@ class Job:
     # For task jobs: the inbound spec and the published outcome.
     task_spec: Optional[dict[str, Any]] = None
     task_result: Optional[dict[str, Any]] = None
+    # Agent-loop counters for the whole job (reviewer.session_record, folded
+    # across candidates/rounds). Persisted at finish into ``session_json`` and
+    # exported by GET /metrics — the only record of a session that survives the
+    # 25-job retention.
+    session: dict[str, Any] = field(default_factory=dict)
     # running | done | error | discarded | published | no_fix
     # Tasks end as "published" (a PR/commit landed) or "no_fix" (completed but
     # serge proposed no patch); reviews use done/published/discarded.
@@ -887,6 +895,7 @@ def _persist_terminal(job: Job) -> None:
             raw_llm_output=job.raw_llm_output,
             draft=job.draft,
             history=history_copy,
+            session=job.session or no_llm_session_record(),
         )
         if job.published_draft is not None:
             _store.save_published_review(
@@ -990,6 +999,7 @@ def _execute_review(
             _push_event(job, "done", "")
             return
         job.draft = draft
+        job.session = draft.session
         if auto_publish:
             _push_event(job, "log", "Publishing review to GitHub…")
             # Store the effective draft publish_review actually posted (e.g.
@@ -1014,6 +1024,7 @@ def _execute_review(
         _push_event(job, "step", "done")
         _push_event(job, "done", "")
     except _UnparseableLLMOutput as exc:
+        job.session = merge_session_records(job.session, getattr(exc, "session", None))
         job.status = "error"
         job.raw_llm_output = exc.content
         job.error = exc.user_message()
@@ -1232,6 +1243,7 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
                     )
                     continue
                 raise
+            job.session = merge_session_records(job.session, attempt_result.session)
             if attempt_result.no_change and index < len(candidate_reqs):
                 last_no_change = attempt_result
                 emit(
@@ -1261,6 +1273,7 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         emit("done", "")
     except TaskError as exc:
         log.warning("task %s rejected: %s", job.id, exc)
+        job.session = merge_session_records(job.session, getattr(exc, "session", None))
         job.status = "error"
         job.error = str(exc)
         emit("step", "error")
@@ -2145,6 +2158,34 @@ def _build_badge_html() -> str:
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}  # the `serge` build stamp is added by middleware
+
+
+@app.get("/metrics")
+def metrics() -> Response:
+    """Prometheus exposition of the finished jobs the store still holds.
+
+    Unauthenticated, like ``/healthz``: it is scraped in-cluster over the pod
+    port, and it carries no review content — job ids, repo/PR numbers, the model
+    name, and counters. Deliberately a rolling window (``WEB_JOB_RETENTION``
+    jobs); Prometheus is the durable side, so read history with a range query,
+    not by curling this. See :mod:`reviewbot.metrics`."""
+    try:
+        sessions = _store.list_sessions(limit=max(cfg.web_job_retention, 1))
+    except Exception:  # noqa: BLE001 — a scrape must never take the app down
+        log.exception("failed to read job sessions for /metrics")
+        sessions = []
+    body = render_job_metrics(
+        sessions,
+        retention=cfg.web_job_retention,
+        version=__version__,
+        commit=git_sha(),
+    )
+    # version=0.0.4 is what Prometheus' text parser expects; without it some
+    # scrapers fall back to sniffing and reject the body.
+    return Response(
+        content=body,
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 @app.get("/version")
@@ -3212,13 +3253,20 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
                     draft.prompt_tokens = int(result.get("prompt_tokens") or 0)
                     draft.completion_tokens = int(result.get("completion_tokens") or 0)
                     draft.truncated_chunks = int(result.get("truncated_chunks") or 0)
+                    draft.session = result.get("session") or {}
+                    job.session = draft.session
                 job.draft = draft
         elif isinstance(result, dict):
             job.task_result = result
+            job.session = result.get("session") or {}
             try:
                 _store.save_task_result(job.id, _json.dumps(result))
             except Exception:  # noqa: BLE001
                 log.exception("failed to persist task result for %s", job.id)
+        if isinstance(terminal.get("session"), dict) and terminal["session"]:
+            # An errored runner has no ``result`` to hang counters off; it sends
+            # them alongside the error instead.
+            job.session = merge_session_records(job.session, terminal["session"])
         if terminal.get("error"):
             job.error = str(terminal["error"])
         if terminal.get("raw_llm_output"):
@@ -3924,6 +3972,10 @@ def task_status(request: Request, owner: str, repo: str, job_id: str) -> JSONRes
             "model": job.llm_model,
             "prompt_tokens": (row or {}).get("prompt_tokens"),
             "completion_tokens": (row or {}).get("completion_tokens"),
+            # Agent-loop counters for the whole job, so the triage reconciler can
+            # report *why* a group came back no_fix — a guard ending the session
+            # reads very differently from the model deciding it had no fix.
+            "session": (row or {}).get("session") or job.session or {},
         }
     )
 

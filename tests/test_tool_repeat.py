@@ -7,7 +7,7 @@ fix, and produced a patch that failed GPU verification — three rounds running.
 
 import unittest
 
-from reviewbot.tool_repeat import ToolRepeatGuard, normalize_arguments
+from reviewbot.tool_repeat import ToolRepeatGuard, normalize_arguments, path_argument
 
 
 GREP_A = '{"pattern": "GlmOcrProcessor|Glm46VProcessor", "path": "src/transformers/models/glm_ocr", "max_results": 50}'
@@ -142,6 +142,91 @@ class ToolRepeatGuardTests(unittest.TestCase):
                 break
         self.assertTrue(guard.tripped)
         self.assertLessEqual(served, 8)
+
+
+class PathArgumentTests(unittest.TestCase):
+    def test_only_the_opening_tools_name_a_path(self):
+        self.assertEqual(path_argument("read_file", '{"path": "a/b.py"}'), "a/b.py")
+        self.assertEqual(path_argument("list_dir", '{"path": "a"}'), "a")
+        # A grep of the same path with a different pattern is a new search,
+        # not a re-read, so it is not counted as a visit.
+        self.assertIsNone(path_argument("grep", '{"pattern": "x", "path": "a"}'))
+        self.assertIsNone(path_argument("fetch_url", '{"url": "https://x"}'))
+
+    def test_spellings_of_the_same_path_collapse(self):
+        for spelling in ("a/b.py", "./a/b.py", "/a/b.py", "  a/b.py  "):
+            self.assertEqual(
+                path_argument("read_file", '{"path": "%s"}' % spelling.strip()),
+                "a/b.py",
+                spelling,
+            )
+
+    def test_list_dir_without_a_path_is_still_a_visit(self):
+        """Its path is optional and defaults to the repo root."""
+        self.assertEqual(path_argument("list_dir", "{}"), ".")
+        self.assertEqual(path_argument("list_dir", '{"path": "/"}'), ".")
+
+    def test_unusable_arguments_name_no_path(self):
+        self.assertIsNone(path_argument("read_file", "not json"))
+        self.assertIsNone(path_argument("read_file", "[1, 2]"))
+        self.assertIsNone(path_argument("read_file", '{"start_line": 1}'))
+
+
+class PathVisitTests(unittest.TestCase):
+    """The waste the exact-signature counter cannot see.
+
+    Job 9d210794 made 153 tool calls, 137 of them re-openings of a path it had
+    already read — ``modular_blt.py`` 53 times, at different line ranges. Every
+    one of those is a distinct signature, so ``repeats`` stays 0 while the
+    budget drains."""
+
+    def test_rereads_of_one_file_are_revisits_but_not_exact_repeats(self):
+        guard = ToolRepeatGuard(6)
+        for start in (1, 180, 400, 620):
+            guard.observe(
+                "read_file",
+                '{"path": "src/m/modular_blt.py", "start_line": %d}' % start,
+            )
+        self.assertEqual(guard.repeats, 0)
+        self.assertFalse(guard.tripped)
+        self.assertEqual(guard.distinct_paths, 1)
+        self.assertEqual(guard.path_revisits, 3)
+
+    def test_a_file_read_once_is_not_waste(self):
+        guard = ToolRepeatGuard(6)
+        for i in range(10):
+            guard.observe("read_file", '{"path": "f%d.py"}' % i)
+        self.assertEqual(guard.distinct_paths, 10)
+        self.assertEqual(guard.path_revisits, 0)
+
+    def test_counting_survives_a_disabled_guard(self):
+        """The nudge is configurable; the observability record is not."""
+        guard = ToolRepeatGuard(0)
+        for _ in range(5):
+            self.assertIsNone(guard.observe("read_file", '{"path": "a.py"}'))
+        self.assertEqual(guard.repeats, 0)
+        self.assertEqual(guard.path_revisits, 4)
+
+    def test_worst_paths_ranks_the_offenders(self):
+        guard = ToolRepeatGuard(999)
+        for _ in range(53):
+            guard.observe("read_file", '{"path": "modular_blt.py"}')
+        for _ in range(21):
+            guard.observe("read_file", '{"path": "configuration_utils.py"}')
+        guard.observe("read_file", '{"path": "once.py"}')
+        self.assertEqual(
+            guard.worst_paths(),
+            [("modular_blt.py", 53), ("configuration_utils.py", 21)],
+        )
+
+    def test_stats_is_the_flat_record(self):
+        guard = ToolRepeatGuard(6)
+        guard.observe("read_file", '{"path": "a.py"}')
+        guard.observe("read_file", '{"path": "a.py"}')
+        self.assertEqual(
+            guard.stats(),
+            {"repeats": 1, "distinct_paths": 1, "path_revisits": 1},
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

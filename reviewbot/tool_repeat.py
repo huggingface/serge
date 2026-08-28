@@ -61,6 +61,40 @@ def normalize_arguments(arguments: str) -> str:
         return (arguments or "").strip()
 
 
+# Tools whose ``path`` argument names something the agent has *opened*. A second
+# ``read_file`` of the same file is a re-visit even when the line range differs —
+# that is the shape that dominated the measured prod window (137 of 153 calls in
+# job 9d210794 were repeat visits to an already-opened path, ``modular_blt.py``
+# 53 times). ``grep`` deliberately is not here: the same path with a different
+# pattern is a genuinely new search, not a re-read.
+_PATH_TOOLS = frozenset({"read_file", "list_dir"})
+
+
+def path_argument(name: str, arguments: str) -> str | None:
+    """The path a call opened, or ``None`` when the tool does not open one.
+
+    Normalized only enough to make two spellings of the same file compare equal
+    (``./x.py`` and ``x.py``); no filesystem access, so it stays usable in the
+    metrics path where the checkout may already be gone."""
+    if name not in _PATH_TOOLS:
+        return None
+    try:
+        parsed = json.loads(arguments or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    raw = parsed.get("path")
+    if not isinstance(raw, str):
+        # list_dir's path is optional and defaults to the repo root; a missing
+        # path is still a visit to a real location, so name it.
+        return "." if name == "list_dir" else None
+    path = raw.strip().lstrip("/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path.rstrip("/") or "."
+
+
 class ToolRepeatGuard:
     """Count identical tool calls and produce a correction for the repeats.
 
@@ -78,6 +112,10 @@ class ToolRepeatGuard:
         self.trip_after = trip_after
         self.counts: dict[str, int] = {}
         self.repeats = 0
+        # Visits per opened path, counted whether or not the guard is enabled:
+        # this is the session's observability record (see :meth:`stats`), and it
+        # has to be there even for a deployment that turned the nudge off.
+        self.path_visits: dict[str, int] = {}
 
     @property
     def enabled(self) -> bool:
@@ -94,6 +132,9 @@ class ToolRepeatGuard:
         The first occurrence of a call is always free — legitimate investigation
         re-lists directories and re-reads files. Only an *exact* re-run of a call
         already made in this session is treated as a repeat."""
+        path = path_argument(name, arguments)
+        if path is not None:
+            self.path_visits[path] = self.path_visits.get(path, 0) + 1
         if not self.enabled:
             return None
         signature = f"{name}\x00{normalize_arguments(arguments)}"
@@ -118,3 +159,34 @@ class ToolRepeatGuard:
         return f"{self.repeats} repeated tool call(s)" + (
             f" (most repeated: {', '.join(parts)})" if parts else ""
         )
+
+    # ------------------------------------------------------------------
+    # observability
+    # ------------------------------------------------------------------
+    @property
+    def distinct_paths(self) -> int:
+        """How many separate files/directories the session opened."""
+        return len(self.path_visits)
+
+    @property
+    def path_revisits(self) -> int:
+        """Calls spent re-opening a path already opened in this session.
+
+        The headline waste number: with 153 calls over 12 distinct paths, 137 of
+        them were this. Counted as ``visits - 1`` per path, so a file read once
+        contributes nothing.
+        """
+        return sum(count - 1 for count in self.path_visits.values() if count > 1)
+
+    def worst_paths(self, limit: int = 3) -> list[tuple[str, int]]:
+        """The most re-opened paths, highest first — for logs and nudges."""
+        ranked = sorted(self.path_visits.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [(path, count) for path, count in ranked[:limit] if count > 1]
+
+    def stats(self) -> dict[str, int]:
+        """Flat counters for the per-job metrics record."""
+        return {
+            "repeats": self.repeats,
+            "distinct_paths": self.distinct_paths,
+            "path_revisits": self.path_revisits,
+        }

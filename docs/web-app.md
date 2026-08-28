@@ -94,3 +94,48 @@ progress in the web UI.
 | `WEB_CLONE_DEPTH` | `50` | Shallow fetch depth |
 
 Point `WEB_CLONE_CACHE_DIR` at durable storage in production.
+
+## Metrics
+
+`GET /metrics` serves a Prometheus text exposition of the jobs the store still
+holds. Unauthenticated, like `/healthz` — it is meant to be scraped in-cluster
+over the pod port, and it carries no review content: job ids, the repo and PR
+number, the model name, and counters.
+
+Per finished job it exports turns, tool calls, input/output tokens, LLM seconds,
+retries, and two numbers about how the budget was spent browsing:
+
+| Metric | Meaning |
+| ------ | ------- |
+| `serge_job_repeat_calls` | Tool calls that re-ran an *earlier call verbatim* — what `TOOL_REPEAT_LIMIT` counts. |
+| `serge_job_path_revisits` | Calls that re-opened a *path already opened*, counted per path as visits−1. A second `read_file` of the same file at a different line range is a revisit but not a verbatim repeat, and that is the shape that dominates in practice. |
+
+The label that matters most is `stop_reason` on `serge_job_info`:
+
+| `stop_reason` | The session ended because… |
+| ------------- | -------------------------- |
+| `answered` | the model decided it was done — the only value that means this |
+| `input_token_cap` | `LLM_MAX_INPUT_TOKENS` was reached; the answer came from a tool-less final turn |
+| `repeat_guard` | `TOOL_REPEAT_LIMIT` tripped |
+| `blind_turn_cap` / `strict_tool_cap` / `absolute_ceiling` | a `TOOL_MAX_ITERATIONS` bound was reached |
+| `chunk_input_token_cap` | a chunked review skipped chunks it could not afford |
+| `no_llm_turns` | the job finished (or failed) without ever running the loop — e.g. reproduce-first classified the group ENVIRONMENT |
+
+Identity lives on `serge_job_info` alone (always `1`) and the numeric series are
+keyed by `job_id` only, so a job's numbers don't fork into a new series when its
+status changes. Join them back with `on(job_id) group_left(...)`:
+
+```promql
+max by (job_id) (serge_job_input_tokens)
+  * on(job_id) group_left(repo, status, stop_reason) max by (job_id, repo, status, stop_reason) (serge_job_info)
+```
+
+The export is a **rolling window** over `WEB_JOB_RETENTION` jobs (exported as
+`serge_job_retention`), not a history: when a job is pruned its series stops
+being exported and goes stale, while the samples Prometheus already took stay
+queryable for its full retention. So curling this endpoint tells you about the
+last couple of days only — ask Prometheus for anything older.
+
+The same record is returned in the `session` field of
+`GET /tasks/{owner}/{repo}/{job_id}/status`, so a dispatcher polling its own task
+can report why a group came back `no_fix` without a dashboard round trip.

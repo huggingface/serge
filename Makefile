@@ -15,7 +15,7 @@ $(VENV)/.installed: pyproject.toml
 	  exit 1; }
 	$(PYTHON) -m venv $(VENV)
 	$(VENV_PYTHON) -m pip install --upgrade pip
-	$(VENV_PYTHON) -m pip install -e '.[web]' pytest ruff
+	$(VENV_PYTHON) -m pip install -e '.[web]' pytest ruff prometheus_client
 	touch $(VENV)/.installed
 
 format: $(VENV)/.installed

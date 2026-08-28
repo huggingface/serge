@@ -37,6 +37,8 @@ from .prompts import build_task_system_prompt, build_task_user_prompt
 from .reviewer import (
     _extract_json,
     _format_aggregated_metrics,
+    merge_session_records,
+    session_record,
     _make_tool_env,
     _run_agentic_loop,
     _UnparseableLLMOutput,
@@ -95,6 +97,11 @@ class TaskError(Exception):
     def __init__(self, message: str, *, status_code: int = 400):
         super().__init__(message)
         self.status_code = status_code
+        # Agent-loop counters for the work already done when this was raised.
+        # A patch that will not apply is a *terminated session*, and it is one of
+        # the outcomes most worth counting; without this the whole round would
+        # leave no trace but an error string.
+        self.session: dict[str, Any] = {}
 
 
 class NormalizeGateBroken(TaskError):
@@ -167,6 +174,10 @@ class TaskPlan:
     metrics_line: str = ""
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Per-job agent-loop counters (reviewer.session_record): turns, tool calls,
+    # re-opened paths, and which guard ended the loop. Kept past the job row's
+    # 25-job retention so a change to the loop can be shown to have helped.
+    session: dict[str, Any] = field(default_factory=dict)
     model: Optional[str] = None
     # True when the patch was validated in-loop (see :func:`_validate_patch`):
     # the worktree already holds the applied + normalized result, so
@@ -191,6 +202,11 @@ class TaskResult:
     # to the next LLM round. Not persisted in ``to_json`` (tracebacks are large).
     verify_verdict: Optional[str] = None
     verify_tracebacks: dict[str, str] = field(default_factory=dict)
+    # Agent-loop counters accumulated over every round this candidate ran
+    # (reviewer.merge_session_records). Small — counters only, no tracebacks —
+    # so unlike ``verify_tracebacks`` it does travel in ``to_json``, which is
+    # how it reaches serge from a per-task runner pod.
+    session: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -203,6 +219,7 @@ class TaskResult:
             "commit_sha": self.commit_sha,
             "changed_files": self.changed_files,
             "verify_verdict": self.verify_verdict,
+            "session": self.session,
         }
 
 
@@ -732,6 +749,7 @@ def prepare_task(
             content=chat.content or "",
             finish_reason=chat.finish_reason,
             metrics_line=metrics_line,
+            session=session_record(metrics),
         ) from exc
 
     title = (result.get("title") or "").strip() or (req.title or "serge: automated fix")
@@ -753,6 +771,7 @@ def prepare_task(
         metrics_line=metrics_line,
         prompt_tokens=metrics.prompt_tokens,
         completion_tokens=metrics.completion_tokens,
+        session=session_record(metrics),
         model=llm.model,
         worktree_prepared=outcome["prepared"],
     )
@@ -1626,6 +1645,9 @@ def prepare_and_publish_candidate(
     rounds = cfg.verify_max_rounds if cfg.verify_on_gpu else 0
     req_i = candidate_req
     result: Optional[TaskResult] = None
+    # Every round runs a fresh agent loop with its own budget; the job-level
+    # bill is their sum, so fold each one in as it completes.
+    session: dict[str, Any] = {}
     for attempt in range(rounds + 1):
         if attempt > 0:
             # Start each retry from a pristine worktree.
@@ -1638,16 +1660,24 @@ def prepare_and_publish_candidate(
             existing_diff=existing_diff,
             chunk_callback=emit,
         )
-        result = publish_task(
-            cfg,
-            gh,
-            req_i,
-            plan,
-            checkout=checkout,
-            clone_cache=clone_cache,
-            job_id=job_id,
-            emit=emit,
-        )
+        session = merge_session_records(session, plan.session)
+        try:
+            result = publish_task(
+                cfg,
+                gh,
+                req_i,
+                plan,
+                checkout=checkout,
+                clone_cache=clone_cache,
+                job_id=job_id,
+                emit=emit,
+            )
+        except TaskError as exc:
+            # The LLM work is done and paid for even though publishing failed;
+            # carry its counters out with the error.
+            exc.session = merge_session_records(exc.session, session)
+            raise
+        result.session = session
         if attempt < rounds and should_retry(result.verify_verdict or ""):
             emit(
                 "log",

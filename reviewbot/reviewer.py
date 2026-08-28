@@ -110,6 +110,10 @@ class ReviewDraft:
     # auto-discovery, if llm_model was unset). Surfaced in the published
     # review footer; None when no LLM call was made.
     model: Optional[str] = None
+    # Per-job agent-loop counters (:func:`session_record`). Like the token
+    # counts above, this is a carrier field: it is NOT part of the draft JSON
+    # a review pod ships back, it travels beside it on the terminal callback.
+    session: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -465,6 +469,55 @@ class _AggregateMetrics:
     latency_seconds: float = 0.0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Why the loop stopped. ``STOP_ANSWERED`` is the *only* value meaning the
+    # model decided it was done; every other value is a guard cutting it off and
+    # forcing an answer out of whatever budget was left. Worth recording per job:
+    # in the one prod window we could still read, all seven sessions that ran LLM
+    # turns ended on a guard and none on the model's own terms, which is not
+    # visible anywhere today.
+    stop_reason: str = "answered"
+    # Copied off the ToolRepeatGuard at every exit (see :func:`_run_agentic_loop`).
+    repeats: int = 0
+    distinct_paths: int = 0
+    path_revisits: int = 0
+    # Times the answer was rejected and re-asked: the normalize/patch gate and
+    # the truncated-final-answer salvage respectively.
+    validation_retries: int = 0
+    truncation_retries: int = 0
+
+
+# Loop-exit reasons, recorded on _AggregateMetrics.stop_reason. Only ANSWERED
+# means the model finished on its own terms.
+STOP_ANSWERED = "answered"
+STOP_INPUT_TOKEN_CAP = "input_token_cap"
+STOP_REPEAT_GUARD = "repeat_guard"
+STOP_BLIND_TURN_CAP = "blind_turn_cap"
+STOP_STRICT_TOOL_CAP = "strict_tool_cap"
+STOP_ABSOLUTE_CEILING = "absolute_ceiling"
+STOP_CHUNK_BUDGET = "chunk_input_token_cap"
+# Not a loop exit: the job finished (or failed) without ever running one. The
+# reproduce-first gate classifying a group ENVIRONMENT is the common case — 3 of
+# the 10 tasks in the measured window — and it has to be countable, otherwise
+# "serge did nothing for 0 turns" and "serge never ran" look identical.
+STOP_NO_LLM_TURNS = "no_llm_turns"
+
+
+def no_llm_session_record() -> dict[str, Any]:
+    """A zeroed session for a job that never reached the agent loop."""
+    return {
+        "turns": 0,
+        "tool_calls": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "seconds": 0.0,
+        "stop_reason": STOP_NO_LLM_TURNS,
+        "repeats": 0,
+        "distinct_paths": 0,
+        "path_revisits": 0,
+        "validation_retries": 0,
+        "truncation_retries": 0,
+        "rounds": 0,
+    }
 
 
 def _format_aggregated_metrics(m: "_AggregateMetrics") -> str:
@@ -480,12 +533,100 @@ def _format_aggregated_metrics(m: "_AggregateMetrics") -> str:
     return " · ".join(parts)
 
 
+def session_record(m: "_AggregateMetrics") -> dict[str, Any]:
+    """The per-job counters worth keeping after the job row is evicted.
+
+    ``WEB_JOB_RETENTION`` is 25 jobs — about two days of traffic — so anything
+    only visible in the job row cannot be used to show that a change to the
+    agent loop helped. These are the numbers that answer "did the model finish,
+    or did a guard cut it off, and what did it spend the budget on?".
+    """
+    return {
+        "turns": m.turns,
+        "tool_calls": m.tool_calls,
+        "prompt_tokens": m.prompt_tokens,
+        "completion_tokens": m.completion_tokens,
+        "seconds": round(m.latency_seconds, 1),
+        "stop_reason": m.stop_reason,
+        "repeats": m.repeats,
+        "distinct_paths": m.distinct_paths,
+        "path_revisits": m.path_revisits,
+        "validation_retries": m.validation_retries,
+        "truncation_retries": m.truncation_retries,
+        "rounds": 1,
+    }
+
+
+# Counters that add up when a job runs the agent loop more than once — a task
+# with several candidate groups, or a GPU-verify retry round.
+_SESSION_SUMS = (
+    "turns",
+    "tool_calls",
+    "prompt_tokens",
+    "completion_tokens",
+    "repeats",
+    "path_revisits",
+    "validation_retries",
+    "truncation_retries",
+)
+
+
+def merge_session_records(
+    total: Optional[dict[str, Any]], part: Optional[dict[str, Any]]
+) -> dict[str, Any]:
+    """Fold one agent-loop session into a job-level total.
+
+    A single task job can run the loop several times (one per candidate group,
+    plus a round per GPU-verify retry), and the thing worth reporting is what the
+    *job* spent — the 2M input-token cap is per loop, but the bill is per job.
+    ``rounds`` counts how many loops were folded in; ``stop_reason`` reports the
+    last loop that a guard cut off, since one cut-off round is what starves the
+    patch that gets published."""
+    if not part:
+        return dict(total or {})
+    if not total:
+        merged = dict(part)
+        # ``part`` may itself already be an accumulation (a candidate that ran
+        # several verify rounds); don't reset its count to one.
+        merged.setdefault("rounds", 1)
+        return merged
+    merged = dict(total)
+    for key in _SESSION_SUMS:
+        merged[key] = int(merged.get(key, 0) or 0) + int(part.get(key, 0) or 0)
+    merged["seconds"] = round(
+        float(merged.get("seconds", 0.0) or 0.0)
+        + float(part.get("seconds", 0.0) or 0.0),
+        1,
+    )
+    merged["distinct_paths"] = max(
+        int(merged.get("distinct_paths", 0) or 0),
+        int(part.get("distinct_paths", 0) or 0),
+    )
+    merged["rounds"] = int(merged.get("rounds", 1) or 1) + int(
+        part.get("rounds", 1) or 1
+    )
+    if part.get("stop_reason", STOP_ANSWERED) != STOP_ANSWERED:
+        merged["stop_reason"] = part["stop_reason"]
+    return merged
+
+
 def _merge_metrics(total: "_AggregateMetrics", part: "_AggregateMetrics") -> None:
     total.turns += part.turns
     total.tool_calls += part.tool_calls
     total.latency_seconds += part.latency_seconds
     total.prompt_tokens += part.prompt_tokens
     total.completion_tokens += part.completion_tokens
+    total.repeats += part.repeats
+    total.path_revisits += part.path_revisits
+    total.validation_retries += part.validation_retries
+    total.truncation_retries += part.truncation_retries
+    # Each chunk browses with a fresh guard, so distinct paths are per-chunk and
+    # summing them double-counts a file two chunks both opened. An upper bound is
+    # the honest reading available without keeping every path around.
+    total.distinct_paths = max(total.distinct_paths, part.distinct_paths)
+    # A cut-off chunk means the session was cut off, whatever later chunks did.
+    if part.stop_reason != STOP_ANSWERED:
+        total.stop_reason = part.stop_reason
 
 
 def _make_tool_env(
@@ -861,6 +1002,18 @@ def _run_agentic_loop(
     blind_tool_turns = 0
     validation_retries = 0
     truncation_retries = 0
+
+    def _finalize(chat: ChatResult) -> tuple[ChatResult, "_AggregateMetrics"]:
+        """Attach the session's browse/retry record to the metrics on the way
+        out. Every ``return`` from this function goes through here so a job's
+        counters are complete no matter which exit it took."""
+        metrics.repeats = repeat_guard.repeats
+        metrics.distinct_paths = repeat_guard.distinct_paths
+        metrics.path_revisits = repeat_guard.path_revisits
+        metrics.validation_retries = validation_retries
+        metrics.truncation_retries = truncation_retries
+        return chat, metrics
+
     # Set for one turn to recover a truncated final answer: disable tools and
     # force minimal reasoning so the whole output budget goes to the JSON.
     force_json_only = False
@@ -871,8 +1024,10 @@ def _run_agentic_loop(
                 "Agent loop hit absolute ceiling of %d iterations; bailing out",
                 ABSOLUTE_ITER_CEILING,
             )
+            metrics.stop_reason = STOP_ABSOLUTE_CEILING
             break
         if iter_cap is not None and blind_tool_turns >= iter_cap:
+            metrics.stop_reason = STOP_BLIND_TURN_CAP
             break
         if (
             iter_cap is not None
@@ -884,6 +1039,7 @@ def _run_agentic_loop(
                 metrics.tool_calls,
                 iter_cap,
             )
+            metrics.stop_reason = STOP_STRICT_TOOL_CAP
             break
         if (
             input_tokens_cap is not None
@@ -901,6 +1057,7 @@ def _run_agentic_loop(
                     f"Input token budget hit ({cumulative} >= {input_tokens_cap}); "
                     "asking for a final review without tools",
                 )
+            metrics.stop_reason = STOP_INPUT_TOKEN_CAP
             break
         if iter_cap is not None:
             if getattr(cfg, "tool_max_iterations_strict", False):
@@ -968,13 +1125,13 @@ def _run_agentic_loop(
                 force_json_only = True
                 continue
             if validate is None:
-                return chat, metrics
+                return _finalize(chat)
             # Verification gate: let the caller check the final answer (for
             # /tasks: apply the patch + run the repo normalizer). A non-empty
             # string is a rejection to feed back; None accepts.
             feedback = validate(chat)
             if feedback is None or validation_retries >= max_validation_retries:
-                return chat, metrics
+                return _finalize(chat)
             validation_retries += 1
             if emit is not None:
                 emit(
@@ -1009,7 +1166,7 @@ def _run_agentic_loop(
                 "content as final answer",
                 len(chat.tool_calls),
             )
-            return chat, metrics
+            return _finalize(chat)
 
         # Append the assistant's tool_calls turn so the next request has
         # the full conversation, then execute each call and append the
@@ -1065,6 +1222,7 @@ def _run_agentic_loop(
                     f"Stuck in a tool-call loop ({repeat_guard.summary()}); "
                     "asking for a final answer without tools",
                 )
+            metrics.stop_reason = STOP_REPEAT_GUARD
             break
 
     # Iteration budget hit — force a final answer with tools disabled.
@@ -1135,10 +1293,10 @@ def _run_agentic_loop(
         # are tool-less: the model fixes its diff from the normalizer's
         # feedback, which needs no browsing.
         if validate is None:
-            return chat, metrics
+            return _finalize(chat)
         feedback = validate(chat)
         if feedback is None or validation_retries >= max_validation_retries:
-            return chat, metrics
+            return _finalize(chat)
         validation_retries += 1
         if emit is not None:
             emit(
@@ -1366,11 +1524,21 @@ class _UnparseableLLMOutput(Exception):
     content + finish_reason + metrics line so the caller can render an
     error to whatever surface they own (GitHub comment, web UI, etc.)."""
 
-    def __init__(self, content: str, finish_reason: Optional[str], metrics_line: str):
+    def __init__(
+        self,
+        content: str,
+        finish_reason: Optional[str],
+        metrics_line: str,
+        session: Optional[dict[str, Any]] = None,
+    ):
         super().__init__("unparseable LLM output")
         self.content = content
         self.finish_reason = finish_reason
         self.metrics_line = metrics_line
+        # These are the sessions we most want counters for: an unparseable
+        # answer is what a starved final turn produces, and the job row records
+        # only the error string.
+        self.session = session or {}
 
     def user_message(self) -> str:
         if self.finish_reason == "length":
@@ -1538,6 +1706,7 @@ def prepare_review(
                 "chunk(s) and finishing early",
             )
             skipped_chunks_for_budget = remaining
+            total_metrics.stop_reason = STOP_CHUNK_BUDGET
             break
         runner_context = _build_runner_context(
             all_files=files,
@@ -1593,6 +1762,7 @@ def prepare_review(
                 content=chat.content or "",
                 finish_reason=chat.finish_reason,
                 metrics_line=metrics_line,
+                session=session_record(total_metrics),
             ) from exc
 
         summary = (result.get("summary") or "").strip()
@@ -1723,6 +1893,7 @@ def prepare_review(
         prompt_tokens=total_metrics.prompt_tokens,
         completion_tokens=total_metrics.completion_tokens,
         model=llm.model,
+        session=session_record(total_metrics),
     )
 
 
