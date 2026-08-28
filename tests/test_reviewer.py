@@ -25,6 +25,14 @@ from reviewbot.reviewer import (
     _prose_outside_json,
     _run_agentic_loop,
     _summarize_rejected_comments,
+    STOP_ANSWERED,
+    STOP_BLIND_TURN_CAP,
+    STOP_INPUT_TOKEN_CAP,
+    STOP_NO_LLM_TURNS,
+    STOP_REPEAT_GUARD,
+    merge_session_records,
+    no_llm_session_record,
+    session_record,
 )
 
 
@@ -1009,3 +1017,200 @@ class LeakedTextToolCallLoopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StopReasonTests(unittest.TestCase):
+    """Which guard ended the session, recorded per job.
+
+    In the one prod window still readable when this was written, all seven task
+    sessions that ran LLM turns were terminated by a guard and none by the model
+    deciding it was done — a fact that was nowhere in the data, only in the log
+    lines of jobs that have since been pruned."""
+
+    def _tool_turn(self, prompt_tokens: int = 40_000) -> ChatResult:
+        return ChatResult(
+            content="",
+            usage={"prompt_tokens": prompt_tokens, "completion_tokens": 20},
+            tool_calls=[ToolCall(id="t", name="grep", arguments='{"pattern": "Foo"}')],
+        )
+
+    def _answer(self) -> ChatResult:
+        return ChatResult(
+            content='{"summary": "ok", "comments": []}',
+            usage={"prompt_tokens": 1_000, "completion_tokens": 10},
+        )
+
+    def test_a_model_that_finishes_is_recorded_as_answered(self) -> None:
+        cfg = _CfgStub()
+        _, metrics = _run_agentic_loop(
+            _FakeLLM([self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=None,
+        )
+        self.assertEqual(metrics.stop_reason, STOP_ANSWERED)
+
+    def test_input_token_cap(self) -> None:
+        cfg = _CfgStub(llm_max_input_tokens=100_000)
+        _, metrics = _run_agentic_loop(
+            _FakeLLM([self._tool_turn(120_000), self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.stop_reason, STOP_INPUT_TOKEN_CAP)
+
+    def test_repeat_guard(self) -> None:
+        cfg = _CfgStub(tool_max_iterations=0, tool_repeat_limit=2)
+        _, metrics = _run_agentic_loop(
+            _FakeLLM([self._tool_turn()] * 3 + [self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.stop_reason, STOP_REPEAT_GUARD)
+
+    def test_blind_turn_cap(self) -> None:
+        cfg = _CfgStub(tool_max_iterations=2, tool_repeat_limit=0)
+        turns = [
+            ChatResult(
+                content="",
+                usage={"prompt_tokens": 1_000, "completion_tokens": 10},
+                tool_calls=[
+                    ToolCall(
+                        id=f"t{i}", name="grep", arguments='{"pattern": "P%d"}' % i
+                    )
+                ],
+            )
+            for i in range(4)
+        ]
+        _, metrics = _run_agentic_loop(
+            _FakeLLM(turns + [self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.stop_reason, STOP_BLIND_TURN_CAP)
+
+    def test_the_browse_record_rides_out_with_the_metrics(self) -> None:
+        """Whatever exit the loop takes, the counters must be complete."""
+        cfg = _CfgStub(tool_max_iterations=0, tool_repeat_limit=0)
+        reads = [
+            ChatResult(
+                content="",
+                usage={"prompt_tokens": 1_000, "completion_tokens": 10},
+                tool_calls=[
+                    ToolCall(
+                        id=f"t{i}",
+                        name="read_file",
+                        arguments='{"path": "a.py", "start_line": %d}' % (i * 50),
+                    )
+                ],
+            )
+            for i in range(3)
+        ]
+        _, metrics = _run_agentic_loop(
+            _FakeLLM(reads + [self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        # Three reads of one file at different offsets: no exact repeat, but two
+        # of the three calls re-opened a file already in the context.
+        self.assertEqual(metrics.repeats, 0)
+        self.assertEqual(metrics.distinct_paths, 1)
+        self.assertEqual(metrics.path_revisits, 2)
+        self.assertEqual(metrics.stop_reason, STOP_ANSWERED)
+
+
+class SessionRecordTests(unittest.TestCase):
+    def test_record_is_flat_and_json_safe(self) -> None:
+        cfg = _CfgStub()
+        _, metrics = _run_agentic_loop(
+            _FakeLLM(  # type: ignore[arg-type]
+                [
+                    ChatResult(
+                        content='{"summary": "ok", "comments": []}',
+                        usage={"prompt_tokens": 7, "completion_tokens": 3},
+                    )
+                ]
+            ),
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=None,
+        )
+        record = session_record(metrics)
+        self.assertEqual(json.loads(json.dumps(record)), record)
+        self.assertEqual(record["turns"], 1)
+        self.assertEqual(record["prompt_tokens"], 7)
+        self.assertEqual(record["rounds"], 1)
+        self.assertEqual(record["stop_reason"], STOP_ANSWERED)
+
+    def test_merging_sums_the_bill_and_counts_the_rounds(self) -> None:
+        a = {
+            "turns": 10,
+            "tool_calls": 5,
+            "prompt_tokens": 900,
+            "rounds": 1,
+            "stop_reason": STOP_ANSWERED,
+            "distinct_paths": 3,
+            "seconds": 1.5,
+        }
+        b = {
+            "turns": 7,
+            "tool_calls": 9,
+            "prompt_tokens": 1_200,
+            "rounds": 1,
+            "stop_reason": STOP_INPUT_TOKEN_CAP,
+            "distinct_paths": 8,
+            "seconds": 2.0,
+        }
+        merged = merge_session_records(a, b)
+        self.assertEqual(merged["turns"], 17)
+        self.assertEqual(merged["prompt_tokens"], 2_100)
+        self.assertEqual(merged["rounds"], 2)
+        self.assertEqual(merged["seconds"], 3.5)
+        # One cut-off round is what starves the patch that gets published, so a
+        # guard anywhere in the job is what the job reports.
+        self.assertEqual(merged["stop_reason"], STOP_INPUT_TOKEN_CAP)
+        # Paths cannot be summed without double-counting a file two rounds both
+        # opened; the larger round is the honest bound.
+        self.assertEqual(merged["distinct_paths"], 8)
+
+    def test_merging_an_accumulation_keeps_its_round_count(self) -> None:
+        already = {"turns": 4, "rounds": 3, "stop_reason": STOP_ANSWERED}
+        self.assertEqual(merge_session_records({}, already)["rounds"], 3)
+        self.assertEqual(
+            merge_session_records({"turns": 1, "rounds": 2}, already)["rounds"], 5
+        )
+
+    def test_a_zero_round_record_is_not_read_as_one(self) -> None:
+        """`rounds: 0` is a real value — a job that never reached the loop — so
+        the arithmetic must not fall back to 1 and invent a loop."""
+        never_ran = no_llm_session_record()
+        self.assertEqual(merge_session_records({}, never_ran)["rounds"], 0)
+        one_loop = {"turns": 5, "rounds": 1, "stop_reason": STOP_ANSWERED}
+        self.assertEqual(merge_session_records(never_ran, one_loop)["rounds"], 1)
+        self.assertEqual(merge_session_records(one_loop, never_ran)["rounds"], 1)
+
+    def test_a_record_without_a_rounds_key_counts_as_one_loop(self) -> None:
+        """Missing is not zero: a session record written before `rounds` existed
+        still describes exactly one loop."""
+        legacy = {"turns": 5, "stop_reason": STOP_ANSWERED}
+        self.assertEqual(merge_session_records({}, legacy)["rounds"], 1)
+        self.assertEqual(merge_session_records(legacy, dict(legacy))["rounds"], 2)
+
+    def test_merging_nothing_changes_nothing(self) -> None:
+        a = {"turns": 3, "rounds": 1}
+        self.assertEqual(merge_session_records(a, None), a)
+        self.assertEqual(merge_session_records(a, {}), a)
+        self.assertEqual(merge_session_records(None, None), {})
+
+    def test_a_job_that_never_ran_the_loop_still_reports(self) -> None:
+        """Reproduce-first classifying a group ENVIRONMENT is 0 LLM turns, and
+        that has to be countable — otherwise it is indistinguishable from serge
+        never having been asked."""
+        record = no_llm_session_record()
+        self.assertEqual(record["rounds"], 0)
+        self.assertEqual(record["turns"], 0)
+        self.assertEqual(record["stop_reason"], STOP_NO_LLM_TURNS)

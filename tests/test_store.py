@@ -247,3 +247,263 @@ class JobStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionRecordPersistenceTests(unittest.TestCase):
+    """The per-job agent-loop counters, and the rolling window over them.
+
+    Point of the whole thing: the job row itself is pruned after
+    ``WEB_JOB_RETENTION`` jobs, so these counters are only useful if something
+    scrapes them out before that. :meth:`JobStore.list_sessions` is what
+    ``GET /metrics`` reads.
+    """
+
+    def _store_with_job(self, tmp: str, job_id: str = "j1", **kw) -> JobStore:
+        store = JobStore(os.path.join(tmp, "jobs.db"))
+        store.insert_job(
+            id=job_id,
+            user="alice",
+            target_owner="huggingface",
+            target_repo="transformers",
+            target_number=48322,
+            trigger_comment="x",
+            llm_provider="hf",
+            llm_api_base="https://router.huggingface.co",
+            llm_model="kimi-k2",
+            created_at=kw.pop("created_at", 1.0),
+            status="running",
+            kind=kw.pop("kind", "task"),
+        )
+        return store
+
+    SESSION = {
+        "turns": 46,
+        "tool_calls": 48,
+        "prompt_tokens": 2_111_885,
+        "stop_reason": "input_token_cap",
+        "path_revisits": 14,
+        "rounds": 1,
+    }
+
+    def test_round_trips_through_the_job_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store_with_job(tmp)
+            store.save_terminal(
+                "j1",
+                status="published",
+                error=None,
+                raw_llm_output=None,
+                draft=None,
+                history=[],
+                session=self.SESSION,
+            )
+            row = store.load("j1")
+            assert row is not None
+            self.assertEqual(row["session"], self.SESSION)
+
+    def test_the_review_path_takes_it_off_the_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store_with_job(tmp, kind="review")
+            draft = ReviewDraft(
+                owner="o",
+                repo="r",
+                number=1,
+                head_sha="abc",
+                summary="s",
+                event="COMMENT",
+                session=self.SESSION,
+            )
+            store.save_terminal(
+                "j1",
+                status="done",
+                error=None,
+                raw_llm_output=None,
+                draft=draft,
+                history=[],
+            )
+            row = store.load("j1")
+            assert row is not None
+            self.assertEqual(row["session"]["turns"], 46)
+
+    def test_a_later_write_without_a_session_does_not_erase_one(self) -> None:
+        """Publishing from the UI re-saves the terminal row; the counters were
+        recorded when the loop finished and must survive that."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store_with_job(tmp)
+            store.save_terminal(
+                "j1",
+                status="done",
+                error=None,
+                raw_llm_output=None,
+                draft=None,
+                history=[],
+                session=self.SESSION,
+            )
+            store.save_terminal(
+                "j1",
+                status="published",
+                error=None,
+                raw_llm_output=None,
+                draft=None,
+                history=[],
+            )
+            row = store.load("j1")
+            assert row is not None
+            self.assertEqual(row["session"], self.SESSION)
+            self.assertEqual(row["status"], "published")
+
+    def test_a_job_with_no_session_reads_as_empty_not_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store_with_job(tmp)
+            row = store.load("j1")
+            assert row is not None
+            self.assertEqual(row["session"], {})
+
+    def test_list_sessions_skips_running_and_session_less_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store_with_job(tmp, "done1", created_at=1.0)
+            store.insert_job(
+                id="running1",
+                user="a",
+                target_owner="o",
+                target_repo="r",
+                target_number=2,
+                trigger_comment="x",
+                llm_provider="hf",
+                llm_api_base="b",
+                llm_model="m",
+                created_at=2.0,
+                status="running",
+            )
+            store.insert_job(
+                id="nosession",
+                user="a",
+                target_owner="o",
+                target_repo="r",
+                target_number=3,
+                trigger_comment="x",
+                llm_provider="hf",
+                llm_api_base="b",
+                llm_model="m",
+                created_at=3.0,
+                status="error",
+            )
+            store.save_terminal(
+                "done1",
+                status="published",
+                error=None,
+                raw_llm_output=None,
+                draft=None,
+                history=[],
+                session=self.SESSION,
+            )
+            # A running job that already recorded a partial session must still be
+            # excluded: its counters are still moving.
+            store._conn.execute(
+                "UPDATE jobs SET session_json = ? WHERE id = ?",
+                (json.dumps(self.SESSION), "running1"),
+            )
+            store._conn.commit()
+
+            rows = store.list_sessions()
+            self.assertEqual([r["id"] for r in rows], ["done1"])
+            self.assertEqual(rows[0]["session"]["turns"], 46)
+
+    def test_list_sessions_lifts_the_pr_and_verdict_out_of_the_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store_with_job(tmp)
+            store.save_task_result(
+                "j1",
+                json.dumps({"pr_number": 48322, "verify_verdict": "fixed"}),
+            )
+            store.save_terminal(
+                "j1",
+                status="published",
+                error=None,
+                raw_llm_output=None,
+                draft=None,
+                history=[],
+                session=self.SESSION,
+            )
+            row = store.list_sessions()[0]
+            self.assertEqual(row["pr_number"], 48322)
+            self.assertEqual(row["verify_verdict"], "fixed")
+
+    def test_a_malformed_session_does_not_break_the_scrape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store_with_job(tmp)
+            store.save_terminal(
+                "j1",
+                status="error",
+                error="boom",
+                raw_llm_output=None,
+                draft=None,
+                history=[],
+                session=self.SESSION,
+            )
+            store._conn.execute(
+                "UPDATE jobs SET session_json = ? WHERE id = ?", ("{not json", "j1")
+            )
+            store._conn.commit()
+            self.assertEqual(store.list_sessions()[0]["session"], {})
+            row = store.load("j1")
+            assert row is not None
+            self.assertEqual(row["session"], {})
+
+    def test_the_window_is_newest_first_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = JobStore(os.path.join(tmp, "jobs.db"))
+            for i in range(5):
+                store.insert_job(
+                    id=f"j{i}",
+                    user="a",
+                    target_owner="o",
+                    target_repo="r",
+                    target_number=i,
+                    trigger_comment="x",
+                    llm_provider="hf",
+                    llm_api_base="b",
+                    llm_model="m",
+                    created_at=float(i),
+                    status="running",
+                )
+                store.save_terminal(
+                    f"j{i}",
+                    status="done",
+                    error=None,
+                    raw_llm_output=None,
+                    draft=None,
+                    history=[],
+                    session={"turns": i},
+                )
+            self.assertEqual(
+                [r["id"] for r in store.list_sessions(limit=3)], ["j4", "j3", "j2"]
+            )
+
+    def test_an_old_database_gains_the_column(self) -> None:
+        """The column is added by _ensure_column, not by recreating the table."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "jobs.db")
+            legacy = sqlite3.connect(path)
+            legacy.execute(
+                """
+                CREATE TABLE jobs (
+                    id TEXT PRIMARY KEY, user TEXT NOT NULL,
+                    target_owner TEXT NOT NULL, target_repo TEXT NOT NULL,
+                    target_number INTEGER NOT NULL, trigger_comment TEXT NOT NULL,
+                    created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                    status TEXT NOT NULL
+                )
+                """
+            )
+            legacy.execute(
+                "INSERT INTO jobs VALUES ('old', 'a', 'o', 'r', 1, 'x', 1.0, 1.0, 'done')"
+            )
+            legacy.commit()
+            legacy.close()
+
+            store = JobStore(path)
+            row = store.load("old")
+            assert row is not None
+            self.assertEqual(row["session"], {})
+            self.assertEqual(store.list_sessions(), [])

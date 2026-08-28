@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-job agent-loop metrics, exported for Prometheus at `GET /metrics`
+  (unauthenticated, like `/healthz`; scraped in-cluster over the pod port).
+  Every finished job now records how many turns and tool calls it ran, what it
+  spent, how many of its tool calls re-opened a path it had already read, and —
+  the one that reorders the rest — **which guard ended the session**, with
+  `answered` meaning the model finished on its own terms and every other value
+  meaning it did not. The exposition is a rolling window over the jobs the store
+  still holds (`WEB_JOB_RETENTION`, 25); Prometheus is the durable side, so read
+  history with a range query rather than by curling the endpoint. The same
+  record is returned on `GET /tasks/{owner}/{repo}/{id}/status`, so a dispatcher
+  can say *why* a group came back `no_fix`.
+
 - GitHub App mode is documented as the zero-config default: installed repos need
   no workflow file or secret, with instructions for overriding gating via an
   explicit workflow and a note on the forked-PR limitation.

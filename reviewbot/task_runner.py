@@ -160,9 +160,14 @@ class CallbackEmitter:
         result: Optional[dict[str, Any]] = None,
         error: Optional[str] = None,
         raw_llm_output: Optional[str] = None,
+        session: Optional[dict[str, Any]] = None,
     ) -> None:
         """Send the terminal outcome. serge records ``status`` on the job and
-        stores ``result`` / ``error`` / ``raw_llm_output``."""
+        stores ``result`` / ``error`` / ``raw_llm_output``.
+
+        ``session`` rides alongside on the failure paths, where there is no
+        ``result`` to carry the agent-loop counters — an errored session is
+        exactly one worth counting, so it must not report nothing."""
         self._seq += 1
         log.info("terminal status=%s error=%s", status, (error or "")[:200])
         self._post(
@@ -174,6 +179,7 @@ class CallbackEmitter:
                     "result": result,
                     "error": error,
                     "raw_llm_output": raw_llm_output,
+                    "session": session or {},
                 },
                 "ts": time.time(),
             }
@@ -416,9 +422,14 @@ def run(spec: RunnerSpec) -> int:
         return 0
     except TaskError as exc:
         log.warning("task %s rejected: %s", spec.job_id, exc)
-        return _fail(emitter, str(exc))
+        return _fail(emitter, str(exc), session=getattr(exc, "session", None))
     except _UnparseableLLMOutput as exc:
-        return _fail(emitter, exc.user_message(), raw_llm_output=exc.content)
+        return _fail(
+            emitter,
+            exc.user_message(),
+            raw_llm_output=exc.content,
+            session=getattr(exc, "session", None),
+        )
     except LLMResponseError as exc:
         log.warning(
             "LLM endpoint returned %d for task %s", exc.status_code, spec.job_id
@@ -436,12 +447,18 @@ def run(spec: RunnerSpec) -> int:
 
 
 def _fail(
-    emitter: CallbackEmitter, message: str, *, raw_llm_output: Optional[str] = None
+    emitter: CallbackEmitter,
+    message: str,
+    *,
+    raw_llm_output: Optional[str] = None,
+    session: Optional[dict[str, Any]] = None,
 ) -> int:
     emitter.emit("step", "error")
     emitter.emit("error", message)
     emitter.emit("done", "")
-    emitter.finish("error", error=message, raw_llm_output=raw_llm_output)
+    emitter.finish(
+        "error", error=message, raw_llm_output=raw_llm_output, session=session
+    )
     return 1
 
 

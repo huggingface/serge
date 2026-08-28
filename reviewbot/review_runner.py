@@ -105,12 +105,16 @@ def run(spec: RunnerSpec) -> int:
             return 0
 
         # Ship the draft (serge rebuilds it via store.decode_draft) plus the
-        # token counts, which the draft payload doesn't carry.
+        # token counts and the agent-loop session, neither of which the draft
+        # payload carries. Prod runs reviews in per-review pods, so this is the
+        # only route the session has: without it every review would persist a
+        # zeroed "never ran the loop" record despite having run one.
         result = {
             "draft": encode_draft(draft),
             "prompt_tokens": draft.prompt_tokens,
             "completion_tokens": draft.completion_tokens,
             "truncated_chunks": draft.truncated_chunks,
+            "session": draft.session,
         }
         emitter.finish("done", result=result)
         return 0
@@ -120,6 +124,7 @@ def run(spec: RunnerSpec) -> int:
             "error",
             error="the model returned an unparseable review",
             raw_llm_output=getattr(exc, "content", None),
+            session=getattr(exc, "session", None),
         )
         return 1
     except LLMResponseError as exc:

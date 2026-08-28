@@ -57,7 +57,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- For tasks: the outcome ({pr_number, branch, url}) once published.
     result_json     TEXT,
     prompt_tokens   INTEGER,
-    completion_tokens INTEGER
+    completion_tokens INTEGER,
+    -- Per-job agent-loop counters (reviewer.session_record) as JSON: turns,
+    -- tool calls, re-opened paths, and which guard ended the loop. Written at
+    -- finish; see GET /metrics, which is what carries these past the 25-job
+    -- retention and into Prometheus.
+    session_json    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
@@ -139,6 +144,7 @@ class JobStore:
             self._ensure_column("kind", "TEXT NOT NULL DEFAULT 'review'")
             self._ensure_column("task_spec_json", "TEXT")
             self._ensure_column("result_json", "TEXT")
+            self._ensure_column("session_json", "TEXT")
             self._ensure_column(
                 "task_write_enabled",
                 "INTEGER NOT NULL DEFAULT 0",
@@ -226,6 +232,7 @@ class JobStore:
         raw_llm_output: Optional[str],
         draft: Optional[ReviewDraft],
         history: list[dict[str, Any]],
+        session: Optional[dict[str, Any]] = None,
     ) -> None:
         """Persist the final state of a job (done/error/published/discarded)
         along with its filtered event history and the resulting draft, if any.
@@ -233,20 +240,30 @@ class JobStore:
         Token counts come from the draft when available; otherwise (error
         path with no draft) we fall back to the latest ``metrics`` event in
         the history so the journal still reports what was consumed before
-        the failure."""
+        the failure.
+
+        ``session`` is the agent-loop record (reviewer.session_record). Passed
+        explicitly on the task path; falls back to the draft's carrier field on
+        the review path. Absent on jobs that never reached the LLM."""
         filtered = [e for e in history if e.get("kind") in PERSIST_EVENT_KINDS]
         if draft is not None:
             prompt_tokens: Optional[int] = draft.prompt_tokens or None
             completion_tokens: Optional[int] = draft.completion_tokens or None
         else:
             prompt_tokens, completion_tokens = _latest_token_counts(history)
+        if not session and draft is not None:
+            session = draft.session
+        session_json = (
+            json.dumps(session, ensure_ascii=False, sort_keys=True) if session else None
+        )
         with self._lock:
             self._conn.execute(
                 """
                 UPDATE jobs
                    SET status = ?, error = ?, raw_llm_output = ?,
                        draft_json = ?, history_json = ?, updated_at = ?,
-                       prompt_tokens = ?, completion_tokens = ?
+                       prompt_tokens = ?, completion_tokens = ?,
+                       session_json = COALESCE(?, session_json)
                  WHERE id = ?
                 """,
                 (
@@ -258,6 +275,7 @@ class JobStore:
                     time.time(),
                     prompt_tokens,
                     completion_tokens,
+                    session_json,
                     job_id,
                 ),
             )
@@ -705,6 +723,39 @@ class JobStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_sessions(self, limit: int = 500) -> list[dict[str, Any]]:
+        """Finished jobs that recorded an agent-loop session, newest first.
+
+        The source for ``GET /metrics``. Deliberately a rolling window over
+        whatever the store still holds (``WEB_JOB_RETENTION``, 25 by default):
+        Prometheus is the durable side of this, and a series that stops being
+        exported simply goes stale while its samples stay queryable. Running
+        jobs are excluded — their counters are still moving."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, target_owner, target_repo, target_number,
+                       status, kind, llm_model, created_at, updated_at,
+                       result_json, session_json
+                  FROM jobs
+                 WHERE session_json IS NOT NULL
+                   AND status != 'running'
+                 ORDER BY created_at DESC
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            d = dict(row)
+            d["session"] = _decode_session(d.pop("session_json", None))
+            result_raw = d.pop("result_json", None)
+            result = _decode_session(result_raw)
+            d["pr_number"] = result.get("pr_number")
+            d["verify_verdict"] = result.get("verify_verdict")
+            out.append(d)
+        return out
+
 
 # ---------------------------------------------------------------------------
 # (de)serialization helpers
@@ -794,6 +845,19 @@ def decode_draft(s: Optional[str]) -> Optional[ReviewDraft]:
     )
 
 
+def _decode_session(raw: Any) -> dict[str, Any]:
+    """Parse a stored ``session_json``. A malformed or missing record reads as
+    ``{}`` — a job that never reached the LLM legitimately has none, and the
+    metrics endpoint must not fall over on one bad row."""
+    if not isinstance(raw, str) or not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _decode_provider_config(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     d["task_write_enabled"] = bool(d.get("task_write_enabled"))
@@ -812,6 +876,8 @@ def _decode_provider_config(row: sqlite3.Row) -> dict[str, Any]:
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
+    session_raw = d.pop("session_json", None)
+    d["session"] = _decode_session(session_raw)
     history_raw = d.pop("history_json", None)
     if history_raw:
         try:
