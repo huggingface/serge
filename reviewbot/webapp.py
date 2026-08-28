@@ -883,6 +883,24 @@ def _push_event(job: Job, kind: str, text: str) -> None:
         job.loop.call_soon_threadsafe(job.queue.put_nowait, event)
 
 
+def _session_with_outcome(job: Job) -> dict[str, Any]:
+    """The job's session record, stamped with the status it finished on.
+
+    Every label the metrics endpoint exports has to be immutable for the life of
+    a job, or the same job forks into a second Prometheus series and shows up
+    twice in any table over a window that straddles the change. Status is the one
+    that moves: a review is ``done`` until a human publishes it, and then it is
+    ``published``. Freezing it here — the store's session write is first-wins —
+    keeps the exported label stable, and it is the more honest reading anyway:
+    the session ended when the loop did, not when someone clicked publish."""
+    session = job.session or no_llm_session_record()
+    # Stamped onto the Job, not a copy: _persist_terminal runs again when a human
+    # publishes a draft, and re-stamping there would move the label after all.
+    session.setdefault("outcome", job.status)
+    job.session = session
+    return session
+
+
 def _persist_terminal(job: Job) -> None:
     """Snapshot a finished job into the store so it survives a restart."""
     with job.history_lock:
@@ -895,7 +913,7 @@ def _persist_terminal(job: Job) -> None:
             raw_llm_output=job.raw_llm_output,
             draft=job.draft,
             history=history_copy,
-            session=job.session or no_llm_session_record(),
+            session=_session_with_outcome(job),
         )
         if job.published_draft is not None:
             _store.save_published_review(
@@ -3521,6 +3539,7 @@ def _load_job_from_store(job_id: str) -> Optional[Job]:
     )
     job.task_spec = _safe_json_obj(row.get("task_spec_json"))
     job.task_result = _safe_json_obj(row.get("result_json"))
+    job.session = dict(row.get("session") or {})
     job.history = list(row.get("history") or [])
     return job
 

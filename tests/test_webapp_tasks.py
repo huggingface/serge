@@ -573,6 +573,25 @@ class WebappTasksTests(unittest.TestCase):
         self.assertEqual(job.session["stop_reason"], "repeat_guard")
         self.assertEqual(job.session["turns"], 27)
 
+    def test_the_persisted_session_freezes_the_outcome(self):
+        """The exported status label must not move after the session ended."""
+        webapp = self._import_webapp()
+        result = webapp.TaskResult(
+            mode="new_pr", pr_number=7, no_change=False, session={"turns": 3}
+        )
+        job = self._run_task_worker_with(webapp, result, persist=True)
+        row = webapp._store.load(job.id)
+        assert row is not None
+        self.assertEqual(row["session"]["outcome"], "published")
+        # _persist_terminal runs again when a human publishes a draft; the
+        # outcome recorded at the end of the session must not follow.
+        job.status = "discarded"
+        webapp._persist_terminal(job)
+        row = webapp._store.load(job.id)
+        assert row is not None
+        self.assertEqual(row["status"], "discarded")
+        self.assertEqual(row["session"]["outcome"], "published")
+
     def test_a_job_that_never_ran_the_loop_persists_a_zeroed_session(self):
         """Reproduce-first classifying a group ENVIRONMENT costs 0 LLM turns.
         Recording nothing would make it indistinguishable from a job that was

@@ -121,6 +121,11 @@ The label that matters most is `stop_reason` on `serge_job_info`:
 | `chunk_input_token_cap` | a chunked review skipped chunks it could not afford |
 | `no_llm_turns` | the job finished (or failed) without ever running the loop — e.g. reproduce-first classified the group ENVIRONMENT |
 
+Every label on `serge_job_info` is immutable for the life of a job — `status` is
+the session's outcome frozen when the loop ended, not the row's live status, so a
+review a human later publishes does not fork into a second series and double its
+row in a table.
+
 Identity lives on `serge_job_info` alone (always `1`) and the numeric series are
 keyed by `job_id` only, so a job's numbers don't fork into a new series when its
 status changes. Join them back with `on(job_id) group_left(...)`:

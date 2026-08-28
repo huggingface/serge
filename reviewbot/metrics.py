@@ -167,7 +167,10 @@ def render_job_metrics(
                     ("kind", row.get("kind") or "review"),
                     ("repo", f"{owner}/{repo}" if owner or repo else ""),
                     ("number", row.get("target_number")),
-                    ("status", row.get("status") or ""),
+                    # The session's own frozen outcome, not the row's live
+                    # status: a review that a human later publishes must not
+                    # fork into a second series. See _session_with_outcome.
+                    ("status", session.get("outcome") or row.get("status") or ""),
                     ("model", row.get("llm_model") or "none"),
                     # "answered" is the only value meaning the model decided it
                     # was done; every other value is a guard ending the session.

@@ -149,6 +149,18 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(len(body.strip().splitlines()), len(body.strip().split("\n")))
         self.assertEqual(len(_samples(body, "serge_job_info")), 1)
 
+    def test_the_frozen_outcome_wins_over_the_live_row_status(self) -> None:
+        """A review is `done` until a human publishes it. If the exported label
+        followed the row, the same job would fork into a second series and show
+        up twice in any table over a window that straddles the publish."""
+        session = dict(_row("a")["session"], outcome="done")
+        body = render_job_metrics([_row("a", status="published", session=session)])
+        self.assertIn('status="done"', _samples(body, "serge_job_info")[0])
+
+    def test_a_session_predating_the_outcome_stamp_falls_back_to_the_row(self) -> None:
+        body = render_job_metrics([_row("a", status="no_fix")])
+        self.assertIn('status="no_fix"', _samples(body, "serge_job_info")[0])
+
     def test_unknown_stop_reason_is_labelled_not_dropped(self) -> None:
         body = render_job_metrics([_row("a", session={"turns": 1})])
         self.assertIn('stop_reason="unknown"', _samples(body, "serge_job_info")[0])
