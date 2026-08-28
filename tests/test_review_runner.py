@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 
 from reviewbot import review_runner
-from reviewbot.reviewer import ReviewDraft, ReviewRequest
+from reviewbot.reviewer import ReviewDraft, ReviewRequest, _UnparseableLLMOutput
 from reviewbot.store import decode_draft
 from reviewbot.task_runner import RunnerSpec
 
@@ -53,12 +53,15 @@ class _RecordingEmitter:
     def emit(self, kind, text):
         self.events.append((kind, text))
 
-    def finish(self, status, *, result=None, error=None, raw_llm_output=None):
+    def finish(
+        self, status, *, result=None, error=None, raw_llm_output=None, session=None
+    ):
         self.terminal = {
             "status": status,
             "result": result,
             "error": error,
             "raw_llm_output": raw_llm_output,
+            "session": session,
         }
 
 
@@ -133,11 +136,54 @@ class ReviewRunnerTests(unittest.TestCase):
         self.assertEqual(rebuilt.summary, "looks good")
         self.assertEqual(rebuilt.head_sha, "deadbeef")
 
+    def test_run_ships_the_agent_loop_session(self):
+        """Prod runs reviews in per-review pods, so this callback is the session's
+        only route home. Without it every review persists a zeroed "never ran the
+        loop" record while having run one — worse than missing data."""
+        session = {
+            "turns": 12,
+            "tool_calls": 20,
+            "prompt_tokens": 480_000,
+            "stop_reason": "repeat_guard",
+            "path_revisits": 9,
+            "rounds": 1,
+        }
+        draft = ReviewDraft(
+            owner="acme",
+            repo="widgets",
+            number=7,
+            head_sha="deadbeef",
+            summary="looks good",
+            event="COMMENT",
+            comments=[],
+            prompt_tokens=100,
+            completion_tokens=42,
+            session=session,
+        )
+        code, emitter = self._run(prepare_return=draft)
+        self.assertEqual(code, 0)
+        self.assertEqual(emitter.terminal["result"]["session"], session)
+        # It travels beside the draft, not inside it — decode_draft does not
+        # carry carrier fields, so a caller must read the top-level key.
+        self.assertEqual(decode_draft(emitter.terminal["result"]["draft"]).session, {})
+
     def test_run_no_reviewable_diff(self):
         code, emitter = self._run(prepare_return=None)
         self.assertEqual(code, 0)
         self.assertEqual(emitter.terminal["status"], "done")
         self.assertIsNone(emitter.terminal["result"])
+
+    def test_unparseable_output_still_reports_what_it_spent(self):
+        exc = _UnparseableLLMOutput(
+            content="not json",
+            finish_reason="length",
+            metrics_line="",
+            session={"turns": 31, "stop_reason": "input_token_cap", "rounds": 1},
+        )
+        code, emitter = self._run(prepare_side_effect=exc)
+        self.assertEqual(code, 1)
+        self.assertEqual(emitter.terminal["status"], "error")
+        self.assertEqual(emitter.terminal["session"]["stop_reason"], "input_token_cap")
 
     def test_run_reports_error_on_crash(self):
         code, emitter = self._run(prepare_side_effect=RuntimeError("boom"))

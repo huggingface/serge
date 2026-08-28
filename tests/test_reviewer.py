@@ -1184,6 +1184,22 @@ class SessionRecordTests(unittest.TestCase):
             merge_session_records({"turns": 1, "rounds": 2}, already)["rounds"], 5
         )
 
+    def test_a_zero_round_record_is_not_read_as_one(self) -> None:
+        """`rounds: 0` is a real value — a job that never reached the loop — so
+        the arithmetic must not fall back to 1 and invent a loop."""
+        never_ran = no_llm_session_record()
+        self.assertEqual(merge_session_records({}, never_ran)["rounds"], 0)
+        one_loop = {"turns": 5, "rounds": 1, "stop_reason": STOP_ANSWERED}
+        self.assertEqual(merge_session_records(never_ran, one_loop)["rounds"], 1)
+        self.assertEqual(merge_session_records(one_loop, never_ran)["rounds"], 1)
+
+    def test_a_record_without_a_rounds_key_counts_as_one_loop(self) -> None:
+        """Missing is not zero: a session record written before `rounds` existed
+        still describes exactly one loop."""
+        legacy = {"turns": 5, "stop_reason": STOP_ANSWERED}
+        self.assertEqual(merge_session_records({}, legacy)["rounds"], 1)
+        self.assertEqual(merge_session_records(legacy, dict(legacy))["rounds"], 2)
+
     def test_merging_nothing_changes_nothing(self) -> None:
         a = {"turns": 3, "rounds": 1}
         self.assertEqual(merge_session_records(a, None), a)

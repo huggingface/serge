@@ -573,6 +573,25 @@ class WebappTasksTests(unittest.TestCase):
         self.assertEqual(job.session["stop_reason"], "repeat_guard")
         self.assertEqual(job.session["turns"], 27)
 
+    def test_unparseable_task_output_keeps_the_session(self):
+        """Three of ten tasks in the measured window ended here — the sessions
+        whose counters matter most."""
+        webapp = self._import_webapp()
+        exc = webapp._UnparseableLLMOutput(
+            content="not json",
+            finish_reason=None,
+            metrics_line="",
+            session={"turns": 76, "stop_reason": "input_token_cap", "rounds": 1},
+        )
+
+        def _raise(*a, **k):
+            raise exc
+
+        job = self._run_task_worker_with(webapp, None, side_effect=_raise)
+        self.assertEqual(job.status, "error")
+        self.assertEqual(job.session["stop_reason"], "input_token_cap")
+        self.assertEqual(job.session["turns"], 76)
+
     def test_the_persisted_session_freezes_the_outcome(self):
         """The exported status label must not move after the session ended."""
         webapp = self._import_webapp()
@@ -1105,6 +1124,74 @@ class TaskLauncherTests(unittest.TestCase):
         self.assertEqual(job.draft.summary, "looks fine")
         self.assertEqual(job.draft.prompt_tokens, 100)
         self.assertEqual(job.draft.completion_tokens, 25)
+
+    def test_review_callback_lands_the_session_on_the_job(self):
+        """The pod ships the session beside the draft (decode_draft does not carry
+        carrier fields). Persisting a review without it would record `no_llm_turns`
+        for a job that ran the loop — prod runs reviews in pods, so this is the
+        only route."""
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        job = self._review_job(webapp)
+        draft = webapp.decode_draft(
+            '{"owner":"acme","repo":"widgets","number":7,"head_sha":"abc",'
+            '"summary":"looks fine","event":"COMMENT","comments":[]}'
+        )
+        from reviewbot.store import encode_draft
+
+        session = {"turns": 12, "stop_reason": "repeat_guard", "rounds": 1}
+        with (
+            patch.object(webapp, "_persist_terminal"),
+            patch.object(webapp, "_notify_task_finished"),
+        ):
+            r = TestClient(webapp.app).post(
+                f"/internal/tasks/{job.id}/events",
+                json={
+                    "terminal": {
+                        "status": "done",
+                        "result": {
+                            "draft": encode_draft(draft),
+                            "prompt_tokens": 100,
+                            "completion_tokens": 25,
+                            "session": session,
+                        },
+                    }
+                },
+                headers={"Authorization": "Bearer cbtok"},
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(job.session, session)
+        self.assertEqual(job.draft.session, session)
+
+    def test_an_errored_runner_reports_its_session_beside_the_error(self):
+        """A failed pod has no `result` to hang counters off."""
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        job = self._review_job(webapp)
+        with (
+            patch.object(webapp, "_persist_terminal"),
+            patch.object(webapp, "_notify_task_finished"),
+        ):
+            r = TestClient(webapp.app).post(
+                f"/internal/tasks/{job.id}/events",
+                json={
+                    "terminal": {
+                        "status": "error",
+                        "error": "the model returned an unparseable review",
+                        "session": {
+                            "turns": 31,
+                            "stop_reason": "input_token_cap",
+                            "rounds": 1,
+                        },
+                    }
+                },
+                headers={"Authorization": "Bearer cbtok"},
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(job.session["stop_reason"], "input_token_cap")
+        self.assertEqual(job.session["turns"], 31)
 
     def _webhook_review_job(self, webapp):
         job = self._review_job(webapp)

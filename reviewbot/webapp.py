@@ -1298,6 +1298,9 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         emit("error", job.error)
         emit("done", "")
     except _UnparseableLLMOutput as exc:
+        # Three of ten tasks in the measured window died here; these are the
+        # sessions whose counters matter most, so keep what the loop spent.
+        job.session = merge_session_records(job.session, getattr(exc, "session", None))
         job.status = "error"
         job.raw_llm_output = exc.content
         job.error = exc.user_message()
@@ -3271,7 +3274,11 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
                     draft.prompt_tokens = int(result.get("prompt_tokens") or 0)
                     draft.completion_tokens = int(result.get("completion_tokens") or 0)
                     draft.truncated_chunks = int(result.get("truncated_chunks") or 0)
-                    draft.session = result.get("session") or {}
+                    # Only when the runner actually sent one: an older runner
+                    # image omits the key, and blanking the draft's own record
+                    # would persist "never ran the loop" for a review that did.
+                    if result.get("session"):
+                        draft.session = result["session"]
                     job.session = draft.session
                 job.draft = draft
         elif isinstance(result, dict):

@@ -571,6 +571,16 @@ _SESSION_SUMS = (
 )
 
 
+def _rounds(record: dict[str, Any]) -> int:
+    """A record's loop count, defaulting to one.
+
+    Not ``or 1``: ``rounds: 0`` is a real value — a job that never reached the
+    agent loop — and reading it as 1 would invent a loop that never ran.
+    """
+    value = record.get("rounds")
+    return 1 if value is None else int(value)
+
+
 def merge_session_records(
     total: Optional[dict[str, Any]], part: Optional[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -588,7 +598,7 @@ def merge_session_records(
         merged = dict(part)
         # ``part`` may itself already be an accumulation (a candidate that ran
         # several verify rounds); don't reset its count to one.
-        merged.setdefault("rounds", 1)
+        merged["rounds"] = _rounds(part)
         return merged
     merged = dict(total)
     for key in _SESSION_SUMS:
@@ -602,9 +612,7 @@ def merge_session_records(
         int(merged.get("distinct_paths", 0) or 0),
         int(part.get("distinct_paths", 0) or 0),
     )
-    merged["rounds"] = int(merged.get("rounds", 1) or 1) + int(
-        part.get("rounds", 1) or 1
-    )
+    merged["rounds"] = _rounds(merged) + _rounds(part)
     if part.get("stop_reason", STOP_ANSWERED) != STOP_ANSWERED:
         merged["stop_reason"] = part["stop_reason"]
     return merged
