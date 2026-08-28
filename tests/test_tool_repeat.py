@@ -7,7 +7,12 @@ fix, and produced a patch that failed GPU verification — three rounds running.
 
 import unittest
 
-from reviewbot.tool_repeat import ToolRepeatGuard, normalize_arguments, path_argument
+from reviewbot.tool_repeat import (
+    ToolRepeatGuard,
+    normalize_arguments,
+    path_argument,
+    path_visit,
+)
 
 
 GREP_A = '{"pattern": "GlmOcrProcessor|Glm46VProcessor", "path": "src/transformers/models/glm_ocr", "max_results": 50}'
@@ -199,13 +204,29 @@ class PathVisitTests(unittest.TestCase):
         self.assertEqual(guard.distinct_paths, 10)
         self.assertEqual(guard.path_revisits, 0)
 
-    def test_counting_survives_a_disabled_guard(self):
-        """The nudge is configurable; the observability record is not."""
-        guard = ToolRepeatGuard(0)
+    def test_counting_survives_both_guards_being_disabled(self):
+        """The nudges are configurable; the observability record is not."""
+        guard = ToolRepeatGuard(0, path_revisit_limit=0, path_trip_after=0)
         for _ in range(5):
             self.assertIsNone(guard.observe("read_file", '{"path": "a.py"}'))
         self.assertEqual(guard.repeats, 0)
         self.assertEqual(guard.path_revisits, 4)
+        self.assertFalse(guard.tripped)
+
+    def test_the_two_allowances_are_independent(self):
+        """Turning off the exact-repeat guard must not turn off the path nudge:
+        they catch different failures and have separate budgets."""
+        guard = ToolRepeatGuard(0, path_revisit_limit=2)
+        self.assertFalse(guard.enabled)  # exact-repeat guard off
+        for _ in range(2):
+            self.assertIsNone(guard.observe("read_file", '{"path": "a.py"}'))
+        self.assertIsNotNone(guard.observe("read_file", '{"path": "a.py"}'))
+        # …and vice versa: the path nudge off leaves exact repeats caught.
+        guard = ToolRepeatGuard(2, path_revisit_limit=0)
+        guard.observe("read_file", '{"path": "a.py"}')
+        self.assertIn(
+            "already made this exact", guard.observe("read_file", '{"path": "a.py"}')
+        )
 
     def test_worst_paths_ranks_the_offenders(self):
         guard = ToolRepeatGuard(999)
@@ -226,6 +247,161 @@ class PathVisitTests(unittest.TestCase):
         self.assertEqual(
             guard.stats(),
             {"repeats": 1, "distinct_paths": 1, "path_revisits": 1},
+        )
+
+
+class PathNudgeTests(unittest.TestCase):
+    """The correction for re-opening a path, which the exact-match nudge misses."""
+
+    FILE = "src/transformers/models/blt/modular_blt.py"
+
+    def _read(self, guard, start=None, end=None, path=None):
+        args = {"path": path or self.FILE}
+        if start is not None:
+            args["start_line"] = start
+        if end is not None:
+            args["end_line"] = end
+        import json as _json
+
+        return guard.observe("read_file", _json.dumps(args))
+
+    def test_the_allowance_is_spent_before_nudging(self):
+        guard = ToolRepeatGuard(6, path_revisit_limit=3)
+        for i in range(3):
+            self.assertIsNone(self._read(guard, i * 100, i * 100 + 99))
+        self.assertIsNotNone(self._read(guard, 400, 500))
+
+    def test_the_nudge_names_the_file_and_what_was_already_served(self):
+        """ "You are repeating" is not actionable; "you already have lines
+        1-200, 180-420" is."""
+        guard = ToolRepeatGuard(6, path_revisit_limit=2)
+        self._read(guard, 1, 200)
+        self._read(guard, 180, 420)
+        note = self._read(guard, 400, 650)
+        self.assertIn(f"`{self.FILE}`", note)
+        self.assertIn("3 times", note)
+        self.assertIn("lines 1-200", note)
+        self.assertIn("lines 180-420", note)
+        # Not the range being served right now — that one is new to the model.
+        self.assertNotIn("lines 400-650", note)
+        self.assertIn("cannot tell you anything new", note)
+
+    def test_repeated_identical_ranges_are_described_once(self):
+        guard = ToolRepeatGuard(0, path_revisit_limit=1)
+        for _ in range(4):
+            note = self._read(guard, 1, 200)
+        self.assertEqual(note.count("lines 1-200"), 1)
+
+    def test_a_long_history_is_elided(self):
+        guard = ToolRepeatGuard(0, path_revisit_limit=1)
+        for i in range(9):
+            note = self._read(guard, i * 100, i * 100 + 50)
+        self.assertIn("…", note)
+        self.assertLessEqual(note.count("lines "), 5)
+
+    def test_a_whole_file_read_says_so(self):
+        guard = ToolRepeatGuard(0, path_revisit_limit=1)
+        self._read(guard)
+        self.assertIn("the whole file", self._read(guard))
+
+    def test_list_dir_is_phrased_as_listing(self):
+        guard = ToolRepeatGuard(0, path_revisit_limit=1)
+        guard.observe("list_dir", '{"path": "src/transformers"}')
+        note = guard.observe("list_dir", '{"path": "src/transformers"}')
+        self.assertIn("listed", note)
+        self.assertNotIn("Re-reading", note)
+        self.assertIn("Listing a directory", note)
+
+    def test_different_files_never_nudge(self):
+        """A genuine investigation opens many files once each."""
+        guard = ToolRepeatGuard(6, path_revisit_limit=3)
+        for i in range(40):
+            self.assertIsNone(self._read(guard, path=f"m{i}.py"))
+        self.assertFalse(guard.tripped)
+
+    def test_grep_is_not_a_revisit(self):
+        """Same path, different pattern is a new search, not a re-read."""
+        guard = ToolRepeatGuard(0, path_revisit_limit=1)
+        for pat in ("Alpha", "Beta", "Gamma", "Delta"):
+            note = guard.observe("grep", '{"pattern": "%s", "path": "src"}' % pat)
+            self.assertIsNone(note)
+        self.assertEqual(guard.path_revisits, 0)
+
+
+class PathTripTests(unittest.TestCase):
+    """The cut-off, which is a separate budget from the exact-repeat one."""
+
+    def test_the_prod_shape_is_cut_off(self):
+        """Task 9d210794: 153 calls, 137 of them re-opening an already-opened
+        path, `modular_blt.py` 53 times — and the exact-match counter saw none
+        of it because every read used a different line range."""
+        guard = ToolRepeatGuard(6, path_revisit_limit=3, path_trip_after=40)
+        served = 0
+        for i in range(153):
+            guard.observe(
+                "read_file",
+                '{"path": "modular_blt.py", "start_line": %d, "end_line": %d}'
+                % (i * 10, i * 10 + 200),
+            )
+            served += 1
+            if guard.tripped:
+                break
+        self.assertTrue(guard.tripped)
+        self.assertLess(served, 60)
+        # The exact-argument counter never fired — this is the whole point.
+        self.assertEqual(guard.repeats, 0)
+
+    def test_the_trip_note_tells_the_model_to_stop(self):
+        guard = ToolRepeatGuard(0, path_revisit_limit=1, path_trip_after=3)
+        for i in range(5):
+            note = guard.observe("read_file", '{"path": "a.py", "start_line": %d}' % i)
+        self.assertTrue(guard.tripped)
+        self.assertIn("no further tool calls will be answered", note)
+
+    def test_a_zero_trip_nudges_forever_without_cutting_off(self):
+        """The escape hatch: keep the correction, never end the session on it."""
+        guard = ToolRepeatGuard(0, path_revisit_limit=2, path_trip_after=0)
+        for i in range(100):
+            note = guard.observe("read_file", '{"path": "a.py", "start_line": %d}' % i)
+        self.assertIsNotNone(note)
+        self.assertFalse(guard.tripped)
+        self.assertEqual(guard.path_revisits, 99)
+
+    def test_the_two_trips_are_separate_budgets(self):
+        """A session can exhaust one without touching the other."""
+        guard = ToolRepeatGuard(3, path_revisit_limit=99, path_trip_after=99)
+        for _ in range(4):
+            guard.observe("grep", '{"pattern": "x"}')
+        self.assertTrue(guard.tripped)  # exact repeats only
+        self.assertEqual(guard.path_revisits, 0)
+
+
+class PathVisitRangeTests(unittest.TestCase):
+    def test_reports_path_and_range(self):
+        self.assertEqual(
+            path_visit("read_file", '{"path": "a.py", "start_line": 5, "end_line": 9}'),
+            ("a.py", "lines 5-9"),
+        )
+        self.assertEqual(
+            path_visit("read_file", '{"path": "a.py"}'), ("a.py", "the whole file")
+        )
+        self.assertEqual(
+            path_visit("read_file", '{"path": "a.py", "start_line": 5}'),
+            ("a.py", "from line 5"),
+        )
+        self.assertEqual(
+            path_visit("read_file", '{"path": "a.py", "end_line": 9}'),
+            ("a.py", "up to line 9"),
+        )
+        self.assertEqual(
+            path_visit("list_dir", '{"path": "src"}'), ("src", "the directory")
+        )
+        self.assertIsNone(path_visit("grep", '{"pattern": "x", "path": "src"}'))
+
+    def test_a_non_integer_range_does_not_break_the_label(self):
+        self.assertEqual(
+            path_visit("read_file", '{"path": "a.py", "start_line": "five"}'),
+            ("a.py", "the whole file"),
         )
 
 

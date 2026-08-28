@@ -491,6 +491,10 @@ class _AggregateMetrics:
 STOP_ANSWERED = "answered"
 STOP_INPUT_TOKEN_CAP = "input_token_cap"
 STOP_REPEAT_GUARD = "repeat_guard"
+# The path counter tripping, not the exact-argument one. Reported separately
+# because they mean different things: `repeat_guard` is a model stuck re-issuing
+# one call, `path_revisit_guard` is a model browsing the same files in circles.
+STOP_PATH_REVISIT_GUARD = "path_revisit_guard"
 STOP_BLIND_TURN_CAP = "blind_turn_cap"
 STOP_STRICT_TOOL_CAP = "strict_tool_cap"
 STOP_ABSOLUTE_CEILING = "absolute_ceiling"
@@ -1005,7 +1009,11 @@ def _run_agentic_loop(
     # Stops a model that has started re-issuing the *same* tool call from eating
     # the whole input-token budget on it. Each repeat is told it is repeating;
     # past the limit we break out and spend what's left on an answer.
-    repeat_guard = ToolRepeatGuard(getattr(cfg, "tool_repeat_limit", 0) or 0)
+    repeat_guard = ToolRepeatGuard(
+        getattr(cfg, "tool_repeat_limit", 0) or 0,
+        path_revisit_limit=getattr(cfg, "tool_path_revisit_limit", 0) or 0,
+        path_trip_after=getattr(cfg, "tool_path_trip_after", 0) or 0,
+    )
     iteration = 0
     blind_tool_turns = 0
     validation_retries = 0
@@ -1199,10 +1207,11 @@ def _run_agentic_loop(
             if repeat_note is not None:
                 result = f"{result}{repeat_note}"
                 log.info(
-                    "Repeated tool call %s (%s); %s",
+                    "Corrected tool call %s (%s); %s | %s",
                     tc.name,
                     _summarize_args_str(tc.arguments),
                     repeat_guard.summary(),
+                    repeat_guard.path_summary(),
                 )
             # Kimi-K2 (and some other engines) require ``name`` on tool
             # replies; OpenAI's spec ignores it. Always sending it is
@@ -1219,18 +1228,21 @@ def _run_agentic_loop(
 
         if repeat_guard.tripped:
             log.warning(
-                "Tool-repeat guard tripped (%s, limit=%d); asking for a final "
+                "Tool-repeat guard tripped (%s); asking for a final "
                 "answer instead of spending the rest of the budget looping",
-                repeat_guard.summary(),
-                repeat_guard.trip_after,
+                repeat_guard.trip_summary(),
             )
             if emit is not None:
                 emit(
                     "log",
-                    f"Stuck in a tool-call loop ({repeat_guard.summary()}); "
+                    f"Stuck in a tool-call loop ({repeat_guard.trip_summary()}); "
                     "asking for a final answer without tools",
                 )
-            metrics.stop_reason = STOP_REPEAT_GUARD
+            metrics.stop_reason = (
+                STOP_REPEAT_GUARD
+                if repeat_guard._repeats_tripped
+                else STOP_PATH_REVISIT_GUARD
+            )
             break
 
     # Iteration budget hit — force a final answer with tools disabled.
