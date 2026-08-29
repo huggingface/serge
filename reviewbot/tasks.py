@@ -750,6 +750,7 @@ def prepare_task(
             finish_reason=chat.finish_reason,
             metrics_line=metrics_line,
             session=session_record(metrics),
+            salvage_attempts=metrics.truncation_retries,
         ) from exc
 
     title = (result.get("title") or "").strip() or (req.title or "serge: automated fix")
