@@ -41,6 +41,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A final answer that is **nothing but leaked tool-call markup** is now
+  re-asked instead of parsed. `_needs_final_salvage` only recognised a
+  *truncated* or *empty* reply, so markup-only content — non-empty, so it
+  looked parseable — went straight to `_extract_json` and raised
+  `LLM returned unparseable output` with **zero** recovery attempts. The
+  review path had a backstop after parsing; the task path had none, which is
+  what 3 of 10 task jobs in the 2026-08-24→26 window died of. The three
+  unusable shapes are now one classifier (`_final_answer_defect`), so the
+  loop, the log line and the recovery prompt agree on what was wrong, and the
+  markup case gets a prompt that names the mistake.
+- `_UnparseableLLMOutput` now carries `salvage_attempts`, so the error
+  distinguishes "salvage never recognised this shape" (0) from "salvage ran
+  and the model still could not produce JSON" (>0). Those are different bugs
+  and they used to share one error string.
+
 - The new-review form's per-provider model dropdown is visible again: it now
   lists a provider's models on page load (via `GET /llm-options/models`) instead
   of only after a PR reference resolved to a matching config, and Anthropic's

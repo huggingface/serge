@@ -908,19 +908,68 @@ _EMPTY_ANSWER_RECOVERY_MESSAGE = (
     "with ONLY the final JSON object the task requires: no analysis, no "
     "explanation, no <think> block, no markdown fences."
 )
+# A reply that is non-empty but is *only* chat-template markup. Says what was
+# wrong explicitly, because unlike the other two shapes this one is a mistake
+# the model can avoid rather than a budget it ran out of.
+_MARKUP_ANSWER_RECOVERY_MESSAGE = (
+    "Your previous reply contained only tool-call markup — no JSON object came "
+    "through. Do not write tool calls as text; you have no tools left on this "
+    "turn. Reply now with ONLY the final JSON object the task requires: no "
+    "analysis, no explanation, no <think> block, no markdown fences."
+)
+
+_RECOVERY_MESSAGES = {
+    "empty": _EMPTY_ANSWER_RECOVERY_MESSAGE,
+    "truncated": _TRUNCATION_RECOVERY_MESSAGE,
+    "markup": _MARKUP_ANSWER_RECOVERY_MESSAGE,
+}
+# How each defect is named in the operator-facing log line.
+_DEFECT_LABELS = {
+    "empty": "empty",
+    "truncated": "truncated",
+    "markup": "nothing but tool-call markup",
+}
+
+
+def _final_answer_defect(chat: ChatResult) -> Optional[str]:
+    """Which unusable shape the final answer has, or ``None`` when it is worth
+    parsing. One classifier because all three callers need the same verdict:
+    the loop (salvage or not), the log line (what was wrong) and the recovery
+    prompt (what to tell the model).
+
+    - ``"empty"`` — blank content, commonly ``finish_reason=None`` when the
+      provider truncates the stream on a very large context.
+    - ``"truncated"`` — hit the output-token limit (``finish_reason="length"``).
+    - ``"markup"`` — non-empty but says nothing: the model wrote its tool calls
+      out as chat-template special tokens instead of calling them (serge#81).
+
+    ``"markup"`` is the one that used to escape. Its content is non-empty, so
+    the older emptiness test said "parse it"; on the task path ``_extract_json``
+    then raised ``_UnparseableLLMOutput`` with **zero** recovery attempts. The
+    review path had a backstop for it after parsing, the task path had none —
+    which is why 3 of 10 task jobs in the 2026-08-24→26 window died
+    "unparseable". Checked last because it is the only test that has to walk the
+    content.
+    """
+    if not (chat.content or "").strip():
+        return "empty"
+    if chat.finish_reason == "length":
+        return "truncated"
+    if _is_model_markup_only(chat.content or ""):
+        return "markup"
+    return None
 
 
 def _needs_final_salvage(chat: ChatResult) -> bool:
     """True when a tool-free final answer should be re-asked rather than
-    parsed: it either hit the output-token limit (``finish_reason="length"``)
-    or came back with blank content (commonly ``finish_reason=None`` when the
-    provider truncates the stream on a very large context)."""
-    return chat.finish_reason == "length" or not (chat.content or "").strip()
+    parsed."""
+    return _final_answer_defect(chat) is not None
 
 
 def _final_recovery_message(chat: ChatResult) -> str:
-    blank = not (chat.content or "").strip()
-    return _EMPTY_ANSWER_RECOVERY_MESSAGE if blank else _TRUNCATION_RECOVERY_MESSAGE
+    return _RECOVERY_MESSAGES.get(
+        _final_answer_defect(chat) or "", _TRUNCATION_RECOVERY_MESSAGE
+    )
 
 
 def _emit_final_salvage(
@@ -928,7 +977,7 @@ def _emit_final_salvage(
 ) -> None:
     if emit is None:
         return
-    what = "empty" if not (chat.content or "").strip() else "truncated"
+    what = _DEFECT_LABELS.get(_final_answer_defect(chat) or "", "unparseable")
     emit(
         "log",
         f"Final answer was {what} (finish_reason={chat.finish_reason}); re-asking "
@@ -1550,6 +1599,7 @@ class _UnparseableLLMOutput(Exception):
         finish_reason: Optional[str],
         metrics_line: str,
         session: Optional[dict[str, Any]] = None,
+        salvage_attempts: int = 0,
     ):
         super().__init__("unparseable LLM output")
         self.content = content
@@ -1559,19 +1609,34 @@ class _UnparseableLLMOutput(Exception):
         # answer is what a starved final turn produces, and the job row records
         # only the error string.
         self.session = session or {}
+        # How many tool-free re-asks the loop already spent trying to recover
+        # this answer. 0 and >0 are different bugs wearing the same error
+        # string: 0 means the salvage never recognised the shape (what the
+        # task path did with leaked markup), >0 means it recognised it and the
+        # model still could not produce JSON. Without this the two are
+        # indistinguishable from the job row, which is how the task path's
+        # missing markup case stayed hidden.
+        self.salvage_attempts = salvage_attempts
+
+    def _salvage_note(self) -> str:
+        if self.salvage_attempts:
+            return f", {self.salvage_attempts} salvage re-ask(s) did not recover it"
+        return ", no salvage was attempted for this shape"
 
     def user_message(self) -> str:
         if self.finish_reason == "length":
             return (
                 "LLM response was truncated before it produced valid review JSON "
-                f"(finish_reason=length, {self.metrics_line}). Increase "
+                f"(finish_reason=length, {self.metrics_line}"
+                f"{self._salvage_note()}). Increase "
                 "LLM_MAX_TOKENS for this provider, or narrow the review scope / "
                 "reduce TOOL_MAX_ITERATIONS so the final answer has enough output "
                 "budget."
             )
         return (
             "LLM returned unparseable output "
-            f"(finish_reason={self.finish_reason}, {self.metrics_line})"
+            f"(finish_reason={self.finish_reason}, {self.metrics_line}"
+            f"{self._salvage_note()})"
         )
 
 
@@ -1783,6 +1848,7 @@ def prepare_review(
                 finish_reason=chat.finish_reason,
                 metrics_line=metrics_line,
                 session=session_record(total_metrics),
+                salvage_attempts=total_metrics.truncation_retries,
             ) from exc
 
         summary = (result.get("summary") or "").strip()

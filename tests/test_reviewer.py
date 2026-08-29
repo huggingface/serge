@@ -11,6 +11,7 @@ from reviewbot.reviewer import (
     _LOG_MSG_MAX_CHARS,
     _MAX_TRUNCATION_RETRIES,
     _UnparseableLLMOutput,
+    _final_answer_defect,
     _assistant_tool_call_dict,
     _build_annotated_diff_chunks,
     _content_preview,
@@ -1382,3 +1383,128 @@ class PathRevisitLoopTests(unittest.TestCase):
             for m in call["messages"]:
                 if m.get("role") == "tool":
                     self.assertNotIn("[serge]", m["content"])
+
+
+class MarkupOnlyFinalAnswerSalvageTests(unittest.TestCase):
+    """A final answer that is nothing but leaked tool-call markup must be
+    re-asked, not parsed.
+
+    This is the task-path hole: the content is non-empty, so the emptiness
+    test said "parse it", and `_extract_json` then raised
+    `_UnparseableLLMOutput` with zero recovery attempts. The review path had a
+    backstop after parsing; the task path had none.
+    """
+
+    LEAKED = (
+        "<|tool_calls_section_begin|><|tool_call_begin|>"
+        "functions.read_file:6<|tool_call_argument_begin|>\n\n"
+        "<|tool_call_end|><|tool_calls_section_end|>"
+    )
+
+    def test_markup_only_answer_needs_salvage(self) -> None:
+        # Fails before the fix: non-empty content, finish_reason="stop".
+        self.assertTrue(
+            _needs_final_salvage(ChatResult(content=self.LEAKED, finish_reason="stop"))
+        )
+        self.assertEqual(
+            _final_answer_defect(ChatResult(content=self.LEAKED, finish_reason="stop")),
+            "markup",
+        )
+
+    def test_real_answer_is_still_parsed(self) -> None:
+        # The guard must not reach past its shape: a normal answer, and a
+        # review that legitimately quotes a special token, both still parse.
+        self.assertIsNone(
+            _final_answer_defect(
+                ChatResult(content='{"summary": "ok"}', finish_reason="stop")
+            )
+        )
+        self.assertIsNone(
+            _final_answer_defect(
+                ChatResult(
+                    content="The test asserts `<|endoftext|>` is appended.",
+                    finish_reason="stop",
+                )
+            )
+        )
+
+    def test_defect_classification_keeps_prior_precedence(self) -> None:
+        # Empty is reported ahead of length so the recovery prompt keeps
+        # saying "empty" for a blank truncated reply, as it did before.
+        self.assertEqual(
+            _final_answer_defect(ChatResult(content="", finish_reason="length")),
+            "empty",
+        )
+        self.assertEqual(
+            _final_answer_defect(
+                ChatResult(content='{"partial', finish_reason="length")
+            ),
+            "truncated",
+        )
+
+    def test_markup_recovery_message_names_the_mistake(self) -> None:
+        msg = _final_recovery_message(
+            ChatResult(content=self.LEAKED, finish_reason="stop")
+        )
+        self.assertIn("tool-call markup", msg)
+        self.assertNotEqual(
+            msg, _final_recovery_message(ChatResult(content="", finish_reason=None))
+        )
+
+    def test_loop_re_asks_and_recovers_a_markup_only_answer(self) -> None:
+        """End to end through the loop: the markup answer is re-asked
+        tool-free and the recovered JSON is what the caller gets."""
+        results = [
+            ChatResult(content=self.LEAKED, finish_reason="stop"),
+            ChatResult(content='{"summary": "recovered", "comments": []}'),
+        ]
+        llm = _FakeLLM(results)
+        chat, metrics = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "review this"}],
+            cfg=_CfgStub(),  # type: ignore[arg-type]
+            tool_env=None,
+        )
+        # Before the fix the loop returned the markup on the first turn.
+        self.assertIn("recovered", chat.content or "")
+        self.assertEqual(metrics.truncation_retries, 1)
+        self.assertEqual(len(llm.calls), 2)
+
+
+class UnparseableSalvageAttemptsTests(unittest.TestCase):
+    """`salvage_attempts` separates two bugs that shared one error string."""
+
+    def test_zero_attempts_says_no_salvage_ran(self) -> None:
+        exc = _UnparseableLLMOutput(
+            content="junk",
+            finish_reason="stop",
+            metrics_line="turns=3",
+            salvage_attempts=0,
+        )
+        self.assertIn("no salvage was attempted", exc.user_message())
+
+    def test_exhausted_attempts_are_reported(self) -> None:
+        exc = _UnparseableLLMOutput(
+            content="junk",
+            finish_reason="stop",
+            metrics_line="turns=3",
+            salvage_attempts=_MAX_TRUNCATION_RETRIES,
+        )
+        msg = exc.user_message()
+        self.assertIn(f"{_MAX_TRUNCATION_RETRIES} salvage re-ask", msg)
+        self.assertNotIn("no salvage was attempted", msg)
+
+    def test_length_truncation_message_also_reports_salvage(self) -> None:
+        exc = _UnparseableLLMOutput(
+            content="junk",
+            finish_reason="length",
+            metrics_line="turns=3",
+            salvage_attempts=1,
+        )
+        self.assertIn("1 salvage re-ask", exc.user_message())
+
+    def test_defaults_to_no_salvage(self) -> None:
+        exc = _UnparseableLLMOutput(
+            content="junk", finish_reason="stop", metrics_line="turns=3"
+        )
+        self.assertEqual(exc.salvage_attempts, 0)
