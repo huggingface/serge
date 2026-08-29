@@ -94,6 +94,19 @@ class Config:
     # it is repeating; past this many the loop stops rather than spending the
     # rest of the input-token budget re-running the same search. 0 disables.
     tool_repeat_limit: int = 6
+    # The same problem measured a second way. The counter above keys on the
+    # exact arguments, so re-reading one file at a different line range each
+    # time is invisible to it — and that is the shape that dominates (prod task
+    # 9d210794: 137 of 153 calls re-opened an already-opened path). Past this
+    # many visits to one path, every further visit is told what it already has.
+    # Higher than tool_repeat_limit on purpose: re-opening a file at a genuinely
+    # new range is normal investigation. 0 disables the nudge.
+    tool_path_revisit_limit: int = 3
+    # Total re-opens across all paths before the loop is cut off and the budget
+    # spent on an answer. Set well above any healthy session (the worst measured
+    # spent 137 calls this way; the one that produced a PR about 10). 0 keeps
+    # the nudges but never cuts the loop off.
+    tool_path_trip_after: int = 40
     # Commit only the files the patch is responsible for, dropping files the
     # normalizer regenerated because the *base* was stale (see commit_scope).
     # Validation still runs repo-wide; this only bounds the commit.
@@ -493,6 +506,8 @@ class Config:
             tool_max_iterations=_int_env("TOOL_MAX_ITERATIONS", 30),
             llm_max_input_tokens=_int_env("LLM_MAX_INPUT_TOKENS", 2_000_000),
             tool_repeat_limit=_int_env("TOOL_REPEAT_LIMIT", 6),
+            tool_path_revisit_limit=_int_env("TOOL_PATH_REVISIT_LIMIT", 3),
+            tool_path_trip_after=_int_env("TOOL_PATH_TRIP_AFTER", 40),
             task_scope_commit_to_patch=_bool_env("TASK_SCOPE_COMMIT_TO_PATCH", True),
             task_commit_always_include=[
                 p.strip()

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The tool-repeat guard is now **path-aware**. It keyed on the exact arguments,
+  so fifty-three reads of one file at a different line range each time were
+  fifty-three distinct signatures and it counted zero repeats — while that is
+  the shape that dominates in practice (prod task `9d210794`: 137 of 153 calls
+  re-opened a path it had already opened). A second counter tracks visits per
+  opened path, with its own allowance (`TOOL_PATH_REVISIT_LIMIT`, default 3) and
+  its own cut-off (`TOOL_PATH_TRIP_AFTER`, default 40). The correction names the
+  file and the ranges already served — *"you have already read `modular_blt.py`
+  6 times in this session (lines 1-200, 180-420, 400-650)"* — rather than only
+  saying stop, because the first is something a model can act on. Still not a
+  cache: every call executes for real, since a re-read after a patch must return
+  the new content. A session cut off this way reports `stop_reason
+  =path_revisit_guard`, distinct from `repeat_guard`.
+
 - Per-job agent-loop metrics, exported for Prometheus at `GET /metrics`
   (unauthenticated, like `/healthz`; scraped in-cluster over the pod port).
   Every finished job now records how many turns and tool calls it ran, what it

@@ -29,6 +29,7 @@ from reviewbot.reviewer import (
     STOP_BLIND_TURN_CAP,
     STOP_INPUT_TOKEN_CAP,
     STOP_NO_LLM_TURNS,
+    STOP_PATH_REVISIT_GUARD,
     STOP_REPEAT_GUARD,
     merge_session_records,
     no_llm_session_record,
@@ -518,12 +519,16 @@ class _CfgStub:
         llm_max_input_tokens: int = 0,
         llm_reasoning_effort: str | None = None,
         tool_repeat_limit: int = 0,
+        tool_path_revisit_limit: int = 0,
+        tool_path_trip_after: int = 0,
     ) -> None:
         self.llm_max_tokens = llm_max_tokens
         self.tool_max_iterations = tool_max_iterations
         self.llm_max_input_tokens = llm_max_input_tokens
         self.llm_reasoning_effort = llm_reasoning_effort
         self.tool_repeat_limit = tool_repeat_limit
+        self.tool_path_revisit_limit = tool_path_revisit_limit
+        self.tool_path_trip_after = tool_path_trip_after
 
 
 class _FakeLLM:
@@ -1214,3 +1219,166 @@ class SessionRecordTests(unittest.TestCase):
         self.assertEqual(record["rounds"], 0)
         self.assertEqual(record["turns"], 0)
         self.assertEqual(record["stop_reason"], STOP_NO_LLM_TURNS)
+
+
+class PathRevisitLoopTests(unittest.TestCase):
+    """The path counter has to end the loop, not just annotate results.
+
+    Task 9d210794 spent 137 of its 153 calls re-opening files it had already
+    opened, at a different line range each time, and the exact-argument guard
+    counted zero repeats the whole way down."""
+
+    def _reading_llm(self, reads: int) -> _FakeLLM:
+        turns = [
+            ChatResult(
+                content="",
+                usage={"prompt_tokens": 40_000, "completion_tokens": 20},
+                tool_calls=[
+                    ToolCall(
+                        id=f"t{i}",
+                        name="read_file",
+                        arguments='{"path": "modular_blt.py", "start_line": %d}'
+                        % (i * 10),
+                    )
+                ],
+            )
+            for i in range(reads)
+        ]
+        final = ChatResult(
+            content='{"summary": "stuck", "comments": []}',
+            usage={"prompt_tokens": 40_000, "completion_tokens": 20},
+        )
+        return _FakeLLM(turns + [final])
+
+    def test_re_reads_cut_the_loop_off_and_say_which_guard_did_it(self) -> None:
+        cfg = _CfgStub(
+            tool_max_iterations=0,
+            tool_repeat_limit=6,
+            tool_path_revisit_limit=2,
+            tool_path_trip_after=4,
+        )
+        llm = self._reading_llm(5)
+        chat, metrics = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "fix this"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.stop_reason, STOP_PATH_REVISIT_GUARD)
+        # Not the exact-argument guard: every read used a different range.
+        self.assertEqual(metrics.repeats, 0)
+        self.assertGreater(metrics.path_revisits, 0)
+        self.assertEqual(chat.content, '{"summary": "stuck", "comments": []}')
+        self.assertLess(len(llm.calls), 12)
+        self.assertNotIn("tools", llm.calls[-1])
+
+    def test_the_model_is_told_what_it_already_has(self) -> None:
+        cfg = _CfgStub(
+            tool_max_iterations=0,
+            tool_repeat_limit=6,
+            tool_path_revisit_limit=2,
+            tool_path_trip_after=0,
+        )
+        llm = self._reading_llm(6)
+        _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "fix this"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        tool_messages = [
+            m for m in llm.calls[-1]["messages"] if m.get("role") == "tool"
+        ]
+        self.assertNotIn("[serge]", tool_messages[0]["content"])
+        nudged = tool_messages[-1]["content"]
+        self.assertIn("modular_blt.py", nudged)
+        self.assertIn("from line 0", nudged)
+
+    def test_the_emitted_reason_names_the_counter_that_tripped(self) -> None:
+        """A path trip reported as "0 repeated tool call(s)" reads like a bug in
+        the guard rather than a model browsing in circles."""
+        events: list[tuple[str, str]] = []
+        cfg = _CfgStub(
+            tool_max_iterations=0,
+            tool_repeat_limit=6,
+            tool_path_revisit_limit=2,
+            tool_path_trip_after=4,
+        )
+        _run_agentic_loop(
+            self._reading_llm(5),  # type: ignore[arg-type]
+            [{"role": "user", "content": "fix this"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+            emit=lambda kind, text: events.append((kind, text)),
+        )
+        logs = [t for k, t in events if k == "log"]
+        stuck = [line for line in logs if "Stuck in a tool-call loop" in line]
+        self.assertTrue(stuck)
+        self.assertIn("re-open(s) of an already-opened path", stuck[0])
+        self.assertIn("modular_blt.py", stuck[0])
+        self.assertNotIn("repeated tool call(s)", stuck[0])
+
+    def test_an_exact_repeat_still_reports_the_repeat_guard(self) -> None:
+        """The two stop reasons must stay distinguishable — they call for
+        different fixes."""
+        cfg = _CfgStub(
+            tool_max_iterations=0,
+            tool_repeat_limit=2,
+            tool_path_revisit_limit=99,
+            tool_path_trip_after=99,
+        )
+        repeat = ChatResult(
+            content="",
+            usage={"prompt_tokens": 40_000, "completion_tokens": 20},
+            tool_calls=[ToolCall(id="t", name="grep", arguments='{"pattern": "Foo"}')],
+        )
+        final = ChatResult(
+            content='{"summary": "ok", "comments": []}',
+            usage={"prompt_tokens": 1_000, "completion_tokens": 10},
+        )
+        _, metrics = _run_agentic_loop(
+            _FakeLLM([repeat] * 4 + [final]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.stop_reason, STOP_REPEAT_GUARD)
+
+    def test_a_broad_investigation_is_left_alone(self) -> None:
+        """Many files opened once each must not trip anything."""
+        cfg = _CfgStub(
+            tool_max_iterations=0,
+            tool_repeat_limit=6,
+            tool_path_revisit_limit=3,
+            tool_path_trip_after=40,
+        )
+        turns = [
+            ChatResult(
+                content="thinking",
+                usage={"prompt_tokens": 1_000, "completion_tokens": 10},
+                tool_calls=[
+                    ToolCall(
+                        id=f"t{i}", name="read_file", arguments='{"path": "m%d.py"}' % i
+                    )
+                ],
+            )
+            for i in range(25)
+        ]
+        final = ChatResult(
+            content='{"summary": "ok", "comments": []}',
+            usage={"prompt_tokens": 1_000, "completion_tokens": 10},
+        )
+        llm = _FakeLLM(turns + [final])
+        _, metrics = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.stop_reason, STOP_ANSWERED)
+        self.assertEqual(metrics.path_revisits, 0)
+        self.assertEqual(metrics.distinct_paths, 25)
+        for call in llm.calls:
+            for m in call["messages"]:
+                if m.get("role") == "tool":
+                    self.assertNotIn("[serge]", m["content"])

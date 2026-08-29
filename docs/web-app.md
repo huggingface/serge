@@ -110,13 +110,16 @@ retries, and two numbers about how the budget was spent browsing:
 | `serge_job_repeat_calls` | Tool calls that re-ran an *earlier call verbatim* — what `TOOL_REPEAT_LIMIT` counts. |
 | `serge_job_path_revisits` | Calls that re-opened a *path already opened*, counted per path as visits−1. A second `read_file` of the same file at a different line range is a revisit but not a verbatim repeat, and that is the shape that dominates in practice. |
 
+Both have a nudge attached (`TOOL_REPEAT_LIMIT` / `TOOL_PATH_REVISIT_LIMIT`) and a separate cut-off budget (`TOOL_REPEAT_LIMIT` / `TOOL_PATH_TRIP_AFTER`), because they are different failures: one model is stuck on a single call, the other is browsing in circles.
+
 The label that matters most is `stop_reason` on `serge_job_info`:
 
 | `stop_reason` | The session ended because… |
 | ------------- | -------------------------- |
 | `answered` | the model decided it was done — the only value that means this |
 | `input_token_cap` | `LLM_MAX_INPUT_TOKENS` was reached; the answer came from a tool-less final turn |
-| `repeat_guard` | `TOOL_REPEAT_LIMIT` tripped |
+| `repeat_guard` | `TOOL_REPEAT_LIMIT` tripped — the model kept re-issuing one call verbatim |
+| `path_revisit_guard` | `TOOL_PATH_TRIP_AFTER` tripped — the model kept re-opening files it had already opened |
 | `blind_turn_cap` / `strict_tool_cap` / `absolute_ceiling` | a `TOOL_MAX_ITERATIONS` bound was reached |
 | `chunk_input_token_cap` | a chunked review skipped chunks it could not afford |
 | `no_llm_turns` | the job finished (or failed) without ever running the loop — e.g. reproduce-first classified the group ENVIRONMENT |

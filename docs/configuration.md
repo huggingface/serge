@@ -60,6 +60,9 @@ package is missing or a compression call fails, so a review never breaks on it.
 | `HELPER_TOOLS_PATH` | `helper_tools_path` | `.ai/review-tools.json` | Optional helper tool config. |
 | `REPO_CHECKOUT_PATH` | `repo_checkout_path` | Action: `github.workspace`; env: empty | Local checkout root for read-only tools. Empty disables tools. |
 | `TOOL_MAX_ITERATIONS` | `tool_max_iterations` | env default `30`, Action default `8` | Maximum tool-calling rounds. Set `0` to disable the cap. |
+| `TOOL_REPEAT_LIMIT` | `tool_repeat_limit` | `6` | Byte-identical tool calls tolerated before the loop is cut off. Each repeat is told it is repeating. `0` disables. |
+| `TOOL_PATH_REVISIT_LIMIT` | `tool_path_revisit_limit` | `3` | Visits to one file/directory before every further visit is told what it already has. Catches the re-read-at-a-different-line-range shape `TOOL_REPEAT_LIMIT` cannot see. `0` disables the nudge. |
+| `TOOL_PATH_TRIP_AFTER` | `tool_path_trip_after` | `40` | Total re-opens across all paths before the loop is cut off. Set well above a healthy session. `0` keeps the nudges but never cuts off. |
 
 ## GitHub App
 
