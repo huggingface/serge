@@ -397,3 +397,21 @@ def test_the_runner_is_told_its_own_deadline():
     from reviewbot import launcher
 
     assert "task_runner_timeout" in launcher.RUNNER_CONFIG_FIELDS
+
+
+# ── A killed runner must not be recorded as a free 0-turn bail ──────────────
+
+
+def test_runner_lost_is_distinct_from_never_running_the_loop():
+    from reviewbot.reviewer import (
+        STOP_NO_LLM_TURNS,
+        STOP_RUNNER_LOST,
+        no_llm_session_record,
+    )
+
+    assert STOP_RUNNER_LOST != STOP_NO_LLM_TURNS
+    assert no_llm_session_record()["stop_reason"] == STOP_NO_LLM_TURNS
+    assert no_llm_session_record(STOP_RUNNER_LOST)["stop_reason"] == STOP_RUNNER_LOST
+    # Counters stay zero either way; the stop_reason is what says whether zero
+    # means "spent nothing" or "we do not know what it spent".
+    assert no_llm_session_record(STOP_RUNNER_LOST)["turns"] == 0

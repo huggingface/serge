@@ -78,6 +78,8 @@ from .reviewer import (
     _UnparseableLLMOutput,
     merge_session_records,
     no_llm_session_record,
+    STOP_NO_LLM_TURNS,
+    STOP_RUNNER_LOST,
     prepare_review,
     publish_review,
     run_followup,
@@ -893,7 +895,13 @@ def _session_with_outcome(job: Job) -> dict[str, Any]:
     ``published``. Freezing it here — the store's session write is first-wins —
     keeps the exported label stable, and it is the more honest reading anyway:
     the session ended when the loop did, not when someone clicked publish."""
-    session = job.session or no_llm_session_record()
+    # A missing session means the runner never reported. For an errored job that
+    # is a killed or crashed runner, whose spend is UNKNOWN — recording it as
+    # `no_llm_turns` (the cheap "never ran the loop" outcome) is wrong data, not
+    # missing data, and it is the metric this repo's own analysis reads.
+    session = job.session or no_llm_session_record(
+        STOP_RUNNER_LOST if job.status == "error" else STOP_NO_LLM_TURNS
+    )
     # Stamped onto the Job, not a copy: _persist_terminal runs again when a human
     # publishes a draft, and re-stamping there would move the label after all.
     session.setdefault("outcome", job.status)
