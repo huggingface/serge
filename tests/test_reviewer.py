@@ -19,6 +19,7 @@ from reviewbot.reviewer import (
     _final_recovery_message,
     _is_model_markup_only,
     _needs_final_salvage,
+    _salvage_decision,
     _extract_json,
     _REVIEW_JSON_KEYS,
     _merge_chunk_event,
@@ -923,10 +924,13 @@ class TruncationRecoveryTests(unittest.TestCase):
             )
         )
 
-    def test_truncation_recovery_is_bounded(self) -> None:
+    def test_recovery_stops_when_the_same_defect_comes_back(self) -> None:
         cfg = _CfgStub()
-        # Always truncated: recovery must give up after _MAX_TRUNCATION_RETRIES
-        # and return the last answer rather than loop forever.
+        # An unchanging defect means the recovery prompt is not working, so the
+        # second re-ask cannot help and costs another whole conversation.
+        # Measured on the task path: `36798024` and `d0dca820` each spent both
+        # re-asks going empty -> empty -> empty for ~39.5k input tokens apiece
+        # and neither recovered.
         always_trunc = ChatResult(
             content='{"patch": "nope',
             usage={"prompt_tokens": 10, "completion_tokens": 16384},
@@ -939,9 +943,65 @@ class TruncationRecoveryTests(unittest.TestCase):
             cfg=cfg,  # type: ignore[arg-type]
             tool_env=None,
         )
-        # Initial answer + _MAX_TRUNCATION_RETRIES recovery attempts.
-        self.assertEqual(len(llm.calls), 1 + _MAX_TRUNCATION_RETRIES)
+        # Initial answer + exactly ONE re-ask, not _MAX_TRUNCATION_RETRIES.
+        self.assertEqual(len(llm.calls), 2)
         self.assertEqual(chat.finish_reason, "length")
+
+    def test_a_different_defect_still_earns_another_attempt(self) -> None:
+        """Stopping is keyed on repetition, not an attempt count: a reply that
+        comes back in a *different* unusable shape means the model did respond
+        to the correction, so the remaining budget is still worth spending."""
+        cfg = _CfgStub()
+        truncated = ChatResult(
+            content='{"patch": "nope',
+            usage={"prompt_tokens": 10, "completion_tokens": 16384},
+            finish_reason="length",
+        )
+        empty = ChatResult(content="", usage={"prompt_tokens": 10}, finish_reason=None)
+        good = ChatResult(
+            content='{"summary": "ok", "comments": []}',
+            usage={"prompt_tokens": 10},
+            finish_reason="stop",
+        )
+        llm = _FakeLLM([truncated, empty, good])
+        chat, _ = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "go"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=None,
+        )
+        self.assertEqual(len(llm.calls), 3)
+        self.assertEqual(chat.finish_reason, "stop")
+
+    def test_one_re_ask_that_works_is_still_made(self) -> None:
+        """`9f20cf8b` returned an empty forced-final answer and recovery 1/2
+        produced the JSON — the first attempt must not be cut."""
+        cfg = _CfgStub()
+        empty = ChatResult(content="", usage={"prompt_tokens": 10}, finish_reason=None)
+        good = ChatResult(
+            content='{"summary": "ok", "comments": []}',
+            usage={"prompt_tokens": 10},
+            finish_reason="stop",
+        )
+        llm = _FakeLLM([empty, good])
+        chat, _ = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "go"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=None,
+        )
+        self.assertEqual(len(llm.calls), 2)
+        self.assertEqual(chat.content, '{"summary": "ok", "comments": []}')
+
+    def test_salvage_decision_rule(self) -> None:
+        self.assertEqual(_salvage_decision("empty", None, 0), "reask")
+        self.assertEqual(_salvage_decision("empty", "empty", 1), "repeated")
+        self.assertEqual(_salvage_decision("truncated", "empty", 1), "reask")
+        self.assertEqual(_salvage_decision(None, None, 0), "stop")
+        # Still bounded when the shape keeps changing.
+        self.assertEqual(
+            _salvage_decision("markup", "empty", _MAX_TRUNCATION_RETRIES), "stop"
+        )
 
 
 class LeakedTextToolCallLoopTests(unittest.TestCase):

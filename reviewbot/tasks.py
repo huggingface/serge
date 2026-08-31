@@ -1658,10 +1658,30 @@ def _maybe_reproduce_first(
     if not node_ids:
         return None, req  # nothing to reproduce → investigate as before
 
+    # Which commit to reproduce AT. For a new PR that is the base branch, but
+    # for a follow-up on serge's own existing PR the work already lives on that
+    # PR's head — reproducing at `main` asks "is this still broken on main?",
+    # which stays true until the fix PR merges, and answers `reproduced` on a
+    # branch that already fixes it.
+    #
+    # That is the stale-group burn, measured: the nightly re-dispatched PR
+    # #48414's group on two consecutive nights (`f31aa5d8`, then `9a898563`),
+    # each ran a full session — 43 and 60 turns, ~2.5M input tokens between them
+    # — and each ended `verify_verdict=already_passing`, because the end gate
+    # *does* use the PR head as its baseline. The two gates disagreed about what
+    # "the baseline" is, and the expensive one was wrong.
+    reproduce_ref = (
+        f"heads/{req.head_branch}"
+        if req.mode == "existing_pr" and req.head_branch
+        else f"heads/{req.base_ref}"
+    )
     try:
-        base_sha = gh.get_ref_sha(req.owner, req.repo, f"heads/{req.base_ref}")
+        base_sha = gh.get_ref_sha(req.owner, req.repo, reproduce_ref)
     except Exception as exc:  # noqa: BLE001 — can't resolve base → fail open
-        emit("log", f"GPU reproduce: could not resolve base ref ({exc}); proceeding.")
+        emit(
+            "log",
+            f"GPU reproduce: could not resolve {reproduce_ref} ({exc}); proceeding.",
+        )
         return None, req
 
     outcome = run_gpu_reproduce(
@@ -1681,7 +1701,15 @@ def _maybe_reproduce_first(
     )
 
     if outcome.verdict == NOT_REPRODUCED:
-        emit("log", "GPU reproduce: not reproducible — skipping group.")
+        if req.mode == "existing_pr" and req.head_branch:
+            emit(
+                "log",
+                f"GPU reproduce: the targeted test(s) already PASS on "
+                f"{req.head_branch} — the open PR already fixes this group. "
+                "Nothing to add; skipping without spending an LLM session.",
+            )
+        else:
+            emit("log", "GPU reproduce: not reproducible — skipping group.")
         return (
             TaskResult(
                 mode=req.mode,
