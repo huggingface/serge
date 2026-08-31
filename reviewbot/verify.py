@@ -81,6 +81,19 @@ NO_RESULT = "no_result"
 # retried — another LLM turn can't change them.
 _RETRYABLE = frozenset({NOT_FIXED, BROKE_OTHERS})
 
+# Verdicts where the gate never adjudicated the patch: the workflow could not be
+# dispatched, no runner picked it up, or no artifact came back. These say nothing
+# about the candidate, so a caller must not treat them as a rejection — the patch
+# is unjudged, not bad. `error` is deliberately NOT here: that is the workflow
+# running and reporting something unverifiable (a skipped or missing test), which
+# IS a reason to refuse the patch.
+_GATE_DID_NOT_RUN = frozenset({NO_TARGETS, DISPATCH_FAILED, TIMEOUT, NO_RESULT})
+
+
+def gate_did_not_run(verdict: str) -> bool:
+    """True when the verify gate never reached a judgement about the patch."""
+    return verdict in _GATE_DID_NOT_RUN
+
 
 def should_retry(verdict: str) -> bool:
     return verdict in _RETRYABLE
