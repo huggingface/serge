@@ -153,3 +153,145 @@ def test_with_verify_feedback_appends_context():
     out = tasks._with_verify_feedback(req, "FEEDBACK")
     assert out.context == "base ctx\n\nFEEDBACK"
     assert req.context == "base ctx"  # original untouched
+
+
+# ── The verdict must survive a PASSING gate, not only a failing one ──────────
+# Every published job in prod stored `verify_verdict=None` while the ones that
+# produced no PR carried it, so the field read as "the gate never ran" exactly
+# where it had run and passed. Both `_commit_changes` success paths dropped it.
+
+
+def _full_cfg():
+    """The real Config: `_commit_changes` renders a PR body, which the
+    SimpleNamespace `_cfg` above (built for the rounds loop) cannot satisfy."""
+    from tests.test_tasks import _make_cfg
+
+    return _make_cfg()
+
+
+class _VerdictGH:
+    """Minimal Git Data API fake for the two `_commit_changes` publish paths."""
+
+    def __init__(self):
+        self.created_pr = None
+        self.deleted = []
+        self.updated_refs = []
+
+    def get_ref_sha(self, owner, repo, ref):
+        return "parentsha"
+
+    def get_commit_tree_sha(self, owner, repo, commit_sha):
+        return "basetree"
+
+    def create_blob(self, owner, repo, content):
+        return "blob1"
+
+    def create_tree(self, owner, repo, base_tree, entries):
+        return "newtree"
+
+    def create_commit(self, owner, repo, *, message, tree_sha, parents):
+        return "newcommit"
+
+    def create_ref(self, owner, repo, ref, sha):
+        return {"ref": ref}
+
+    def update_ref(self, owner, repo, ref, sha, *, force=False):
+        self.updated_refs.append((ref, sha, force))
+        return {}
+
+    def delete_ref(self, owner, repo, ref):
+        self.deleted.append(ref)
+
+    def create_pull_request(self, owner, repo, *, title, head, base, body, draft=False):
+        self.created_pr = {"head": head}
+        return {"number": 99, "html_url": "u", "node_id": "n"}
+
+    def mark_pull_request_ready(self, node_id):
+        pass
+
+    def request_reviewers(self, owner, repo, number, reviewers):
+        return list(reviewers)
+
+
+def _commit(mode, verdict, monkeypatch):
+    from reviewbot.clone_cache import FileChange
+
+    monkeypatch.setattr(
+        tasks, "post_task_pr_created_notification", lambda **_k: None, raising=False
+    )
+    gh = _VerdictGH()
+    req = tasks.TaskRequest(
+        owner="acme",
+        repo="widget",
+        base_ref="main",
+        instruction="fix",
+        context="",
+        mode=mode,
+        pr_number=7 if mode == "existing_pr" else None,
+        head_branch="serge/fix-old" if mode == "existing_pr" else None,
+    )
+    result = tasks._commit_changes(
+        _full_cfg(),
+        gh,
+        req,
+        changes=[FileChange(path="a.txt", status="M", content=b"x", mode="100644")],
+        plan=tasks.TaskPlan(title="t", body="b", patch="p"),
+        job_id="job12345",
+        emit_fn=lambda *_a: None,
+        verify=lambda parent, candidate: verify.VerifyOutcome(verdict=verdict),
+    )
+    return result, gh
+
+
+def test_new_pr_records_the_verdict_that_let_it_publish(monkeypatch):
+    result, gh = _commit("new_pr", verify.FIXED, monkeypatch)
+    assert gh.created_pr is not None, "a fixed verdict must still open the PR"
+    assert result.pr_number == 99
+    assert result.verify_verdict == "fixed"
+    assert result.to_json()["verify_verdict"] == "fixed"
+
+
+def test_existing_pr_follow_up_records_the_verdict(monkeypatch):
+    result, gh = _commit("existing_pr", verify.FIXED, monkeypatch)
+    assert result.pr_number == 7
+    assert result.verify_verdict == "fixed"
+
+
+def test_a_failing_gate_still_records_its_verdict(monkeypatch):
+    result, gh = _commit("new_pr", verify.NOT_FIXED, monkeypatch)
+    assert gh.created_pr is None
+    assert result.no_change
+    assert result.verify_verdict == "not_fixed"
+
+
+def test_no_gate_leaves_the_verdict_unset(monkeypatch):
+    """`None` must keep meaning "the gate did not run" — that is the only way
+    to tell a skipped gate from a passing one."""
+    from reviewbot.clone_cache import FileChange
+
+    monkeypatch.setattr(
+        tasks, "post_task_pr_created_notification", lambda **_k: None, raising=False
+    )
+    gh = _VerdictGH()
+    req = tasks.TaskRequest(
+        owner="a", repo="b", base_ref="main", instruction="i", context="", mode="new_pr"
+    )
+    result = tasks._commit_changes(
+        _full_cfg(),
+        gh,
+        req,
+        changes=[FileChange(path="a.txt", status="M", content=b"x", mode="100644")],
+        plan=tasks.TaskPlan(title="t", body="b", patch="p"),
+        job_id="job12345",
+        emit_fn=lambda *_a: None,
+        verify=None,
+    )
+    assert result.verify_verdict is None
+
+
+def test_recording_fixed_does_not_trigger_a_retry_round():
+    """The rounds loop keys on `result.verify_verdict`, so populating it on the
+    success path could have made every published job retry. It cannot: `fixed`
+    is not in `_RETRYABLE`."""
+    assert not verify.should_retry(verify.FIXED)
+    assert not verify.should_retry(verify.ALREADY_PASSING)
