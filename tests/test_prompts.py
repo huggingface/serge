@@ -179,7 +179,18 @@ class TruncateMiddleTests(unittest.TestCase):
         self.assertNotIn("B", out)
 
     def test_reserve_fits_a_full_reproduce_block(self) -> None:
-        # The whole point of the constant: a maximal reproduce block
-        # (Config.reproduce_tb_chars = 12000) must fit inside the reserve.
-        self.assertGreater(CONTEXT_TAIL_RESERVE_CHARS, 12_000)
+        # The whole point of the constant: a maximal reproduce block must fit
+        # inside the reserve. Assert it against the config field rather than a
+        # copied literal — the two drifted apart once already (the reserve was
+        # sized for one traceback while the formatters take five).
+        import dataclasses
+
+        from reviewbot.config import Config
+
+        block = next(
+            f.default
+            for f in dataclasses.fields(Config)
+            if f.name == "reproduce_block_chars"
+        )
+        self.assertGreaterEqual(CONTEXT_TAIL_RESERVE_CHARS, block)
         self.assertLess(CONTEXT_TAIL_RESERVE_CHARS, MAX_CONTEXT_CHARS)

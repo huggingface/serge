@@ -514,8 +514,10 @@ MAX_CONTEXT_CHARS = 40000
 # How much of the END of a task context is protected from truncation. The
 # appended GPU reproduce/verify block lives there and is the authoritative
 # evidence for the fix, so it must outrank the middle of the report. Sized above
-# `Config.reproduce_tb_chars` (12000) so a full block fits inside the reserve.
-CONTEXT_TAIL_RESERVE_CHARS = 16000
+# `Config.reproduce_block_chars` (32000) — which budgets the whole block, not one
+# traceback — so a full block fits inside the reserve however many tests failed.
+# The earlier 16000 only held for a single traceback; the formatters take five.
+CONTEXT_TAIL_RESERVE_CHARS = 34000
 
 
 TASK_SYSTEM_PROMPT_TEMPLATE = """You are an expert software engineer making a

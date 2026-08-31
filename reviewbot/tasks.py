@@ -1402,21 +1402,70 @@ def publish_task(
     )
 
 
-def _tail_tb(tb: Optional[str], max_chars: int) -> str:
-    """Keep the tail of a traceback (the assertion diff + captured output sit at
-    the end) up to ``max_chars``, marking the cut so the LLM knows it's partial."""
+# The smallest per-traceback slice worth sending. Below this a traceback is
+# noise in both directions, so we would rather show fewer tests in full.
+MIN_TB_CHARS = 6000
+# How much of the HEAD of each traceback is protected from the middle cut.
+# Sized from real reproduce artifacts (see ``_clip_tb``): the assertion summary
+# pytest prepends, the failing source line and the ``E`` block together run to
+# ~2.4k, so 4k keeps them whole with margin.
+TB_HEAD_KEEP_CHARS = 4000
+
+
+def _clip_tb(tb: Optional[str], max_chars: int) -> str:
+    """Clip a traceback to ``max_chars`` from the MIDDLE, keeping both ends.
+
+    A traceback carries the load-bearing ``E`` block at *either* end depending
+    on how pytest laid it out, so no single-ended cut can serve both shapes.
+    Measured on the 2026-08-31 reproduce artifacts:
+
+    * ``mm_grounding_dino`` — pytest prepends the assertion summary, so the
+      ``E`` block sits at offset 1,515 of 25,586 and 2,116 of 45,905: at the
+      **head**;
+    * ``cwm`` (36,497) and ``kimi_k25`` (117,073 / 118,454) — the test source
+      contains a huge inline ``Expectations({...})`` literal, pushing the ``E``
+      block to 404 and ~9,640 chars from the **end**.
+
+    The old tail-only cut kept the last ``max_chars`` and therefore deleted the
+    entire assertion diff, the ``expected_*`` literal and the actual-vs-expected
+    comparison for the first shape — everything the model needs to rewrite a
+    stale expectation, leaving only the ``--showlocals`` tensor dump. Job
+    ``d2d9c129`` returned ``no_fix`` saying exactly that, and was right to:
+    "the actual decoder logits ... is in the elided portion of the traceback,
+    so I cannot record a plausible, verified expectation."
+    """
     text = tb or ""
     if len(text) <= max_chars:
         return text
-    return "…(traceback truncated to last %d chars)…\n%s" % (
-        max_chars,
-        text[-max_chars:],
+    head_len = min(TB_HEAD_KEEP_CHARS, max_chars // 3)
+    tail_len = max_chars - head_len
+    omitted = len(text) - max_chars
+    return (
+        "%s\n…(%d chars omitted from the middle of the traceback; the end follows)…\n%s"
+        % (
+            text[:head_len],
+            omitted,
+            text[len(text) - tail_len :],
+        )
     )
 
 
-def _format_verify_feedback(result: TaskResult, max_chars: int = 12000) -> str:
+def _tb_budget(count: int, block_chars: int) -> int:
+    """Per-traceback slice of the whole-block budget.
+
+    ``block_chars`` bounds the reproduce/verify block as a whole, because that
+    is what has to fit inside ``prompts.CONTEXT_TAIL_RESERVE_CHARS``. The old
+    per-traceback cap could not: the formatters take up to 5 tracebacks, so a
+    12,000 cap allowed a 60,000-char block against a 16,000 reserve, and a
+    40,000 cap produced the 121,417-char block observed on job ``f50c5e85``.
+    """
+    return max(MIN_TB_CHARS, block_chars // max(1, count))
+
+
+def _format_verify_feedback(result: TaskResult, max_chars: int = 32000) -> str:
     """Markdown feedback for the next LLM round: the failures the previous
-    candidate's GPU verify still produced."""
+    candidate's GPU verify still produced. ``max_chars`` budgets the block as a
+    whole and is divided across the tracebacks it shows."""
     lines = [
         "## Your previous patch did NOT fix the tests (GPU verification)",
         "",
@@ -1426,10 +1475,12 @@ def _format_verify_feedback(result: TaskResult, max_chars: int = 12000) -> str:
         "repeat the same change; use the tracebacks to find the real cause.",
         "",
     ]
-    for nodeid, tb in list(result.verify_tracebacks.items())[:5]:
+    shown = list(result.verify_tracebacks.items())[:5]
+    per_tb = _tb_budget(len(shown), max_chars)
+    for nodeid, tb in shown:
         lines.append(f"### {nodeid}")
         lines.append("```")
-        lines.append(_tail_tb(tb, max_chars))
+        lines.append(_clip_tb(tb, per_tb))
         lines.append("```")
         lines.append("")
     return "\n".join(lines).rstrip()
@@ -1493,7 +1544,7 @@ def _environment_bail_message(
 def _format_reproduce_feedback(
     outcome: VerifyOutcome,
     classification: ClassifyResult,
-    max_chars: int = 12000,
+    max_chars: int = 32000,
 ) -> str:
     """Authoritative reproduction context seeded into the LLM prompt. Supersedes
     any inbound 'do not run the test suite' note: serge already ran the tests on
@@ -1537,8 +1588,10 @@ def _format_reproduce_feedback(
             "a change if you can point at concrete code that is actually at fault.",
             "",
         ]
-    for nodeid, tb in list(outcome.tracebacks.items())[:5]:
-        lines += [f"### {nodeid}", "```", _tail_tb(tb, max_chars), "```", ""]
+    shown = list(outcome.tracebacks.items())[:5]
+    per_tb = _tb_budget(len(shown), max_chars)
+    for nodeid, tb in shown:
+        lines += [f"### {nodeid}", "```", _clip_tb(tb, per_tb), "```", ""]
     return "\n".join(lines).rstrip()
 
 
@@ -1661,7 +1714,7 @@ def _maybe_reproduce_first(
     seeded = _with_verify_feedback(
         req,
         _format_reproduce_feedback(
-            outcome, classification, max_chars=cfg.reproduce_tb_chars
+            outcome, classification, max_chars=cfg.reproduce_block_chars
         ),
     )
     seeded = dataclasses.replace(seeded, reproduce_run_url=outcome.run_url)
@@ -1742,7 +1795,7 @@ def prepare_and_publish_candidate(
             )
             req_i = _with_verify_feedback(
                 candidate_req,
-                _format_verify_feedback(result, max_chars=cfg.reproduce_tb_chars),
+                _format_verify_feedback(result, max_chars=cfg.reproduce_block_chars),
             )
             continue
         return result
