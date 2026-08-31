@@ -194,3 +194,56 @@ class TruncateMiddleTests(unittest.TestCase):
         )
         self.assertGreaterEqual(CONTEXT_TAIL_RESERVE_CHARS, block)
         self.assertLess(CONTEXT_TAIL_RESERVE_CHARS, MAX_CONTEXT_CHARS)
+
+
+class ChangedExpectationsRuleTests(unittest.TestCase):
+    """serge reviewed its own expectation rewrite on huggingface/transformers
+    PR #48437 (job `609a3021`) and half-caught it.
+
+    The diff moved a fill-mask assertion from index 6 to 7 and changed the
+    expected token from `"happiness"` to `"<unk>"`. The review never mentioned
+    `<unk>`; filed the index change as a maintainability *nit* ("can shift with
+    tokenizer changes") when index 6 is in fact a bare `▁` token, so the old
+    assertion was reading a non-mask position; and cited the GPU gate — "Serge
+    verified the patched test passes on a GPU runner, which gives reasonable
+    confidence the new expectation matches the current behavior" — which is
+    circular, because the patch rewrote the assertion the gate re-runs.
+    """
+
+    def _prompt(self) -> str:
+        """Whitespace-collapsed: the section is hard-wrapped for readability, so
+        a phrase can straddle a newline. The rule's presence is what matters,
+        not where the wrap fell."""
+        return " ".join(build_system_prompt("rules").split())
+
+    def test_a_changed_expectation_is_its_own_category(self) -> None:
+        p = self._prompt()
+        self.assertIn("CHANGED EXPECTATIONS", p)
+        self.assertIn("redefining what passing means", p)
+
+    def test_degenerate_values_are_named_so_unk_cannot_pass_unremarked(self) -> None:
+        p = self._prompt()
+        for token in ("`<unk>`", "empty string", "all-zeros", "NaN"):
+            self.assertIn(token, p)
+
+    def test_a_moved_assertion_index_is_a_correctness_finding(self) -> None:
+        # The review called this a nit; the old index was reading the wrong token.
+        p = self._prompt()
+        self.assertIn("correctness finding, not a maintainability nit", p)
+
+    def test_a_passing_run_is_not_evidence_for_a_rewritten_expectation(self) -> None:
+        p = self._prompt()
+        self.assertIn("passing test run is NOT evidence", p)
+        self.assertIn("circular", p)
+        self.assertIn("verified on a GPU runner", p)
+
+    def test_the_rule_survives_a_repo_with_no_review_rules(self) -> None:
+        self.assertIn("CHANGED EXPECTATIONS", build_system_prompt(""))
+        self.assertIn(
+            "CHANGED EXPECTATIONS", build_system_prompt("x", tools_enabled=False)
+        )
+
+    def test_a_literal_brace_in_the_rule_survives_formatting(self) -> None:
+        """The template is rendered with str.format, so the `Expectations({...})`
+        example has to be brace-escaped or every review prompt raises."""
+        self.assertIn("`Expectations({...})`", self._prompt())
