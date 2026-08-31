@@ -382,3 +382,88 @@ class TracebackClipTests(unittest.TestCase):
             outcome, ClassifyResult(TEST_ISSUE, "r"), max_chars=32000
         )
         self.assertLessEqual(len(block), prompts.CONTEXT_TAIL_RESERVE_CHARS)
+
+
+class ReproduceRefForFollowUpTests(unittest.TestCase):
+    """Which commit reproduce-first runs AT.
+
+    The stale-group burn: the nightly re-dispatched PR #48414's group on two
+    consecutive nights (`f31aa5d8`, then `9a898563`), each ran a full session
+    — 43 and 60 turns, ~2.5M input tokens between them — and each ended
+    `verify_verdict=already_passing`. Reproduce-first asked "is this still
+    broken on main?", which stays true until the fix PR merges, while the end
+    verify gate used the PR head. The two gates disagreed about the baseline
+    and the expensive one was wrong.
+    """
+
+    def _gh(self, refs):
+        asked = []
+
+        class _GH:
+            def get_ref_sha(self, owner, repo, ref):
+                asked.append(ref)
+                return refs[ref]
+
+        return _GH(), asked
+
+    def _req(self, **kw):
+        base = dict(
+            owner="huggingface",
+            repo="transformers",
+            base_ref="main",
+            instruction="fix",
+            context=CTX,
+            mode="new_pr",
+        )
+        base.update(kw)
+        return tasks.TaskRequest(**base)
+
+    def _run(self, req, verdict):
+        gh, asked = self._gh(
+            {"heads/main": "mainsha", "heads/serge/fix/itf-abc": "prheadsha"}
+        )
+        seen = {}
+
+        def fake_reproduce(_gh, **kw):
+            seen.update(kw)
+            return VerifyOutcome(
+                verdict=verdict, run_url="u", detail="d", tracebacks={"t": "tb"}
+            )
+
+        orig = tasks.run_gpu_reproduce
+        tasks.run_gpu_reproduce = fake_reproduce
+        try:
+            bail, out = tasks._maybe_reproduce_first(
+                _cfg(), gh, req, "job1", lambda *_a: None
+            )
+        finally:
+            tasks.run_gpu_reproduce = orig
+        return bail, out, asked, seen
+
+    def test_a_follow_up_reproduces_at_the_pr_head(self) -> None:
+        req = self._req(
+            mode="existing_pr", pr_number=48414, head_branch="serge/fix/itf-abc"
+        )
+        _bail, _out, asked, seen = self._run(req, REPRODUCED)
+        self.assertEqual(asked, ["heads/serge/fix/itf-abc"])
+        self.assertEqual(seen["base_sha"], "prheadsha")
+
+    def test_a_new_pr_still_reproduces_at_the_base_branch(self) -> None:
+        _bail, _out, asked, seen = self._run(self._req(), REPRODUCED)
+        self.assertEqual(asked, ["heads/main"])
+        self.assertEqual(seen["base_sha"], "mainsha")
+
+    def test_a_follow_up_whose_pr_already_passes_costs_no_llm(self) -> None:
+        req = self._req(
+            mode="existing_pr", pr_number=48414, head_branch="serge/fix/itf-abc"
+        )
+        bail, _out, _asked, _seen = self._run(req, NOT_REPRODUCED)
+        self.assertIsNotNone(bail)
+        self.assertTrue(bail.no_change)
+        self.assertEqual(bail.pr_number, 48414)
+        self.assertEqual(bail.verify_verdict, NOT_REPRODUCED)
+
+    def test_an_existing_pr_with_no_head_branch_falls_back_to_base(self) -> None:
+        req = self._req(mode="existing_pr", pr_number=1)
+        _bail, _out, asked, _seen = self._run(req, REPRODUCED)
+        self.assertEqual(asked, ["heads/main"])

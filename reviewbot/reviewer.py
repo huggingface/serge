@@ -972,6 +972,46 @@ def _final_recovery_message(chat: ChatResult) -> str:
     )
 
 
+def _salvage_decision(
+    defect: Optional[str], last_defect: Optional[str], attempts: int
+) -> str:
+    """Whether to re-ask for a defective final answer: ``"reask"``,
+    ``"repeated"`` (the recovery already failed on this same shape) or
+    ``"stop"``.
+
+    One function because both salvage sites — the normal no-tool-calls turn and
+    the forced final turn after a guard trip — need the identical rule, and the
+    forced one is where the expensive case actually happens.
+
+    Re-asking is worth one attempt: `9f20cf8b` returned an empty forced-final
+    answer and recovery 1/2 produced the JSON. It is *not* worth a second
+    attempt at the same shape: `36798024` and `d0dca820` each spent both
+    re-asks going empty -> empty -> empty, ~39.5k input tokens apiece for
+    ~75-100 output tokens of nothing, and neither recovered. A recovery that
+    returns the same defect has demonstrably not worked, so the signal to stop
+    is repetition, not an attempt count.
+    """
+    if defect is None:
+        return "stop"
+    if defect == last_defect:
+        return "repeated"
+    if attempts >= _MAX_TRUNCATION_RETRIES:
+        return "stop"
+    return "reask"
+
+
+def _emit_salvage_giveup(
+    emit: Optional[Callable[[str, str], None]], defect: str, attempts: int
+) -> None:
+    if emit is None:
+        return
+    emit(
+        "log",
+        f"Final answer was {_DEFECT_LABELS.get(defect, defect)} again after "
+        f"{attempts} re-ask(s); the recovery is not working, not re-asking.",
+    )
+
+
 def _emit_final_salvage(
     emit: Optional[Callable[[str, str], None]], chat: ChatResult, attempt: int
 ) -> None:
@@ -1067,6 +1107,9 @@ def _run_agentic_loop(
     blind_tool_turns = 0
     validation_retries = 0
     truncation_retries = 0
+    # The defect the last re-ask was issued for. A re-ask that produces the same
+    # shape again has demonstrably not worked; see the loop below.
+    last_defect: Optional[str] = None
 
     def _finalize(chat: ChatResult) -> tuple[ChatResult, "_AggregateMetrics"]:
         """Attach the session's browse/retry record to the metrics on the way
@@ -1177,11 +1220,13 @@ def _run_agentic_loop(
             # the provider truncates a huge-context stream). Re-ask for the JSON
             # only, tool-less and low-reasoning, instead of returning content
             # that just fails the parse.
-            if (
-                _needs_final_salvage(chat)
-                and truncation_retries < _MAX_TRUNCATION_RETRIES
-            ):
+            defect = _final_answer_defect(chat)
+            decision = _salvage_decision(defect, last_defect, truncation_retries)
+            if decision == "repeated":
+                _emit_salvage_giveup(emit, defect or "", truncation_retries)
+            elif decision == "reask":
                 truncation_retries += 1
+                last_defect = defect
                 _emit_final_salvage(emit, chat, truncation_retries)
                 messages.append({"role": "assistant", "content": chat.content or None})
                 messages.append(
@@ -1348,8 +1393,15 @@ def _run_agentic_loop(
         # to die on: an empty completion (finish_reason=None) went straight to
         # the parser and surfaced as "LLM returned unparseable output". Re-ask
         # for the JSON only instead (bounded by _MAX_TRUNCATION_RETRIES).
-        if _needs_final_salvage(chat) and truncation_retries < _MAX_TRUNCATION_RETRIES:
+        defect = _final_answer_defect(chat)
+        decision = _salvage_decision(defect, last_defect, truncation_retries)
+        if decision == "repeated":
+            # This is the site the expensive case actually hits: both measured
+            # jobs were already guard-terminated before this turn.
+            _emit_salvage_giveup(emit, defect or "", truncation_retries)
+        elif decision == "reask":
             truncation_retries += 1
+            last_defect = defect
             _emit_final_salvage(emit, chat, truncation_retries)
             messages.append({"role": "assistant", "content": chat.content or None})
             messages.append({"role": "user", "content": _final_recovery_message(chat)})
