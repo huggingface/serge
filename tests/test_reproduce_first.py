@@ -467,3 +467,92 @@ class ReproduceRefForFollowUpTests(unittest.TestCase):
         req = self._req(mode="existing_pr", pr_number=1)
         _bail, _out, asked, _seen = self._run(req, REPRODUCED)
         self.assertEqual(asked, ["heads/main"])
+
+
+class FixableOomOverridesTheEnvironmentBailTests(unittest.TestCase):
+    """serge's classifier prompt made `environment_issue` cover *any* OOM, so
+    every OOM bailed with 0 LLM turns. transformers-ci's triage has known better
+    since 2026-08-14 (26 of 54 persistent OOMs were retention-shaped and had
+    been deferred as "needs capacity" for weeks) and dispatches the retention
+    and load shapes as source patches.
+
+    They disagreed and the less-informed one won because it runs later: job
+    `c6836491` (`phimoe`) is a CUDA OOM on the weight-conversion path — `load` —
+    and serge killed it. The verdict tool now measures the shape on the GPU box,
+    where the whole traceback exists.
+    """
+
+    def _oom_outcome(self, shapes):
+        return VerifyOutcome(
+            verdict=REPRODUCED,
+            run_url="u",
+            detail="d",
+            tracebacks={"t": "tb"},
+            result={"oom_shapes": shapes} if shapes is not None else None,
+        )
+
+    def test_load_and_retention_are_fixable(self) -> None:
+        self.assertEqual(
+            tasks.fixable_oom_shapes(
+                self._oom_outcome({"a": "load", "b": "retention"})
+            ),
+            ["a", "b"],
+        )
+
+    def test_capacity_and_unknown_are_not(self) -> None:
+        self.assertEqual(
+            tasks.fixable_oom_shapes(
+                self._oom_outcome({"a": "capacity", "b": "unknown"})
+            ),
+            [],
+        )
+
+    def test_a_non_oom_environment_failure_has_no_shapes(self) -> None:
+        # A missing dependency is still an environment bail — nothing to override.
+        self.assertEqual(tasks.fixable_oom_shapes(self._oom_outcome({})), [])
+        self.assertEqual(tasks.fixable_oom_shapes(self._oom_outcome(None)), [])
+
+    def test_an_old_verdict_artifact_without_the_key_still_bails(self) -> None:
+        """The verdict tool ships on merge to transformers-ci `main`, so serge
+        can see artifacts from before it. Missing key must mean "no override"."""
+        self.assertEqual(
+            tasks.fixable_oom_shapes(
+                VerifyOutcome(verdict=REPRODUCED, run_url="u", detail="d", result={})
+            ),
+            [],
+        )
+
+    def _run_gate(self, shapes, label=ENVIRONMENT_ISSUE):
+        """Drive `_maybe_reproduce_first` with a reproduced OOM of `shapes`."""
+
+        class _GH:
+            def get_ref_sha(self, owner, repo, ref):
+                return "basesha"
+
+        req = tasks.TaskRequest(
+            owner="huggingface",
+            repo="transformers",
+            base_ref="main",
+            instruction="fix",
+            context=CTX,
+            mode="new_pr",
+        )
+        orig_rep, orig_cls = tasks.run_gpu_reproduce, tasks._classify_reproduced
+        tasks.run_gpu_reproduce = lambda _gh, **kw: self._oom_outcome(shapes)
+        tasks._classify_reproduced = lambda *a, **k: ClassifyResult(label, "oom")
+        try:
+            return tasks._maybe_reproduce_first(
+                _cfg(), _GH(), req, "job1", lambda *_a: None
+            )
+        finally:
+            tasks.run_gpu_reproduce, tasks._classify_reproduced = orig_rep, orig_cls
+
+    def test_a_patchable_oom_is_investigated_not_skipped(self) -> None:
+        bail, seeded = self._run_gate({"t": "load"})
+        self.assertIsNone(bail, "a load-shaped OOM must not bail")
+        self.assertIn("REPRODUCED on GPU", seeded.context)
+
+    def test_a_capacity_oom_still_skips(self) -> None:
+        bail, _ = self._run_gate({"t": "capacity"})
+        self.assertIsNotNone(bail)
+        self.assertTrue(bail.no_change)

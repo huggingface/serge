@@ -1636,6 +1636,36 @@ def _classify_reproduced(
     return result
 
 
+# OOM shapes the transformers-ci verdict tool reports per node-id (it runs on the
+# GPU box, where the whole traceback exists, and applies that repo's `oom_shape`).
+# `retention` = a trivial request against a card earlier tests never freed, fixed
+# by a tearDown; `load` = an OOM while `from_pretrained` materializes weights,
+# fixed by the load pattern. Both are SOURCE patches. `capacity` = one allocation
+# that cannot fit however clean the card is, and `unknown` = unparsed.
+_FIXABLE_OOM_SHAPES = frozenset({"retention", "load"})
+
+
+def fixable_oom_shapes(outcome: VerifyOutcome) -> list[str]:
+    """The node-ids whose OOM this repo should still try to patch.
+
+    serge's classifier prompt makes ``environment_issue`` cover *any*
+    "device/host out-of-memory", so before this every OOM bailed with zero LLM
+    turns. transformers-ci's triage has known better since 2026-08-14, when 26
+    of 54 persistent OOMs turned out to be retention-shaped and had been
+    deferred as "needs capacity" for weeks; its ``env_only_reason`` dispatches a
+    group when any test shows the retention or load shape. This mirrors that
+    rule exactly, so the two components cannot disagree again.
+
+    They did disagree, and the less-informed one won because it runs later: the
+    `phimoe` group (job `c6836491`) is a CUDA OOM on the weight-conversion path
+    — ``load``, which triage explicitly dispatches — and serge killed it. Triage
+    could not even see it was an OOM: the CI dataset shows only ``RuntimeError:
+    We encountered some issues during automatic conversion of the weights``.
+    """
+    shapes = (outcome.result or {}).get("oom_shapes") or {}
+    return sorted(n for n, shape in shapes.items() if shape in _FIXABLE_OOM_SHAPES)
+
+
 def _maybe_reproduce_first(
     cfg: Config,
     gh: GitHubClient,
@@ -1734,7 +1764,17 @@ def _maybe_reproduce_first(
     classification = _classify_reproduced(
         cfg, node_ids, outcome.tracebacks, req.context, emit
     )
-    if classification.is_environment_issue and cfg.classify_bail_on_environment:
+    fixable = fixable_oom_shapes(outcome)
+    if classification.is_environment_issue and fixable:
+        # Not every OOM is a capacity fact. The verdict tool measured the shape
+        # on the GPU box and says this one is patchable, so the flat
+        # "any OOM is environment" verdict is overruled rather than obeyed.
+        emit(
+            "log",
+            "GPU reproduce: classified environment, but the OOM shape is "
+            f"patchable ({', '.join(fixable)}) — investigating anyway.",
+        )
+    elif classification.is_environment_issue and cfg.classify_bail_on_environment:
         # The failure is real but not patchable: an investigation could only end
         # `no_fix`, so stop here — one classifier call instead of a full LLM cycle.
         emit("log", "GPU reproduce: environment issue — skipping group (no patch).")

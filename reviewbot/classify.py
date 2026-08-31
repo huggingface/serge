@@ -69,10 +69,15 @@ expected values/tensors that legitimately changed, an over-tight tolerance, or a
 bad skip/guard condition. The test (its expectations) should be corrected.
 - "environment_issue": NEITHER the code nor the test is wrong — the failure is a \
 property of the machine or the installed environment, and no source change can fix \
-it. Only for: device/host out-of-memory, a missing or version-incompatible \
-dependency (ImportError/ModuleNotFoundError, an API that moved in a third-party \
-package), a CUDA/driver/hardware mismatch, or a checkpoint that is gone, renamed, \
-or gated on the Hub.
+it. Only for: a missing or version-incompatible dependency \
+(ImportError/ModuleNotFoundError, an API that moved in a third-party package), a \
+CUDA/driver/hardware mismatch, a checkpoint that is gone, renamed, or gated on the \
+Hub, or an out-of-memory where ONE allocation is too big for the card. \
+NOT every out-of-memory: if the failing allocation is small while the card is \
+already nearly full, earlier tests never freed their models and the fix is a \
+`tearDown` in the test file; if the OOM happens while `from_pretrained` is still \
+materializing weights, the fix is the load pattern. Both of those are \
+"test_issue" (a source patch), not environment.
 - "unclear": you genuinely cannot tell from the traceback which it is.
 
 Judge only from the traceback and node-ids given. Do not guess beyond them. \
