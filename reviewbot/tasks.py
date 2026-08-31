@@ -1143,8 +1143,14 @@ def _commit_changes(
         # back to its previous head so the follow-up commit is undone.
         gh.update_ref(owner, repo, f"heads/{head_branch}", commit_sha)
         emit_fn("log", f"Pushed commit {commit_sha[:8]} to {head_branch}")
+        # Recorded on BOTH branches below. A verdict that only survives failure
+        # is not a metric: every published job stored `verify_verdict=None`
+        # while the ones that produced no PR carried it, so the field read as
+        # "the gate never ran" exactly where it had run and passed.
+        verdict: Optional[str] = None
         if verify is not None:
             outcome = verify(parent_sha, commit_sha)
+            verdict = outcome.verdict
             if not outcome.is_fixed:
                 try:
                     gh.update_ref(
@@ -1174,6 +1180,7 @@ def _commit_changes(
             changed_files=changed_files,
             message=f"Pushed follow-up commit to PR #{req.pr_number}.",
             url=f"https://github.com/{owner}/{repo}/pull/{req.pr_number}",
+            verify_verdict=verdict,
         )
 
     # new_pr
@@ -1196,8 +1203,10 @@ def _commit_changes(
     # verdict, tear the branch down and return without a PR.
     verify_run_url: Optional[str] = None
     verify_runs: Optional[int] = None
+    verdict = None
     if verify is not None:
         outcome = verify(parent_sha, commit_sha)
+        verdict = outcome.verdict
         if not outcome.is_fixed:
             try:
                 gh.delete_ref(owner, repo, f"heads/{branch}")
@@ -1274,6 +1283,7 @@ def _commit_changes(
         changed_files=changed_files,
         message=f"Opened PR #{pr.get('number')}.",
         url=pr.get("html_url"),
+        verify_verdict=verdict,
     )
 
 
