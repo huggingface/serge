@@ -197,22 +197,24 @@ class Config:
     # CLASSIFY_BAIL_ON_ENVIRONMENT=0 to investigate them anyway (the old
     # behaviour) if the label ever starts misfiring.
     classify_bail_on_environment: bool = True
-    # Per-traceback char budget when serge seeds the reproduced/verify failures
-    # into the fix prompt. The GPU run emits full assertion diffs (pytest -vv);
-    # the old 2000-char tail chopped the very generated strings the LLM needs to
-    # rewrite stale expected values. Raised to 40000 to pair with the verdict
-    # tool's traceback distiller (serge_verify_verdict.distill_failure): the
-    # distiller caps KB-scale intermediate tensors so a distilled traceback is
-    # ~20-30KB, and this budget keeps the whole of it — including the assert diff
-    # and the asserted actual output, which sit at the HEAD of the longrepr and a
-    # smaller tail-cut would drop (the owlvit/instructblip cases).
-    # Tunable via REPRODUCE_TB_CHARS.
-    # Per-traceback cap for the reproduce block. MUST stay below
-    # prompts.CONTEXT_TAIL_RESERVE_CHARS: this used to be 40000, exactly equal to
-    # MAX_CONTEXT_CHARS, so the block was allowed to claim the entire context
-    # budget on its own and was then appended after the report and truncated
-    # away. Aligned with _format_reproduce_feedback's own default.
-    reproduce_tb_chars: int = 12000
+    # Char budget for the reproduce/verify block **as a whole** when serge seeds
+    # the GPU failures into the fix prompt — NOT a per-traceback cap. The
+    # formatters show up to 5 tracebacks and divide this budget across the ones
+    # actually present (tasks._tb_budget), because what has to fit somewhere is
+    # the block, not one traceback:
+    #
+    #   * as a per-traceback cap of 40000 it produced a 121,417-char block
+    #     (job f50c5e85) against a 40,000-char context — the block was appended
+    #     past MAX_CONTEXT_CHARS and head-truncation deleted it outright (#103);
+    #   * dropping the same knob to 12000 kept the block (25,197 chars on job
+    #     d2d9c129) but cut each traceback to its last 12,000 chars, which for a
+    #     25,586-char longrepr is the --showlocals tensor dump and none of the
+    #     assertion diff. That job returned no_fix saying so.
+    #
+    # Sized to fit prompts.CONTEXT_TAIL_RESERVE_CHARS, so a full block survives
+    # context truncation. Tunable via REPRODUCE_BLOCK_CHARS (REPRODUCE_TB_CHARS
+    # is still read as a legacy alias).
+    reproduce_block_chars: int = 32000
     # Optional task-only completion-token cap. When unset, tasks use the
     # normal llm_max_tokens value.
     task_llm_max_tokens: Optional[int] = None
@@ -474,7 +476,9 @@ class Config:
             classify_bail_on_environment=_bool_env(
                 "CLASSIFY_BAIL_ON_ENVIRONMENT", True
             ),
-            reproduce_tb_chars=_int_env("REPRODUCE_TB_CHARS", 12000),
+            reproduce_block_chars=_int_env(
+                "REPRODUCE_BLOCK_CHARS", _int_env("REPRODUCE_TB_CHARS", 32000)
+            ),
             # Streaming on by default — the web UI's live token counter
             # and reasoning display rely on incremental SSE chunks. Set
             # LLM_STREAM=0 to fall back to the buffered REST path.

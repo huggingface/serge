@@ -1,6 +1,7 @@
 import types
+import unittest
 
-from reviewbot import tasks
+from reviewbot import prompts, tasks
 from reviewbot.classify import (
     ENVIRONMENT_ISSUE,
     PRODUCT_ISSUE,
@@ -33,7 +34,7 @@ def _cfg(reproduce_first=True, bail_on_env=True):
         verify_poll_timeout=100,
         verify_poll_interval=0,
         classify_max_tokens=4096,
-        reproduce_tb_chars=12000,
+        reproduce_block_chars=32000,
     )
 
 
@@ -308,3 +309,76 @@ def test_decorate_body_no_gpu_section_without_footer():
     plan = tasks.TaskPlan(title="t", body="b", patch="p")
     req = types.SimpleNamespace(context="")
     assert "Verified on GPU" not in tasks._decorate_body(cfg, plan, req)
+
+
+class TracebackClipTests(unittest.TestCase):
+    """Regression cover for the two truncation bugs the 2026-08-31 reproduce
+    artifacts exposed. Both fixtures mirror a real longrepr layout: the
+    load-bearing ``E`` block sits at the HEAD in one shape and at the END in the
+    other, so a single-ended cut always deletes it for one of them."""
+
+    # mm_grounding_dino: pytest prepends the assertion summary, so everything
+    # the model needs is in the first ~2.4k and the rest is --showlocals noise.
+    HEAD_SHAPE = (
+        "AssertionError: Tensor-likes are not close!\n"
+        "Mismatched elements: 9 / 9 (100.0%)\n"
+        "        expected_logits = torch.tensor([[-5.1160, -0.2143]])\n"
+        ">       torch.testing.assert_close(outputs.logits[0, :3, :3], expected_logits)\n"
+        "E       AssertionError: Tensor-likes are not close!\n"
+    ) + "pixel_values = tensor([[0.2795, 0.3138]])\n" * 4000
+
+    # cwm / kimi_k25: a huge inline Expectations({...}) literal in the test
+    # source pushes the E block to within ~10k of the end.
+    TAIL_SHAPE = (
+        (
+            "self = <tests.models.kimi_k25.test_modeling_kimi_k25.KimiK25IntegrationTest>\n"
+            "    expectations = Expectations({('cuda', None): [\n"
+        )
+        + "        [0.123, 0.456, 0.789],\n" * 4000
+        + ("E       RuntimeError: index out of range in self\n")
+    )
+
+    def test_head_shape_keeps_the_assertion_diff(self) -> None:
+        out = tasks._clip_tb(self.HEAD_SHAPE, 12000)
+        self.assertLess(len(self.HEAD_SHAPE), 200_000)
+        self.assertIn("Tensor-likes are not close", out)
+        self.assertIn("expected_logits = torch.tensor", out)
+        self.assertIn("E       AssertionError", out)
+
+    def test_tail_shape_keeps_the_error_line(self) -> None:
+        out = tasks._clip_tb(self.TAIL_SHAPE, 12000)
+        self.assertIn("E       RuntimeError: index out of range in self", out)
+
+    def test_a_tail_only_cut_would_have_lost_the_head_shape(self) -> None:
+        """The bug this replaces: the old cut kept only ``text[-max_chars:]``."""
+        self.assertNotIn("expected_logits = torch.tensor", self.HEAD_SHAPE[-12000:])
+
+    def test_short_tracebacks_are_returned_whole(self) -> None:
+        self.assertEqual(tasks._clip_tb("short", 12000), "short")
+        self.assertEqual(tasks._clip_tb(None, 12000), "")
+
+    def test_clip_respects_the_budget(self) -> None:
+        out = tasks._clip_tb("x" * 50_000, 12000)
+        # The marker adds a bounded constant; the kept text is within budget.
+        self.assertLessEqual(len(out), 12000 + 200)
+
+    def test_budget_is_divided_across_the_tracebacks_present(self) -> None:
+        self.assertEqual(tasks._tb_budget(1, 32000), 32000)
+        self.assertEqual(tasks._tb_budget(2, 32000), 16000)
+        # Never below the floor, however many tests failed.
+        self.assertEqual(tasks._tb_budget(20, 32000), tasks.MIN_TB_CHARS)
+        self.assertEqual(tasks._tb_budget(0, 32000), 32000)
+
+    def test_reproduce_block_stays_within_the_context_reserve(self) -> None:
+        """A 5-traceback block used to be able to reach 5x the per-tb cap; the
+        block budget is what has to fit inside CONTEXT_TAIL_RESERVE_CHARS."""
+        outcome = VerifyOutcome(
+            verdict=REPRODUCED,
+            run_url="u",
+            detail="d",
+            tracebacks={f"t{i}": "y" * 200_000 for i in range(5)},
+        )
+        block = tasks._format_reproduce_feedback(
+            outcome, ClassifyResult(TEST_ISSUE, "r"), max_chars=32000
+        )
+        self.assertLessEqual(len(block), prompts.CONTEXT_TAIL_RESERVE_CHARS)
