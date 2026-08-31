@@ -653,6 +653,36 @@ def _read_repo_conventions(cfg: Config, checkout: Checkout) -> str:
     return cfg.default_review_rules
 
 
+def prompt_prefix_summary(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    conventions: str = "",
+    normalize_guidance: str | None = "",
+    context: str = "",
+    instruction: str = "",
+    existing_diff: str | None = "",
+) -> str:
+    """One line naming the size of every part of the resent prompt prefix.
+
+    Pure so the wording is testable without a checkout, an LLM or a GPU. Chars
+    rather than tokens deliberately: the exact token count already arrives in
+    the per-turn ``metrics`` events, and a char count needs no tokenizer for a
+    model whose tokenizer we do not ship.
+    """
+    total = len(system_prompt) + len(user_prompt)
+    return (
+        f"Prompt prefix {total:,} chars, resent every turn: "
+        f"system {len(system_prompt):,} "
+        f"[conventions {len(conventions or ''):,}, "
+        f"normalize-guidance {len(normalize_guidance or ''):,}] · "
+        f"user {len(user_prompt):,} "
+        f"[context {len(context or ''):,}, "
+        f"instruction {len(instruction or ''):,}, "
+        f"existing-diff {len(existing_diff or ''):,}]"
+    )
+
+
 def prepare_task(
     cfg: Config,
     req: TaskRequest,
@@ -691,8 +721,9 @@ def prepare_task(
         stream=cfg.llm_stream,
         compressor=MessageCompressor.from_env(),
     )
+    conventions = _read_repo_conventions(cfg, checkout)
     system_prompt = build_task_system_prompt(
-        _read_repo_conventions(cfg, checkout),
+        conventions,
         cfg.task_normalize_guidance,
         tools_enabled=tool_env is not None,
     )
@@ -702,6 +733,30 @@ def prepare_task(
         instruction=req.instruction,
         context=req.context,
         existing_diff=existing_diff,
+    )
+
+    # This prefix is resent on EVERY turn, so its size -- not the number of tool
+    # calls -- sets how many turns the input-token cap buys. Measured on a real
+    # 51-turn task (mm_grounding_dino, 2026-08-31): turn 1 cost 25,335 input
+    # tokens and the conversation itself then grew only ~510 tokens a turn, so
+    # ~63% of the whole 2M budget went on re-sending this prefix. The known
+    # components (system template, conventions, tool schemas, dispatched ITF
+    # context) account for only ~3.2k of those 25.3k, and the residue is
+    # believed to be the GPU reproduce/verify feedback that `_with_feedback`
+    # appends to `req.context`. "Believed" is the problem: it was reached by
+    # subtraction because the request body is never logged. Log the breakdown
+    # once per task so the dominant component is a fact in the job row.
+    _emit(
+        "log",
+        prompt_prefix_summary(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            conventions=conventions,
+            normalize_guidance=cfg.task_normalize_guidance,
+            context=req.context,
+            instruction=req.instruction,
+            existing_diff=existing_diff,
+        ),
     )
 
     # Wire the normalize verification gate into the loop when configured. The
