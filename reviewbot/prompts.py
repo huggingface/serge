@@ -234,6 +234,39 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + f"\n[... truncated, {len(text) - limit} chars omitted ...]"
 
 
+def _truncate_middle(text: str, limit: int, tail: int) -> str:
+    """Keep the first ``limit - tail`` chars AND the last ``tail`` chars,
+    dropping the middle.
+
+    Plain head truncation cannot be used on a task context, because both ends
+    carry something load-bearing:
+
+    * the **head** opens with the ``<!-- serge-task:... -->`` marker and the
+      fingerprint line, which the instruction requires be copied into the PR
+      body — lose it and the PR no longer links back to its triage row;
+    * the **tail** is where ``_with_verify_feedback`` appends the GPU
+      reproduce/verify block, which announces itself as *authoritative* and
+      carries the triage steer (test issue vs library bug).
+
+    Head truncation kept the first and silently discarded the second. Measured
+    on 2026-08-31: three live task contexts of 42,815 / 62,939 / 124,011 chars
+    against a 40,000 limit dropped 2,815 / 22,939 / 84,011 chars from the tail,
+    so two of the three lost the whole reproduce block — roughly 50 GPU-minutes
+    of evidence each — and worked from the report's head instead.
+    """
+    if len(text) <= limit:
+        return text
+    tail = max(0, min(tail, limit))
+    head_len = limit - tail
+    omitted = len(text) - limit
+    head = text[:head_len]
+    kept_tail = text[len(text) - tail :] if tail else ""
+    return (
+        f"{head}\n[... {omitted} chars omitted from the middle; the end of the "
+        f"context follows ...]\n{kept_tail}"
+    )
+
+
 # Sequences a malicious PR body / diff line could use to spoof the
 # boundary markers around untrusted blocks (see USER_PROMPT_TEMPLATE).
 # We don't try to be exhaustive — collapsing the marker prefix is enough
@@ -478,6 +511,11 @@ def build_user_prompt(
 
 MAX_INSTRUCTION_CHARS = 8000
 MAX_CONTEXT_CHARS = 40000
+# How much of the END of a task context is protected from truncation. The
+# appended GPU reproduce/verify block lives there and is the authoritative
+# evidence for the fix, so it must outrank the middle of the report. Sized above
+# `Config.reproduce_tb_chars` (12000) so a full block fits inside the reserve.
+CONTEXT_TAIL_RESERVE_CHARS = 16000
 
 
 TASK_SYSTEM_PROMPT_TEMPLATE = """You are an expert software engineer making a
@@ -611,7 +649,11 @@ def build_task_user_prompt(
         instruction=_scrub_delimiters(
             _truncate(instruction or "(none)", MAX_INSTRUCTION_CHARS)
         ),
-        context=_scrub_delimiters(_truncate(context or "(none)", MAX_CONTEXT_CHARS)),
+        context=_scrub_delimiters(
+            _truncate_middle(
+                context or "(none)", MAX_CONTEXT_CHARS, CONTEXT_TAIL_RESERVE_CHARS
+            )
+        ),
         existing_block=existing_block,
         today_iso=today.isoformat(),
     )
