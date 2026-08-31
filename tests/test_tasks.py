@@ -13,6 +13,7 @@ from reviewbot.clone_cache import Checkout, CloneCache
 from reviewbot.config import Config
 from reviewbot.github_client import SERGE_GIT_EMAIL
 from reviewbot.tasks import (
+    prompt_prefix_summary,
     MAX_REVIEWERS,
     NormalizeGateBroken,
     TaskError,
@@ -1310,3 +1311,46 @@ class ReadRepoConventionsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PromptPrefixSummaryTests(unittest.TestCase):
+    """The prefix is resent on every turn, so its breakdown is what explains
+    where an input-token budget went. Measured on a real 51-turn task: turn 1
+    cost 25,335 tokens and the conversation then grew only ~510 a turn, so ~63%
+    of the 2M cap was this prefix -- and which component dominates was reached
+    by subtraction, which is what this line replaces."""
+
+    def test_names_every_component(self) -> None:
+        line = prompt_prefix_summary(
+            system_prompt="s" * 4000,
+            user_prompt="u" * 90000,
+            conventions="c" * 3597,
+            normalize_guidance="n" * 120,
+            context="x" * 88000,
+            instruction="i" * 1000,
+            existing_diff="",
+        )
+        self.assertIn("Prompt prefix 94,000 chars", line)
+        self.assertIn("system 4,000", line)
+        self.assertIn("conventions 3,597", line)
+        self.assertIn("normalize-guidance 120", line)
+        self.assertIn("user 90,000", line)
+        self.assertIn("context 88,000", line)
+        self.assertIn("instruction 1,000", line)
+        self.assertIn("existing-diff 0", line)
+
+    def test_none_components_are_zero_not_a_crash(self) -> None:
+        # normalize_guidance and existing_diff are Optional in the real call.
+        line = prompt_prefix_summary(
+            system_prompt="s",
+            user_prompt="u",
+            normalize_guidance=None,
+            existing_diff=None,
+        )
+        self.assertIn("normalize-guidance 0", line)
+        self.assertIn("existing-diff 0", line)
+        self.assertIn("Prompt prefix 2 chars", line)
+
+    def test_total_is_system_plus_user(self) -> None:
+        line = prompt_prefix_summary(system_prompt="a" * 10, user_prompt="b" * 5)
+        self.assertIn("Prompt prefix 15 chars", line)
