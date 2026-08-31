@@ -1,6 +1,10 @@
 import unittest
 
 from reviewbot.prompts import (
+    CONTEXT_TAIL_RESERVE_CHARS,
+    MAX_CONTEXT_CHARS,
+    _truncate_middle,
+    build_task_user_prompt,
     build_followup_system_prompt,
     build_followup_user_prompt,
     build_system_prompt,
@@ -90,3 +94,92 @@ class FollowupPromptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContextTruncationTests(unittest.TestCase):
+    """A task context is load-bearing at BOTH ends, so it truncates in the
+    middle.
+
+    Head: the `<!-- serge-task:... -->` marker and fingerprint the instruction
+    requires in the PR body. Tail: the GPU reproduce/verify block appended by
+    `_with_verify_feedback`, which announces itself as authoritative and carries
+    the triage steer. Head truncation kept the first and silently dropped the
+    second."""
+
+    MARKER = "<!-- serge-task:integration-failure-triage:sha256:abc123 -->"
+    REPRODUCE = "## The targeted test(s) were REPRODUCED on GPU (authoritative)"
+
+    def _context(self, filler_chars: int) -> str:
+        return (
+            f"{self.MARKER}\nSerge task fingerprint: `abc123`.\n\n"
+            + ("REPORT " * (filler_chars // 7))[:filler_chars]
+            + f"\n\n{self.REPRODUCE}\n\nE AssertionError: Tensor-likes are not close!"
+        )
+
+    def _prompt(self, context: str) -> str:
+        return build_task_user_prompt(
+            repo_full_name="huggingface/transformers",
+            base_ref="main",
+            instruction="fix it",
+            context=context,
+            existing_diff="",
+        )
+
+    def test_reproduce_block_survives_a_context_over_the_limit(self) -> None:
+        # The live 124,011-char case: head truncation dropped 84,011 chars from
+        # the tail and the model never saw the reproduce block.
+        prompt = self._prompt(self._context(121_000))
+        self.assertIn(self.REPRODUCE, prompt)
+        self.assertIn("Tensor-likes are not close", prompt)
+
+    def test_marker_also_survives(self) -> None:
+        prompt = self._prompt(self._context(121_000))
+        self.assertIn(self.MARKER, prompt)
+        self.assertIn("Serge task fingerprint", prompt)
+
+    def test_live_sizes_all_keep_both_ends(self) -> None:
+        # The three real contexts measured on 2026-08-31.
+        for size in (42_815, 62_939, 124_011):
+            with self.subTest(context_chars=size):
+                prompt = self._prompt(self._context(size))
+                self.assertIn(self.MARKER, prompt)
+                self.assertIn(self.REPRODUCE, prompt)
+
+    def test_short_context_is_untouched(self) -> None:
+        ctx = self._context(100)
+        prompt = self._prompt(ctx)
+        self.assertNotIn("omitted from the middle", prompt)
+        self.assertIn(self.REPRODUCE, prompt)
+
+    def test_says_the_middle_was_dropped(self) -> None:
+        prompt = self._prompt(self._context(121_000))
+        self.assertIn("omitted from the middle", prompt)
+
+
+class TruncateMiddleTests(unittest.TestCase):
+    def test_keeps_head_and_tail_and_reports_the_gap(self) -> None:
+        text = "H" * 100 + "M" * 800 + "T" * 100
+        out = _truncate_middle(text, limit=200, tail=100)
+        self.assertTrue(out.startswith("H" * 100))
+        self.assertTrue(out.endswith("T" * 100))
+        self.assertIn("800 chars omitted from the middle", out)
+
+    def test_under_limit_is_returned_verbatim(self) -> None:
+        self.assertEqual(_truncate_middle("short", 100, 50), "short")
+
+    def test_tail_larger_than_limit_is_clamped(self) -> None:
+        # Degenerate config must not produce a negative head slice.
+        out = _truncate_middle("x" * 500, limit=100, tail=999)
+        self.assertIn("omitted from the middle", out)
+        self.assertTrue(out.endswith("x" * 100))
+
+    def test_zero_tail_behaves_like_head_truncation(self) -> None:
+        out = _truncate_middle("A" * 50 + "B" * 50, limit=50, tail=0)
+        self.assertTrue(out.startswith("A" * 50))
+        self.assertNotIn("B", out)
+
+    def test_reserve_fits_a_full_reproduce_block(self) -> None:
+        # The whole point of the constant: a maximal reproduce block
+        # (Config.reproduce_tb_chars = 12000) must fit inside the reserve.
+        self.assertGreater(CONTEXT_TAIL_RESERVE_CHARS, 12_000)
+        self.assertLess(CONTEXT_TAIL_RESERVE_CHARS, MAX_CONTEXT_CHARS)
