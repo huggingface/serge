@@ -295,3 +295,123 @@ def test_recording_fixed_does_not_trigger_a_retry_round():
     is not in `_RETRYABLE`."""
     assert not verify.should_retry(verify.FIXED)
     assert not verify.should_retry(verify.ALREADY_PASSING)
+
+
+# ── A gate that never ran is not a rejection ────────────────────────────────
+# Job b228e033 (2026-08-31) committed a candidate, dispatched GPU verify, and
+# was killed by TASK_RUNNER_TIMEOUT while the run sat queued for a runner. No
+# code got to react, so the branch survived with no PR and no verdict. 5 of 79
+# serge fix branches were orphaned that way.
+
+
+def test_gate_did_not_run_covers_only_orchestration_verdicts():
+    for v in (
+        verify.TIMEOUT,
+        verify.NO_RESULT,
+        verify.DISPATCH_FAILED,
+        verify.NO_TARGETS,
+    ):
+        assert verify.gate_did_not_run(v), v
+    # `error` is the workflow RUNNING and reporting something unverifiable — a
+    # real reason to refuse the patch, not an infrastructure miss.
+    for v in (
+        verify.FIXED,
+        verify.NOT_FIXED,
+        verify.BROKE_OTHERS,
+        verify.ALREADY_PASSING,
+        verify.ERROR,
+    ):
+        assert not verify.gate_did_not_run(v), v
+
+
+def _commit_with_verdict(verdict, monkeypatch):
+    from reviewbot.clone_cache import FileChange
+
+    monkeypatch.setattr(
+        tasks, "post_task_pr_created_notification", lambda **_k: None, raising=False
+    )
+    gh = _VerdictGH()
+    req = tasks.TaskRequest(
+        owner="acme",
+        repo="widget",
+        base_ref="main",
+        instruction="fix",
+        context="",
+        mode="new_pr",
+    )
+    result = tasks._commit_changes(
+        _full_cfg(),
+        gh,
+        req,
+        changes=[FileChange(path="a.txt", status="M", content=b"x", mode="100644")],
+        plan=tasks.TaskPlan(title="t", body="b", patch="p"),
+        job_id="job12345",
+        emit_fn=lambda *_a: None,
+        verify=lambda parent, candidate: verify.VerifyOutcome(verdict=verdict),
+    )
+    return result, gh
+
+
+def test_an_unjudged_verdict_keeps_the_branch_and_opens_no_pr(monkeypatch):
+    result, gh = _commit_with_verdict(verify.TIMEOUT, monkeypatch)
+    assert gh.created_pr is None, "an unverified patch must not enter the review queue"
+    assert gh.deleted == [], "the branch is the only surviving artifact — keep it"
+    assert result.branch, "the branch name must travel so the issue can link it"
+    assert result.no_change
+    assert result.verify_verdict == verify.TIMEOUT
+    assert result.branch in result.message
+    assert "UNVERIFIED" in result.message
+
+
+def test_a_real_rejection_still_tears_the_branch_down(monkeypatch):
+    result, gh = _commit_with_verdict(verify.NOT_FIXED, monkeypatch)
+    assert gh.created_pr is None
+    assert gh.deleted, "a judged-bad patch should not leave a branch behind"
+    assert result.verify_verdict == verify.NOT_FIXED
+
+
+def test_error_is_a_rejection_not_an_infrastructure_miss(monkeypatch):
+    _result, gh = _commit_with_verdict(verify.ERROR, monkeypatch)
+    assert gh.deleted, "`error` means the workflow ran and reported it"
+
+
+def test_effective_poll_timeout_is_clamped_to_the_runner_budget():
+    # 78 minutes into a 120-minute budget, the poll believed it had 60.
+    t0 = tasks._PROCESS_START
+    out = tasks.effective_poll_timeout(3600, 7200, now=t0 + 78 * 60)
+    assert out == 7200 - 78 * 60 - tasks._VERIFY_WINDDOWN_SECONDS
+    assert out < 3600
+
+
+def test_effective_poll_timeout_passes_through_without_a_deadline():
+    assert tasks.effective_poll_timeout(3600, None) == 3600
+    assert tasks.effective_poll_timeout(3600, 0) == 3600
+
+
+def test_effective_poll_timeout_never_goes_negative():
+    t0 = tasks._PROCESS_START
+    assert tasks.effective_poll_timeout(3600, 7200, now=t0 + 10_000) == 0
+
+
+def test_the_runner_is_told_its_own_deadline():
+    from reviewbot import launcher
+
+    assert "task_runner_timeout" in launcher.RUNNER_CONFIG_FIELDS
+
+
+# ── A killed runner must not be recorded as a free 0-turn bail ──────────────
+
+
+def test_runner_lost_is_distinct_from_never_running_the_loop():
+    from reviewbot.reviewer import (
+        STOP_NO_LLM_TURNS,
+        STOP_RUNNER_LOST,
+        no_llm_session_record,
+    )
+
+    assert STOP_RUNNER_LOST != STOP_NO_LLM_TURNS
+    assert no_llm_session_record()["stop_reason"] == STOP_NO_LLM_TURNS
+    assert no_llm_session_record(STOP_RUNNER_LOST)["stop_reason"] == STOP_RUNNER_LOST
+    # Counters stay zero either way; the stop_reason is what says whether zero
+    # means "spent nothing" or "we do not know what it spent".
+    assert no_llm_session_record(STOP_RUNNER_LOST)["turns"] == 0

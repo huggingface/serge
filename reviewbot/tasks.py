@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -50,6 +51,7 @@ from .verify import (
     REPRODUCED,
     VerifyOutcome,
     extract_verify_targets,
+    gate_did_not_run,
     run_gpu_reproduce,
     run_gpu_verify,
     should_retry,
@@ -986,6 +988,19 @@ def _decorate_body(
     return body
 
 
+def _verify_unjudged_message(outcome: VerifyOutcome, branch: str) -> str:
+    """What to report when the gate never ran. Names the branch, because that
+    branch is the only surviving artifact of the work and nothing else points
+    at it."""
+    where = f" ({outcome.run_url})" if outcome.run_url else ""
+    return (
+        f"A candidate patch was committed to `{branch}` but GPU verification "
+        f"could not run (`{outcome.verdict}`){where}, so it is UNVERIFIED and no "
+        "PR was opened. The branch is kept: re-run verification against it, or "
+        "delete it if the group has moved on."
+    )
+
+
 def _verify_failure_message(outcome: VerifyOutcome) -> str:
     """Human/next-run explanation when GPU verify does not confirm the fix."""
     reasons = {
@@ -1013,6 +1028,37 @@ def _verify_failure_message(outcome: VerifyOutcome) -> str:
     for nodeid, tb in list(outcome.tracebacks.items())[:5]:
         lines.append(f"\n### {nodeid}\n```\n{(tb or '')[-1500:]}\n```")
     return "\n".join(lines)
+
+
+# When the runner process started, so the verify poll can be bounded by the
+# budget the runner has LEFT rather than an absolute hour. `TASK_RUNNER_TIMEOUT`
+# is enforced from outside — webapp waits on the subprocess and kills it — so a
+# poll that outlives the runner is not a slow poll, it is a lost job: no code in
+# this process gets to run, and the branch is left with no PR and no verdict.
+#
+# Observed 2026-08-31 on job `b228e033`: LLM work finished 78 minutes into a
+# 120-minute budget, verify was dispatched, and the poll believed it had its
+# full 60 minutes when 42 remained. 5 of 79 serge fix branches (6%) are orphaned
+# patches with no PR, which is what this shape leaves behind.
+_PROCESS_START = time.monotonic()
+# Leave the runner room to open the PR and report after the poll gives up.
+_VERIFY_WINDDOWN_SECONDS = 180
+
+
+def effective_poll_timeout(
+    configured: int, runner_timeout: Optional[int], *, now: Optional[float] = None
+) -> int:
+    """The verify poll timeout, clamped to the runner's remaining budget.
+
+    Returns ``configured`` unchanged when there is no runner deadline (an
+    unbounded or locally-run task). Never returns less than 0; a caller that
+    gets 0 should treat the gate as unavailable rather than poll forever.
+    """
+    if not runner_timeout:
+        return configured
+    elapsed = (now if now is not None else time.monotonic()) - _PROCESS_START
+    remaining = runner_timeout - elapsed - _VERIFY_WINDDOWN_SECONDS
+    return max(0, int(min(configured, remaining)))
 
 
 def _make_verify_gate(
@@ -1048,7 +1094,9 @@ def _make_verify_gate(
             default_machine_type=cfg.verify_machine_type,
             run_collateral=cfg.verify_run_collateral,
             transformersci_ref=cfg.verify_transformersci_ref,
-            poll_timeout=cfg.verify_poll_timeout,
+            poll_timeout=effective_poll_timeout(
+                cfg.verify_poll_timeout, getattr(cfg, "task_runner_timeout", None)
+            ),
             poll_interval=cfg.verify_poll_interval,
             emit=emit_fn,
         )
@@ -1207,6 +1255,32 @@ def _commit_changes(
     if verify is not None:
         outcome = verify(parent_sha, commit_sha)
         verdict = outcome.verdict
+        if gate_did_not_run(verdict):
+            # The gate never judged this patch — no runner picked the job up, the
+            # dispatch failed, or no artifact came back. That says nothing about
+            # the candidate, so deleting the branch throws away work for a reason
+            # that is not about the work. KEEP it, and report it: the branch name
+            # travels in TaskResult.to_json(), so the triage reconciler can link
+            # it from the tracking issue and say verification could not run.
+            #
+            # No PR: an unverified patch must not land in the review queue looking
+            # like a verified one. 5 of 79 serge fix branches were orphaned this
+            # way before this existed — committed patches with no PR and no
+            # verdict, invisible unless someone listed the refs.
+            emit_fn(
+                "log",
+                f"GPU verify could not run ({verdict}); keeping branch {branch} "
+                "unverified and opening no PR.",
+            )
+            return TaskResult(
+                mode=req.mode,
+                no_change=True,
+                branch=branch,
+                commit_sha=commit_sha,
+                message=_verify_unjudged_message(outcome, branch),
+                verify_verdict=verdict,
+                verify_tracebacks=outcome.tracebacks,
+            )
         if not outcome.is_fixed:
             try:
                 gh.delete_ref(owner, repo, f"heads/{branch}")

@@ -504,17 +504,30 @@ STOP_CHUNK_BUDGET = "chunk_input_token_cap"
 # the 10 tasks in the measured window — and it has to be countable, otherwise
 # "serge did nothing for 0 turns" and "serge never ran" look identical.
 STOP_NO_LLM_TURNS = "no_llm_turns"
+# The runner died before reporting anything, so what it spent is unknown. This
+# must NOT be recorded as `no_llm_turns`: that value means "the job legitimately
+# never reached the loop" and is a cheap outcome, and conflating the two makes an
+# expensive job look free. Job `b228e033` was killed by TASK_RUNNER_TIMEOUT while
+# polling for a GPU runner, after 28 LLM turns and 879,010 input tokens, and was
+# recorded as `no_llm_turns` with turns=0 — 1 of the 7 `no_llm_turns` rows in the
+# store was this, i.e. 14% of the "free bail" population was not free at all.
+STOP_RUNNER_LOST = "runner_lost"
 
 
-def no_llm_session_record() -> dict[str, Any]:
-    """A zeroed session for a job that never reached the agent loop."""
+def no_llm_session_record(stop_reason: str = STOP_NO_LLM_TURNS) -> dict[str, Any]:
+    """A zeroed session for a job that never reported one.
+
+    ``stop_reason`` distinguishes *why* the counters are zero: the default means
+    the job really did skip the agent loop, while :data:`STOP_RUNNER_LOST` means
+    the counters are unknown rather than zero.
+    """
     return {
         "turns": 0,
         "tool_calls": 0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "seconds": 0.0,
-        "stop_reason": STOP_NO_LLM_TURNS,
+        "stop_reason": stop_reason,
         "repeats": 0,
         "distinct_paths": 0,
         "path_revisits": 0,

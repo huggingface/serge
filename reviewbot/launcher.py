@@ -77,6 +77,9 @@ RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
     "verify_run_collateral",
     "verify_machine_type",
     "verify_poll_timeout",
+    # The runner needs its OWN deadline to bound the verify poll by the budget it
+    # has left; without it the poll outlives the process that is waiting on it.
+    "task_runner_timeout",
     "verify_poll_interval",
     "verify_max_rounds",
     "classify_max_tokens",

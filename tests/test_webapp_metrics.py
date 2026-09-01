@@ -152,3 +152,49 @@ class WebappMetricsTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class RunnerLostSessionTests(WebappMetricsTests):
+    """A runner killed before it reports leaves no session. Falling back to the
+    `no_llm_turns` record makes an expensive job look free: job `b228e033` was
+    killed by TASK_RUNNER_TIMEOUT after 28 LLM turns and 879,010 input tokens
+    and was recorded as `no_llm_turns` with turns=0. 1 of the 7 `no_llm_turns`
+    rows in the prod store was that, i.e. 14% of the "free bail" population."""
+
+    def _job(self, status, session=None):
+        j = self.webapp.Job(
+            id="j1",
+            user="u",
+            target_owner="acme",
+            target_repo="widget",
+            target_number=1,
+            trigger_comment="",
+            llm_provider="p",
+            llm_api_base="b",
+            llm_model="m",
+            created_at=0.0,
+            kind="task",
+        )
+        j.status = status
+        j.session = session
+        return j
+
+    def test_an_errored_job_with_no_session_is_runner_lost(self) -> None:
+        from reviewbot.reviewer import STOP_RUNNER_LOST
+
+        s = self.webapp._session_with_outcome(self._job("error"))
+        self.assertEqual(s["stop_reason"], STOP_RUNNER_LOST)
+        self.assertEqual(s["outcome"], "error")
+
+    def test_a_non_error_job_with_no_session_still_reads_no_llm_turns(self) -> None:
+        from reviewbot.reviewer import STOP_NO_LLM_TURNS
+
+        s = self.webapp._session_with_outcome(self._job("no_fix"))
+        self.assertEqual(s["stop_reason"], STOP_NO_LLM_TURNS)
+
+    def test_a_reported_session_is_never_overwritten(self) -> None:
+        s = self.webapp._session_with_outcome(
+            self._job("error", {"turns": 28, "stop_reason": "repeat_guard"})
+        )
+        self.assertEqual(s["turns"], 28)
+        self.assertEqual(s["stop_reason"], "repeat_guard")
