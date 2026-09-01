@@ -31,6 +31,7 @@ from .clone_cache import Checkout, CloneCache, FileChange
 from .commit_scope import describe_dropped, scope_paths
 from .compression import MessageCompressor
 from .config import Config
+from .expectation_guard import PatchClassification, classify_patch
 from .github_client import SERGE_GIT_EMAIL, GitHubClient
 from .llm_client import ChatCompletionClient
 from .normalize import NormalizeError, run_normalize
@@ -204,6 +205,13 @@ class TaskResult:
     # to the next LLM round. Not persisted in ``to_json`` (tracebacks are large).
     verify_verdict: Optional[str] = None
     verify_tracebacks: dict[str, str] = field(default_factory=dict)
+    # True when the patch changed only expected values in test files, so the GPU
+    # verdict above is circular and must not be reported as confidence — see
+    # :mod:`reviewbot.expectation_guard`. Travels in ``to_json`` because the
+    # triage recap and the session metrics are where "verify_verdict=fixed" is
+    # otherwise read as success.
+    expectation_only: bool = False
+    expectation_note: str = ""
     # Agent-loop counters accumulated over every round this candidate ran
     # (reviewer.merge_session_records). Small — counters only, no tracebacks —
     # so unlike ``verify_tracebacks`` it does travel in ``to_json``, which is
@@ -221,6 +229,8 @@ class TaskResult:
             "commit_sha": self.commit_sha,
             "changed_files": self.changed_files,
             "verify_verdict": self.verify_verdict,
+            "expectation_only": self.expectation_only,
+            "expectation_note": self.expectation_note,
             "session": self.session,
         }
 
@@ -1116,6 +1126,7 @@ def _verification_footer(
     verify_run_url: Optional[str],
     reproduce_run_url: Optional[str],
     runs: Optional[int] = None,
+    classification: Optional[PatchClassification] = None,
 ) -> str:
     """Provenance appended to the PR body: serge ran the targeted ``@slow`` tests
     on GPU and opened this PR only after they passed with the patch. Links the
@@ -1131,13 +1142,31 @@ def _verification_footer(
         if runs and runs > 1
         else ""
     )
-    lines = [
-        "",
-        "---",
-        "### ✅ Verified on GPU",
-        "serge ran the targeted `@slow` test(s) on a GPU runner and opened this PR "
-        "only after they passed with this patch." + flakiness,
-    ]
+    # An expectation-only patch rewrote the assertion the gate then re-ran, so
+    # the green run is circular and cannot be offered as confidence. The runs
+    # are still linked — a reviewer needs them to see what the model produced —
+    # but the heading and the claim are replaced, not decorated. Leaving
+    # "✅ Verified on GPU" on such a PR is exactly the reasoning the review
+    # prompt tells a human reviewer to reject (prompts.py, CHANGED EXPECTATIONS).
+    if classification is not None and classification.expectation_only:
+        lines = [
+            "",
+            "---",
+            "### ⚠️ Not verified — this patch changed the expectation",
+            classification.reason(),
+            "",
+            "The GPU run below is **not evidence that this change is correct**: "
+            "the tests were re-run after the patch rewrote what they assert, so "
+            "they pass by construction. Judge the new value on its merits.",
+        ]
+    else:
+        lines = [
+            "",
+            "---",
+            "### ✅ Verified on GPU",
+            "serge ran the targeted `@slow` test(s) on a GPU runner and opened this PR "
+            "only after they passed with this patch." + flakiness,
+        ]
     if verify_run_url:
         lines.append(f"- **Passes with this patch:** {verify_run_url}")
     if reproduce_run_url:
@@ -1168,6 +1197,20 @@ def _commit_changes(
         "log",
         f"Change touches {len(changed_files)} file(s): {', '.join(changed_files)}",
     )
+    # Decided from the committed file list, not just the proposed diff — the
+    # normalizer can add a regenerated source file the patch never mentions.
+    classification = classify_patch(plan.patch, changed_files=changed_files)
+    if classification.expectation_only:
+        emit_fn(
+            "log",
+            "Expectation-only patch: the GPU verdict is circular here and will "
+            "not be reported as verification."
+            + (
+                f" Degenerate new value(s): {', '.join(classification.degenerate_values)}."
+                if classification.degenerate_values
+                else ""
+            ),
+        )
 
     owner, repo = req.owner, req.repo
     emit_fn("step", "commit")
@@ -1229,6 +1272,8 @@ def _commit_changes(
             message=f"Pushed follow-up commit to PR #{req.pr_number}.",
             url=f"https://github.com/{owner}/{repo}/pull/{req.pr_number}",
             verify_verdict=verdict,
+            expectation_only=classification.expectation_only,
+            expectation_note=classification.reason(),
         )
 
     # new_pr
@@ -1314,7 +1359,10 @@ def _commit_changes(
             plan,
             req,
             verification_footer=_verification_footer(
-                verify_run_url, req.reproduce_run_url, runs=verify_runs
+                verify_run_url,
+                req.reproduce_run_url,
+                runs=verify_runs,
+                classification=classification,
             ),
             gh=gh,
         ),
@@ -1358,6 +1406,8 @@ def _commit_changes(
         message=f"Opened PR #{pr.get('number')}.",
         url=pr.get("html_url"),
         verify_verdict=verdict,
+        expectation_only=classification.expectation_only,
+        expectation_note=classification.reason(),
     )
 
 
