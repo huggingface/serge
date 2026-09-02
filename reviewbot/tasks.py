@@ -998,17 +998,34 @@ def _decorate_body(
     return body
 
 
-def _verify_unjudged_message(outcome: VerifyOutcome, branch: str) -> str:
+def _verify_unjudged_message(
+    outcome: VerifyOutcome,
+    branch: str,
+    classification: Optional[PatchClassification] = None,
+) -> str:
     """What to report when the gate never ran. Names the branch, because that
     branch is the only surviving artifact of the work and nothing else points
-    at it."""
+    at it.
+
+    Carries the expectation warning too. This message becomes the Reason cell of
+    the triage recap, which then invites a human to "re-run verification against
+    it" — and for a patch that rewrote its own assertion, that later verdict will
+    come back `fixed` and mean nothing. Whoever picks the branch up has to be
+    told before they read the result, not after."""
     where = f" ({outcome.run_url})" if outcome.run_url else ""
-    return (
+    msg = (
         f"A candidate patch was committed to `{branch}` but GPU verification "
         f"could not run (`{outcome.verdict}`){where}, so it is UNVERIFIED and no "
         "PR was opened. The branch is kept: re-run verification against it, or "
         "delete it if the group has moved on."
     )
+    if classification is not None and classification.expectation_only:
+        msg += (
+            " CAUTION: " + classification.reason() + " Re-running the gate on it "
+            "cannot confirm it — the tests would be re-run after the patch "
+            "rewrote what they assert, so they pass by construction."
+        )
+    return msg
 
 
 def _verify_failure_message(outcome: VerifyOutcome) -> str:
@@ -1262,6 +1279,8 @@ def _commit_changes(
                     message=_verify_failure_message(outcome),
                     verify_verdict=outcome.verdict,
                     verify_tracebacks=outcome.tracebacks,
+                    expectation_only=classification.expectation_only,
+                    expectation_note=classification.reason(),
                 )
         return TaskResult(
             mode=req.mode,
@@ -1322,9 +1341,17 @@ def _commit_changes(
                 no_change=True,
                 branch=branch,
                 commit_sha=commit_sha,
-                message=_verify_unjudged_message(outcome, branch),
+                message=_verify_unjudged_message(outcome, branch, classification),
                 verify_verdict=verdict,
                 verify_tracebacks=outcome.tracebacks,
+                # The branch survives and the recap invites someone to finish it,
+                # so this is the ONE outcome where the flag matters most: whoever
+                # picks the branch up has to be told the patch rewrote its own
+                # assertion, or they will read a later `fixed` as evidence.
+                # Observed 2026-09-01 on job 9a266db2, whose kept patch rewrote
+                # EXPECTED_TEXT_COMPLETION and was recorded expectation_only=False.
+                expectation_only=classification.expectation_only,
+                expectation_note=classification.reason(),
             )
         if not outcome.is_fixed:
             try:
@@ -1339,6 +1366,8 @@ def _commit_changes(
                 message=_verify_failure_message(outcome),
                 verify_verdict=outcome.verdict,
                 verify_tracebacks=outcome.tracebacks,
+                expectation_only=classification.expectation_only,
+                expectation_note=classification.reason(),
             )
         verify_run_url = outcome.run_url
         verify_runs = (outcome.result or {}).get("runs")

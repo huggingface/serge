@@ -357,3 +357,68 @@ class TaskResultTests(unittest.TestCase):
         from reviewbot.tasks import TaskResult
 
         self.assertFalse(TaskResult(mode="new_pr").to_json()["expectation_only"])
+
+
+class UnjudgedOutcomeTests(unittest.TestCase):
+    """The flag has to reach the outcomes that do NOT publish a PR.
+
+    serge#111 wired `expectation_only` into the two success returns of
+    `_commit_changes` only. The 2026-09-01 nightly then kept a branch for job
+    `9a266db2` whose patch rewrote `EXPECTED_TEXT_COMPLETION`, and the stored
+    result said `expectation_only=False` — while the triage recap invited a
+    human to "re-run verification against it". That later verdict would come
+    back `fixed` and mean nothing.
+
+    The kept-branch path is the one that matters most, because the branch
+    survives and someone is being asked to act on it.
+    """
+
+    BRANCH = "serge/fix/itf-4a72b9af302d-9a266db2"
+
+    def _unjudged(self, verdict="timeout"):
+        # NB: not `_outcome` — unittest.TestCase already owns that attribute.
+        from reviewbot.verify import VerifyOutcome
+
+        return VerifyOutcome(verdict=verdict, run_url="https://example/run/1")
+
+    def test_the_kept_branch_message_warns_about_the_rewrite(self):
+        from reviewbot.tasks import _verify_unjudged_message
+
+        msg = _verify_unjudged_message(
+            self._unjudged(), self.BRANCH, classify_patch(PR_48437)
+        )
+        self.assertIn("CAUTION", msg)
+        self.assertIn("pass by construction", msg)
+        # The original guidance must survive alongside the warning.
+        self.assertIn("The branch is kept", msg)
+        self.assertIn(self.BRANCH, msg)
+
+    def test_a_real_fix_gets_no_caution(self):
+        from reviewbot.tasks import _verify_unjudged_message
+
+        msg = _verify_unjudged_message(
+            self._unjudged(), self.BRANCH, classify_patch(PR_48440)
+        )
+        self.assertNotIn("CAUTION", msg)
+        self.assertIn("The branch is kept", msg)
+
+    def test_no_classification_keeps_the_old_message(self):
+        """Callers that never classified must be unaffected."""
+        from reviewbot.tasks import _verify_unjudged_message
+
+        msg = _verify_unjudged_message(self._unjudged(), self.BRANCH)
+        self.assertNotIn("CAUTION", msg)
+
+    def test_every_committed_patch_outcome_sets_the_flag(self):
+        """A guard against re-introducing the gap: each `return TaskResult(` in
+        `_commit_changes` that follows a commit must carry the flag."""
+        import inspect
+
+        from reviewbot import tasks
+
+        src = inspect.getsource(tasks._commit_changes)
+        self.assertEqual(
+            src.count("return TaskResult("),
+            src.count("expectation_only=classification.expectation_only"),
+            "a _commit_changes return path is missing expectation_only",
+        )
