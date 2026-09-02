@@ -779,6 +779,24 @@ def prepare_task(
     # full normalizer run) is paid at most once per task.
     baseline_state: dict = {}
 
+    def _parses(content: str) -> bool:
+        """Whether the final answer is the JSON object this path requires.
+
+        Handed to the agent loop so a reply that is non-empty but incomplete is
+        re-asked instead of parsed. Both places that could have caught the
+        2026-09-02 phimoe replay declined to: `_final_answer_defect` had no
+        shape for "real prose that is not a complete object", and
+        `_validate_patch` swallows the ValueError on purpose because the
+        normalizer has nothing to say about it. So the job raised
+        `_UnparseableLLMOutput` with zero recovery attempts while two salvage
+        retries went unused.
+        """
+        try:
+            _extract_json(content, _TASK_JSON_KEYS)
+        except ValueError:
+            return False
+        return True
+
     def _validate(chat) -> Optional[str]:
         feedback, prepared = _validate_patch(
             cfg,
@@ -805,6 +823,7 @@ def prepare_task(
         final_force_message=_TASK_FORCE_FINAL_MESSAGE,
         validate=_validate if normalize_configured else None,
         max_validation_retries=cfg.task_normalize_max_retries,
+        parses=_parses,
     )
     metrics_line = _format_aggregated_metrics(metrics)
     _emit("log", f"LLM done: {metrics_line}")
