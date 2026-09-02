@@ -931,20 +931,38 @@ _MARKUP_ANSWER_RECOVERY_MESSAGE = (
     "analysis, no explanation, no <think> block, no markdown fences."
 )
 
+# Non-empty, real prose, and still not the object we asked for — most often a
+# JSON literal that stops mid-string because the provider truncated the stream
+# without setting finish_reason="length". Measured 2026-09-02 replaying the
+# phimoe group: the model spent 26,449 chars of reasoning, emitted ~107 content
+# tokens of a correct-looking answer cut off inside `"body"`, and the job died
+# with ZERO recovery attempts because none of the three shapes above matched.
+_UNPARSEABLE_ANSWER_RECOVERY_MESSAGE = (
+    "Your previous reply did not contain a complete JSON object — the text "
+    "stopped part-way through. Reply now with ONLY the final JSON object the "
+    "task requires, complete and closed: no analysis, no explanation, no "
+    "<think> block, no markdown fences. Keep the body short so the whole "
+    "object fits."
+)
+
 _RECOVERY_MESSAGES = {
     "empty": _EMPTY_ANSWER_RECOVERY_MESSAGE,
     "truncated": _TRUNCATION_RECOVERY_MESSAGE,
     "markup": _MARKUP_ANSWER_RECOVERY_MESSAGE,
+    "unparseable": _UNPARSEABLE_ANSWER_RECOVERY_MESSAGE,
 }
 # How each defect is named in the operator-facing log line.
 _DEFECT_LABELS = {
     "empty": "empty",
     "truncated": "truncated",
     "markup": "nothing but tool-call markup",
+    "unparseable": "not a complete JSON object",
 }
 
 
-def _final_answer_defect(chat: ChatResult) -> Optional[str]:
+def _final_answer_defect(
+    chat: ChatResult, parses: Optional[Callable[[str], bool]] = None
+) -> Optional[str]:
     """Which unusable shape the final answer has, or ``None`` when it is worth
     parsing. One classifier because all three callers need the same verdict:
     the loop (salvage or not), the log line (what was wrong) and the recovery
@@ -963,6 +981,18 @@ def _final_answer_defect(chat: ChatResult) -> Optional[str]:
     which is why 3 of 10 task jobs in the 2026-08-24→26 window died
     "unparseable". Checked last because it is the only test that has to walk the
     content.
+
+    - ``"unparseable"`` — non-empty, real prose, and still not the object we
+      asked for. Tested only when the caller supplies ``parses``, because only
+      the caller knows which keys its own answer must carry.
+
+    ``"unparseable"`` closes the gap between ``empty`` and ``truncated``: a
+    provider can truncate the stream *mid-content* and set no finish_reason at
+    all, leaving an answer that is neither blank nor flagged length-limited.
+    Measured 2026-09-02 on the phimoe replay — a correct-looking answer cut off
+    inside `"body"` went straight to the parser and raised
+    ``_UnparseableLLMOutput`` with **zero** recovery attempts, exactly as
+    ``markup`` used to.
     """
     if not (chat.content or "").strip():
         return "empty"
@@ -970,19 +1000,30 @@ def _final_answer_defect(chat: ChatResult) -> Optional[str]:
         return "truncated"
     if _is_model_markup_only(chat.content or ""):
         return "markup"
+    # Last: the only test that needs the caller's own schema, and the only one
+    # that costs a parse.
+    if parses is not None and not parses(chat.content or ""):
+        return "unparseable"
     return None
 
 
-def _needs_final_salvage(chat: ChatResult) -> bool:
+def _needs_final_salvage(
+    chat: ChatResult, parses: Optional[Callable[[str], bool]] = None
+) -> bool:
     """True when a tool-free final answer should be re-asked rather than
     parsed."""
-    return _final_answer_defect(chat) is not None
+    return _final_answer_defect(chat, parses) is not None
 
 
-def _final_recovery_message(chat: ChatResult) -> str:
-    return _RECOVERY_MESSAGES.get(
-        _final_answer_defect(chat) or "", _TRUNCATION_RECOVERY_MESSAGE
-    )
+def _recovery_message_for(defect: Optional[str]) -> str:
+    """The re-ask text for a defect the caller has already classified.
+
+    Takes the verdict rather than the ChatResult so a caller cannot classify
+    twice and get two different answers by passing ``parses`` to one call and
+    not the other — which is how the salvage log line and the recovery prompt
+    would silently disagree.
+    """
+    return _RECOVERY_MESSAGES.get(defect or "", _TRUNCATION_RECOVERY_MESSAGE)
 
 
 def _salvage_decision(
@@ -1026,11 +1067,14 @@ def _emit_salvage_giveup(
 
 
 def _emit_final_salvage(
-    emit: Optional[Callable[[str, str], None]], chat: ChatResult, attempt: int
+    emit: Optional[Callable[[str, str], None]],
+    chat: ChatResult,
+    attempt: int,
+    defect: Optional[str] = None,
 ) -> None:
     if emit is None:
         return
-    what = _DEFECT_LABELS.get(_final_answer_defect(chat) or "", "unparseable")
+    what = _DEFECT_LABELS.get(defect or "", "unparseable")
     emit(
         "log",
         f"Final answer was {what} (finish_reason={chat.finish_reason}); re-asking "
@@ -1049,6 +1093,7 @@ def _run_agentic_loop(
     final_force_message: Optional[str] = None,
     validate: Optional[Callable[[ChatResult], Optional[str]]] = None,
     max_validation_retries: int = 0,
+    parses: Optional[Callable[[str], bool]] = None,
 ) -> tuple[ChatResult, _AggregateMetrics]:
     """Run a tool-augmented chat loop until the model emits a final
     (non-tool) response, falling back to a final non-tool turn if the
@@ -1233,17 +1278,17 @@ def _run_agentic_loop(
             # the provider truncates a huge-context stream). Re-ask for the JSON
             # only, tool-less and low-reasoning, instead of returning content
             # that just fails the parse.
-            defect = _final_answer_defect(chat)
+            defect = _final_answer_defect(chat, parses)
             decision = _salvage_decision(defect, last_defect, truncation_retries)
             if decision == "repeated":
                 _emit_salvage_giveup(emit, defect or "", truncation_retries)
             elif decision == "reask":
                 truncation_retries += 1
                 last_defect = defect
-                _emit_final_salvage(emit, chat, truncation_retries)
+                _emit_final_salvage(emit, chat, truncation_retries, defect)
                 messages.append({"role": "assistant", "content": chat.content or None})
                 messages.append(
-                    {"role": "user", "content": _final_recovery_message(chat)}
+                    {"role": "user", "content": _recovery_message_for(defect)}
                 )
                 force_json_only = True
                 continue
@@ -1406,7 +1451,7 @@ def _run_agentic_loop(
         # to die on: an empty completion (finish_reason=None) went straight to
         # the parser and surfaced as "LLM returned unparseable output". Re-ask
         # for the JSON only instead (bounded by _MAX_TRUNCATION_RETRIES).
-        defect = _final_answer_defect(chat)
+        defect = _final_answer_defect(chat, parses)
         decision = _salvage_decision(defect, last_defect, truncation_retries)
         if decision == "repeated":
             # This is the site the expensive case actually hits: both measured
@@ -1415,9 +1460,9 @@ def _run_agentic_loop(
         elif decision == "reask":
             truncation_retries += 1
             last_defect = defect
-            _emit_final_salvage(emit, chat, truncation_retries)
+            _emit_final_salvage(emit, chat, truncation_retries, defect)
             messages.append({"role": "assistant", "content": chat.content or None})
-            messages.append({"role": "user", "content": _final_recovery_message(chat)})
+            messages.append({"role": "user", "content": _recovery_message_for(defect)})
             continue
 
         # The verification gate must run on the forced final answer too —

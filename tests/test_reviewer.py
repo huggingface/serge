@@ -16,7 +16,7 @@ from reviewbot.reviewer import (
     _build_annotated_diff_chunks,
     _content_preview,
     _emit_chat_message,
-    _final_recovery_message,
+    _recovery_message_for,
     _is_model_markup_only,
     _needs_final_salvage,
     _salvage_decision,
@@ -116,9 +116,13 @@ class FinalSalvageTests(unittest.TestCase):
         )
 
     def test_recovery_message_varies_by_cause(self) -> None:
-        empty = _final_recovery_message(ChatResult(content="", finish_reason=None))
-        truncated = _final_recovery_message(
-            ChatResult(content='{"partial', finish_reason="length")
+        empty = _recovery_message_for(
+            _final_answer_defect(ChatResult(content="", finish_reason=None))
+        )
+        truncated = _recovery_message_for(
+            _final_answer_defect(
+                ChatResult(content='{"partial', finish_reason="length")
+            )
         )
         self.assertIn("empty", empty)
         self.assertIn("cut off", truncated)
@@ -1503,12 +1507,15 @@ class MarkupOnlyFinalAnswerSalvageTests(unittest.TestCase):
         )
 
     def test_markup_recovery_message_names_the_mistake(self) -> None:
-        msg = _final_recovery_message(
-            ChatResult(content=self.LEAKED, finish_reason="stop")
+        msg = _recovery_message_for(
+            _final_answer_defect(ChatResult(content=self.LEAKED, finish_reason="stop"))
         )
         self.assertIn("tool-call markup", msg)
         self.assertNotEqual(
-            msg, _final_recovery_message(ChatResult(content="", finish_reason=None))
+            msg,
+            _recovery_message_for(
+                _final_answer_defect(ChatResult(content="", finish_reason=None))
+            ),
         )
 
     def test_loop_re_asks_and_recovers_a_markup_only_answer(self) -> None:
@@ -1529,6 +1536,100 @@ class MarkupOnlyFinalAnswerSalvageTests(unittest.TestCase):
         self.assertIn("recovered", chat.content or "")
         self.assertEqual(metrics.truncation_retries, 1)
         self.assertEqual(len(llm.calls), 2)
+
+
+class IncompleteJsonSalvageTests(unittest.TestCase):
+    """A reply that is real prose but not a complete object must be re-asked.
+
+    Captured 2026-09-02 replaying the phimoe group on serge's own model. The
+    repeat guard forced a final answer; the model spent 26,449 chars of
+    reasoning and emitted ~107 content tokens of a *correct-looking* answer cut
+    off inside `"body"`. `finish_reason` was not "length" and the content was
+    not blank, so none of the three existing shapes matched: the job raised
+    `_UnparseableLLMOutput` with **zero** recovery attempts while two salvage
+    retries sat unused. This is the same hole `markup` used to fall through.
+    """
+
+    # Verbatim from that run's events.log, truncation and all.
+    CUT_OFF = (
+        '{"title": "Reserve per-device headroom in Phimoe integration test '
+        'loading", "body": "<!-- serge-task:integration-failure-triage:'
+        "sha256:a91897e3 -->\n\n`PhimoeIntegration"
+    )
+    # NB: the \\n must survive into the JSON as an escape, not become a real
+    # newline — a literal newline inside a JSON string is invalid, which would
+    # make this "good" fixture silently unparseable and the test meaningless.
+    GOOD = r'{"title": "t", "body": "b", "patch": "diff --git a/x b/x\n"}'
+
+    @staticmethod
+    def _parses(content: str) -> bool:
+        from reviewbot.reviewer import _extract_json
+
+        try:
+            _extract_json(content, ("title", "body", "patch"))
+        except ValueError:
+            return False
+        return True
+
+    def test_it_is_not_a_defect_without_a_parse_check(self) -> None:
+        """Unchanged for callers that pass no `parses` — this is why the review
+        path is unaffected by the new shape."""
+        chat = ChatResult(content=self.CUT_OFF, finish_reason=None)
+        self.assertIsNone(_final_answer_defect(chat))
+
+    def test_it_is_classified_unparseable_with_one(self) -> None:
+        chat = ChatResult(content=self.CUT_OFF, finish_reason=None)
+        self.assertEqual(_final_answer_defect(chat, self._parses), "unparseable")
+
+    def test_the_recovery_message_says_it_stopped_part_way(self) -> None:
+        msg = _recovery_message_for("unparseable")
+        self.assertIn("stopped part-way", msg)
+        self.assertIn("complete and closed", msg)
+        # It must not be mistaken for the length-limit message: the cause is
+        # different, so the instruction to the model is different.
+        self.assertNotEqual(msg, _recovery_message_for("truncated"))
+
+    def test_a_complete_object_is_still_no_defect(self) -> None:
+        chat = ChatResult(content=self.GOOD, finish_reason="stop")
+        self.assertIsNone(_final_answer_defect(chat, self._parses))
+
+    def test_the_loop_re_asks_and_recovers(self) -> None:
+        """End to end: the cut-off answer is re-asked tool-free and the caller
+        gets the recovered object instead of an exception."""
+        llm = _FakeLLM(
+            [
+                ChatResult(content=self.CUT_OFF, finish_reason=None),
+                ChatResult(content=self.GOOD, finish_reason="stop"),
+            ]
+        )
+        chat, metrics = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "fix this"}],
+            cfg=_CfgStub(),  # type: ignore[arg-type]
+            tool_env=None,
+            parses=self._parses,
+        )
+        self.assertIn('"patch"', chat.content or "")
+        self.assertEqual(metrics.truncation_retries, 1)
+        self.assertEqual(len(llm.calls), 2)
+
+    def test_without_the_parse_check_the_loop_returns_the_cut_off_answer(self) -> None:
+        """The regression this fixes, pinned: no `parses`, no salvage."""
+        llm = _FakeLLM(
+            [
+                ChatResult(content=self.CUT_OFF, finish_reason=None),
+                ChatResult(content=self.GOOD, finish_reason="stop"),
+            ]
+        )
+        chat, metrics = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "fix this"}],
+            cfg=_CfgStub(),  # type: ignore[arg-type]
+            tool_env=None,
+        )
+        self.assertEqual(chat.content, self.CUT_OFF)
+        self.assertEqual(metrics.truncation_retries, 0)
+        self.assertEqual(len(llm.calls), 1)
 
 
 class UnparseableSalvageAttemptsTests(unittest.TestCase):
