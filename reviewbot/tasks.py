@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from . import __version__, pr_links
+from .brevity import BrevityResult, condense_patch_comments
 from .clone_cache import Checkout, CloneCache, FileChange
 from .commit_scope import describe_dropped, scope_paths
 from .compression import MessageCompressor
@@ -185,6 +186,12 @@ class TaskPlan:
     # True when the patch was validated in-loop (see :func:`_validate_patch`):
     # the worktree already holds the applied + normalized result, so
     # :func:`publish_task` commits it directly instead of re-applying.
+    # NOTE: when it is set, ``patch`` above is the model's own diff and the
+    # worktree is what ships. The brevity pass (:mod:`reviewbot.brevity`)
+    # shortens comments in the worktree, so the committed comments can be
+    # shorter than the ones in ``patch``. Everything reading ``patch`` reads it
+    # for the code it touches (``scope_paths``, ``classify_patch``), which a
+    # comment rewrite cannot change.
     worktree_prepared: bool = False
 
 
@@ -538,6 +545,45 @@ def _check_normalizer_baseline(
     raise NormalizeGateBroken(message)
 
 
+def _condense_added_comments(
+    cfg: Config,
+    *,
+    checkout: Checkout,
+    patch: str,
+    llm: Optional[ChatCompletionClient],
+    emit: Callable[[str, str], None],
+) -> Optional[BrevityResult]:
+    """Run the one-call brevity pass over the comments this patch adds
+    (:mod:`reviewbot.brevity`), in the worktree, before the normalizer.
+
+    Deliberately placed *before* the normalizer and not after it: the comments
+    that get committed are then the ones the repo's own formatter saw and the
+    gate accepted, exactly like the code around them.
+
+    Returns None when the pass is off or unavailable, and swallows anything it
+    raises — some models are verbose, but none of that is worth failing a task
+    over, and the un-condensed comments are merely the status quo."""
+    if not cfg.task_comment_brevity or llm is None or not patch.strip():
+        return None
+    try:
+        return condense_patch_comments(
+            llm,
+            root=checkout.path,
+            patch=patch,
+            width=cfg.comment_brevity_width,
+            min_chars=cfg.comment_brevity_min_chars,
+            max_items=cfg.comment_brevity_max_items,
+            max_tokens=cfg.llm_max_tokens,
+            reasoning_effort=cfg.llm_reasoning_effort,
+            emit=emit,
+        )
+    except Exception:  # noqa: BLE001
+        log.warning(
+            "comment brevity pass failed; keeping the original comments", exc_info=True
+        )
+        return None
+
+
 def _validate_patch(
     cfg: Config,
     *,
@@ -546,6 +592,8 @@ def _validate_patch(
     content: Optional[str],
     emit: Callable[[str, str], None],
     baseline_state: Optional[dict] = None,
+    llm: Optional[ChatCompletionClient] = None,
+    brevity_chats: Optional[list] = None,
 ) -> tuple[Optional[str], bool]:
     """Validate the model's final answer by applying its patch to a clean
     worktree and running the repo normalizer.
@@ -589,6 +637,17 @@ def _validate_patch(
             False,
         )
 
+    # The patch is applied and nothing has reformatted it yet, so the file's
+    # line numbers are still the diff's new-side ones: the one point where the
+    # comments the patch added can be located exactly. Shorten them here so the
+    # normalizer runs over the text that will be committed.
+    brevity = _condense_added_comments(
+        cfg, checkout=checkout, patch=patch, llm=llm, emit=emit
+    )
+    if brevity is not None and brevity.chat is not None and brevity_chats is not None:
+        brevity_chats.append(brevity.chat)
+    condensed = brevity is not None and brevity.condensed > 0
+
     returncode, output = _run_repo_normalizer(cfg, checkout, emit)
     if returncode is None:
         # Normalizer could not run (infra) — accept the applied patch
@@ -623,6 +682,16 @@ def _validate_patch(
             "leaving a copied block out of sync, or a lint/format issue the "
             "fixer cannot resolve on its own."
         )
+        if condensed:
+            # The line numbers in the output above are the worktree's, and the
+            # brevity pass moved them: a comment that came in over four lines
+            # may now sit on one. Say so, rather than let the model conclude
+            # its own diff was misread.
+            msg += (
+                "\n\nNote: the comment TEXT in your patch was shortened before "
+                "this run (your code is untouched), so a line number above can "
+                "sit a few lines from where your diff put it."
+            )
         if cfg.task_normalize_guidance:
             msg += f"\n\n{cfg.task_normalize_guidance.strip()}"
         return msg, False
@@ -775,6 +844,11 @@ def prepare_task(
     # closure records whether the accepted answer left the worktree prepared.
     normalize_configured = bool(cfg.task_normalize_command)
     outcome = {"prepared": False}
+    # Each accepted final answer gets one brevity call (:mod:`reviewbot.brevity`),
+    # so a task that spends its correction budget pays for more than one. They
+    # are not loop turns, so they are folded into the token totals below and
+    # deliberately not into ``session``'s turn count.
+    brevity_chats: list = []
     # Shared across corrections so the pristine-checkout baseline (which costs a
     # full normalizer run) is paid at most once per task.
     baseline_state: dict = {}
@@ -805,6 +879,8 @@ def prepare_task(
             content=chat.content,
             emit=_emit,
             baseline_state=baseline_state,
+            llm=llm,
+            brevity_chats=brevity_chats,
         )
         outcome["prepared"] = prepared
         return feedback
@@ -825,6 +901,10 @@ def prepare_task(
         max_validation_retries=cfg.task_normalize_max_retries,
         parses=_parses,
     )
+    for brevity_chat in brevity_chats:
+        metrics.prompt_tokens += brevity_chat.prompt_tokens or 0
+        metrics.completion_tokens += brevity_chat.completion_tokens or 0
+        metrics.latency_seconds += brevity_chat.latency_seconds or 0.0
     metrics_line = _format_aggregated_metrics(metrics)
     _emit("log", f"LLM done: {metrics_line}")
 

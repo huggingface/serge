@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
 from . import __version__
+from .brevity import condense_review_bodies
 from .compression import MessageCompressor
 from .config import Config
 from .context_script import run_context_script
@@ -877,6 +878,56 @@ def _synthesize_merged_summary(
     if not text:
         return None, None
     return text, metrics
+
+
+def _condense_review(
+    cfg: Config,
+    llm: ChatCompletionClient,
+    summary: str,
+    comments: list[dict[str, Any]],
+    *,
+    metrics: "_AggregateMetrics",
+    emit: Optional[Callable[[str, str], None]] = None,
+) -> str:
+    """Shorten the review we are about to publish in ONE extra LLM call (see
+    :mod:`reviewbot.brevity`): the summary, returned, and each inline comment's
+    ``body``, rewritten in place.
+
+    Called from :func:`prepare_review` rather than from :func:`publish_review`
+    so the operator reads — and can edit — the text that will actually be
+    posted. The pass can only shorten: it never drops a finding, never rewrites
+    a ```suggestion block, and hands back the original body for anything it
+    declines. A failure here leaves the whole review exactly as the model
+    wrote it, which is the behaviour that shipped before this existed."""
+    bodies = [summary] + [str(c.get("body") or "") for c in comments]
+    labels = ["the PR-level review summary"] + [
+        f"inline comment on {c.get('path')}:{c.get('line')}" for c in comments
+    ]
+    try:
+        shortened, result = condense_review_bodies(
+            llm,
+            bodies,
+            labels=labels,
+            min_chars=cfg.comment_brevity_min_chars,
+            max_items=cfg.comment_brevity_max_items,
+            max_tokens=cfg.llm_max_tokens,
+            reasoning_effort=cfg.llm_reasoning_effort,
+            emit=emit,
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("review brevity pass failed; publishing as written", exc_info=True)
+        return summary
+
+    for comment, body in zip(comments, shortened[1:]):
+        comment["body"] = body
+    if result.chat is not None:
+        # Tokens and latency, but not a turn: this is not the agentic loop
+        # browsing the PR, and `session`'s turn count is read as loop
+        # iterations (see the serge-agent-sessions dashboard).
+        metrics.prompt_tokens += result.chat.prompt_tokens or 0
+        metrics.completion_tokens += result.chat.completion_tokens or 0
+        metrics.latency_seconds += result.chat.latency_seconds or 0.0
+    return shortened[0]
 
 
 def _merge_chunk_event(events: list[str], comments_count: int) -> str:
@@ -2049,6 +2100,12 @@ def prepare_review(
     _emit("log", f"LLM done: {metrics_line}")
 
     event = _merge_chunk_event(all_events, len(all_valid))
+
+    if cfg.review_comment_brevity and (summary.strip() or all_valid):
+        summary = _condense_review(
+            cfg, llm, summary, all_valid, metrics=total_metrics, emit=_emit
+        )
+        metrics_line = _format_aggregated_metrics(total_metrics)
 
     draft_comments: list[DraftComment] = []
     seen_comments: set[tuple[str, str, int, str]] = set()

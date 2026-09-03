@@ -10,7 +10,9 @@ from reviewbot.tools import ToolEnv
 from reviewbot.reviewer import (
     _LOG_MSG_MAX_CHARS,
     _MAX_TRUNCATION_RETRIES,
+    _AggregateMetrics,
     _UnparseableLLMOutput,
+    _condense_review,
     _final_answer_defect,
     _assistant_tool_call_dict,
     _build_annotated_diff_chunks,
@@ -527,7 +529,13 @@ class _CfgStub:
         tool_repeat_limit: int = 0,
         tool_path_revisit_limit: int = 0,
         tool_path_trip_after: int = 0,
+        review_comment_brevity: bool = True,
+        comment_brevity_min_chars: int = 100,
+        comment_brevity_max_items: int = 40,
     ) -> None:
+        self.review_comment_brevity = review_comment_brevity
+        self.comment_brevity_min_chars = comment_brevity_min_chars
+        self.comment_brevity_max_items = comment_brevity_max_items
         self.llm_max_tokens = llm_max_tokens
         self.tool_max_iterations = tool_max_iterations
         self.llm_max_input_tokens = llm_max_input_tokens
@@ -551,6 +559,88 @@ class _FakeLLM:
         if len(self._results) > 1:
             return self._results.pop(0)
         return self._results[0]
+
+
+class ReviewBrevityTests(unittest.TestCase):
+    """_condense_review: the extra pass that shortens a review before it is
+    stored as a draft. The pass itself is covered in tests/test_brevity.py;
+    what matters here is that the wiring shortens the right body and that a
+    failure costs the review nothing."""
+
+    SUMMARY = (
+        "I reviewed this pull request and overall it looks quite good to me. "
+        "As we can see from the diff, the author changes how the client retries "
+        "a request, and the timeout is adjusted as well.\n\n**Correctness**\n"
+        "- The retry loop is unbounded when the server keeps answering 429."
+    )
+    INLINE = (
+        "This line reads the timeout out of the environment on every single "
+        "call, which means the lookup sits on the hot path of every request "
+        "this client makes. Consider hoisting it into the constructor instead."
+    )
+
+    def _comments(self):
+        return [
+            {"path": "client.py", "line": 42, "side": "RIGHT", "body": self.INLINE},
+            {"path": "client.py", "line": 9, "side": "RIGHT", "body": "Nit: naming."},
+        ]
+
+    def test_summary_and_bodies_are_shortened_in_place(self):
+        llm = _FakeLLM(
+            [
+                ChatResult(
+                    content=json.dumps(
+                        {
+                            "comments": {
+                                "r0": "**Correctness**\n- The retry loop is "
+                                "unbounded on repeated 429s.",
+                                "r1": "The env lookup is on the hot path; "
+                                "hoist it into the constructor.",
+                            }
+                        }
+                    ),
+                    usage={"prompt_tokens": 300, "completion_tokens": 40},
+                )
+            ]
+        )
+        comments = self._comments()
+        metrics = _AggregateMetrics(turns=7, prompt_tokens=1000, completion_tokens=100)
+        summary = _condense_review(
+            _CfgStub(comment_brevity_min_chars=40),
+            llm,  # type: ignore[arg-type]
+            self.SUMMARY,
+            comments,
+            metrics=metrics,
+        )
+        self.assertEqual(len(llm.calls), 1)
+        self.assertIn("unbounded on repeated 429s", summary)
+        self.assertNotIn("overall it looks quite good", summary)
+        self.assertIn("hoist it into the constructor", comments[0]["body"])
+        # Too short to be worth a pass: left exactly as written.
+        self.assertEqual(comments[1]["body"], "Nit: naming.")
+        # Its cost is recorded...
+        self.assertEqual(metrics.prompt_tokens, 1300)
+        self.assertEqual(metrics.completion_tokens, 140)
+        # ...but it is not an agent-loop turn, and the session count says so.
+        self.assertEqual(metrics.turns, 7)
+
+    def test_a_provider_failure_leaves_the_review_as_written(self):
+        class _Broken:
+            def complete(self, messages, **kwargs):
+                raise RuntimeError("provider is down")
+
+        comments = self._comments()
+        metrics = _AggregateMetrics()
+        summary = _condense_review(
+            _CfgStub(comment_brevity_min_chars=40),
+            _Broken(),  # type: ignore[arg-type]
+            self.SUMMARY,
+            comments,
+            metrics=metrics,
+        )
+        self.assertEqual(summary, self.SUMMARY)
+        self.assertEqual(comments[0]["body"], self.INLINE)
+        self.assertEqual(metrics.prompt_tokens, 0)
 
 
 class InputTokenBudgetTests(unittest.TestCase):
