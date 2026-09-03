@@ -297,6 +297,28 @@ class Config:
     # fixes over `# noqa`/`# type: ignore` suppressions", or repo-specific
     # conventions. Operator config, never request-supplied.
     task_normalize_guidance: Optional[str] = None
+    # One extra LLM call that shortens verbose prose serge itself wrote (see
+    # :mod:`reviewbot.brevity`). Two independent switches because they act on
+    # different flows: ``task_comment_brevity`` shortens the comments a patch
+    # adds, right before the normalizer runs over them;
+    # ``review_comment_brevity`` shortens a review's summary and inline comment
+    # bodies before they are stored as a draft. Both default on: the LENGTH
+    # block in the task prompt did not stop Kimi writing four-line comments
+    # over one-line assignments, and both passes fail open, so the worst case
+    # is the un-condensed text we would have shipped anyway.
+    task_comment_brevity: bool = True
+    review_comment_brevity: bool = True
+    # Column to wrap a rewritten comment at. Under ruff's line-length in both
+    # repos we target, so the pass cannot introduce a line-too-long the
+    # normalizer would then have to fix.
+    comment_brevity_width: int = 88
+    # Comments shorter than this are left alone: a comment that already fits on
+    # one line is not the verbosity this pass exists for, and asking about it
+    # spends the model's attention for nothing.
+    comment_brevity_min_chars: int = 100
+    # Hard cap on how many comments/bodies one call is asked about (longest
+    # first). Bounds the prompt for a pathological patch.
+    comment_brevity_max_items: int = 40
     task_sandbox_backend: str = sandbox.AUTO_BACKEND
     # Kubernetes placement for the per-task runner Jobs (TASK_EXECUTION=
     # kubernetes; see SERGE_PERTASK_POD_PLAN.md). ``task_k8s_namespace`` defaults
@@ -589,6 +611,11 @@ class Config:
                 os.environ.get("TASK_NORMALIZE_GUIDANCE") or ""
             ).strip()
             or None,
+            task_comment_brevity=_bool_env("TASK_COMMENT_BREVITY", True),
+            review_comment_brevity=_bool_env("REVIEW_COMMENT_BREVITY", True),
+            comment_brevity_width=_int_env("COMMENT_BREVITY_WIDTH", 88),
+            comment_brevity_min_chars=_int_env("COMMENT_BREVITY_MIN_CHARS", 100),
+            comment_brevity_max_items=_int_env("COMMENT_BREVITY_MAX_ITEMS", 40),
             task_sandbox_backend=sandbox.normalize_backend(
                 os.environ.get("TASK_SANDBOX_BACKEND")
             ),

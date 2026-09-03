@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from reviewbot.clone_cache import Checkout, CloneCache
 from reviewbot.config import Config
+from reviewbot.llm_client import ChatResult
 from reviewbot.github_client import SERGE_GIT_EMAIL
 from reviewbot.tasks import (
     prompt_prefix_summary,
@@ -947,6 +948,197 @@ class PublishFallbackNormalizeTests(unittest.TestCase):
             )
         self.assertFalse(result.no_change)
         self.assertEqual(result.changed_files, ["hello.txt"])
+
+
+class _BrevityLLM:
+    """Answers the brevity pass with a fixed comment mapping, and records the
+    calls so a test can pin what the pass costs."""
+
+    def __init__(self, mapping):
+        self._mapping = mapping
+        self.calls = []
+
+    def complete(self, messages, **kwargs):
+        self.calls.append({"messages": list(messages), **kwargs})
+        return ChatResult(
+            content=json.dumps({"comments": self._mapping}),
+            usage={"prompt_tokens": 90, "completion_tokens": 12},
+        )
+
+
+class CommentBrevityGateTests(unittest.TestCase):
+    """The brevity pass inside the in-loop gate (reviewbot/brevity.py).
+
+    The point of the placement is the ordering: the comments that reach a PR
+    are the ones the repo's normalizer saw. These tests prove it by having the
+    normalize command copy the file it is given, so what it copied is evidence
+    of what it was handed."""
+
+    _PATCH = (
+        "diff --git a/mod.py b/mod.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/mod.py\n"
+        "@@ -0,0 +1,5 @@\n"
+        "+import os\n"
+        "+\n"
+        "+# We keep the retry count at three because the upstream API rate limit\n"
+        "+# window is sixty seconds, and three attempts is what fits inside it.\n"
+        "+RETRIES = 3\n"
+    )
+    _SHORT = "Three retries fit in the API's 60s rate-limit window."
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = self._tmp.name
+        src = os.path.join(root, "src")
+        os.makedirs(src)
+        _git(src, "init", "--quiet", "-b", "main")
+        with open(os.path.join(src, "hello.txt"), "w") as f:
+            f.write("hi from main\n")
+        _git(src, "add", "-A")
+        _git(src, "commit", "--quiet", "-m", "main commit")
+        self.cache = CloneCache(os.path.join(root, "cache"))
+        self.co = self.cache.acquire_ref(
+            token="",
+            owner="acme",
+            repo="widget",
+            ref="main",
+            job_id="brev1234",
+            remote_url=src,
+        )
+
+    def _cfg(self, **overrides):
+        base = dict(
+            helper_sandbox="off",
+            task_sandbox_backend="bwrap",
+            # Hand the normalizer's copy of the file back to the test.
+            task_normalize_command=["sh", "-c", "cp mod.py seen.py"],
+            task_normalize_timeout=30,
+            comment_brevity_min_chars=40,
+        )
+        base.update(overrides)
+        return _make_cfg(**base)
+
+    def _wt(self, name):
+        return os.path.join(self.co.path, name)
+
+    def _read(self, name):
+        with open(self._wt(name)) as fh:
+            return fh.read()
+
+    def _content(self):
+        return json.dumps({"title": "t", "body": "b", "patch": self._PATCH})
+
+    def test_the_normalizer_sees_the_condensed_comment(self):
+        llm = _BrevityLLM({"c1": self._SHORT})
+        feedback, prepared = _validate_patch(
+            self._cfg(),
+            checkout=self.co,
+            clone_cache=self.cache,
+            content=self._content(),
+            emit=lambda *a: None,
+            llm=llm,
+        )
+        self.assertIsNone(feedback)
+        self.assertTrue(prepared)
+        self.assertEqual(len(llm.calls), 1)
+        # In the worktree, which is what publish_task commits...
+        self.assertIn(f"# {self._SHORT}\n", self._read("mod.py"))
+        self.assertNotIn("rate limit\n", self._read("mod.py"))
+        # ...and already there when the normalizer ran, which is the ordering
+        # this pass depends on: a shortened comment is formatted and validated
+        # like the code around it, never after the gate that would catch it.
+        self.assertIn(f"# {self._SHORT}\n", self._read("seen.py"))
+        # And it is the condensed file that publish_task would commit: the pass
+        # edits the worktree, and staging picks that up (apply_patch's --index
+        # staged the model's version, so this is the assertion that the later
+        # edit is not left behind in the index).
+        self.cache.stage_all(self.co)
+        blob = {c.path: (c.content or b"") for c in self.cache.collect_changes(self.co)}
+        self.assertIn(self._SHORT.encode(), blob["mod.py"])
+        self.assertNotIn(b"rate limit", blob["mod.py"])
+
+    def test_a_normalize_failure_says_the_comments_moved(self):
+        # The normalizer reports line numbers in the worktree, which the pass
+        # has just shifted. The model must not read that as its diff being
+        # misapplied.
+        llm = _BrevityLLM({"c1": self._SHORT})
+        feedback, prepared = _validate_patch(
+            self._cfg(
+                task_normalize_command=["sh", "-c", "echo 'mod.py:3 boom' >&2; exit 3"]
+            ),
+            checkout=self.co,
+            clone_cache=self.cache,
+            content=self._content(),
+            emit=lambda *a: None,
+            llm=llm,
+            baseline_state={"checked": True},
+        )
+        self.assertFalse(prepared)
+        self.assertIn("boom", feedback)
+        self.assertIn("comment TEXT in your patch was shortened", feedback)
+
+    def test_no_such_note_when_nothing_was_condensed(self):
+        feedback, _ = _validate_patch(
+            self._cfg(
+                task_normalize_command=["sh", "-c", "echo 'mod.py:3 boom' >&2; exit 3"]
+            ),
+            checkout=self.co,
+            clone_cache=self.cache,
+            content=self._content(),
+            emit=lambda *a: None,
+            baseline_state={"checked": True},
+        )
+        self.assertIn("boom", feedback)
+        self.assertNotIn("shortened", feedback)
+
+    def test_the_pass_is_skipped_when_it_is_turned_off(self):
+        llm = _BrevityLLM({"c1": self._SHORT})
+        feedback, prepared = _validate_patch(
+            self._cfg(task_comment_brevity=False),
+            checkout=self.co,
+            clone_cache=self.cache,
+            content=self._content(),
+            emit=lambda *a: None,
+            llm=llm,
+        )
+        self.assertIsNone(feedback)
+        self.assertTrue(prepared)
+        self.assertEqual(llm.calls, [])
+        self.assertIn("rate limit", self._read("mod.py"))
+
+    def test_no_llm_means_no_pass_and_no_failure(self):
+        # publish_task's fallback path has no client to spend; the patch ships
+        # with the comments the model wrote, exactly as it did before.
+        feedback, prepared = _validate_patch(
+            self._cfg(),
+            checkout=self.co,
+            clone_cache=self.cache,
+            content=self._content(),
+            emit=lambda *a: None,
+        )
+        self.assertIsNone(feedback)
+        self.assertTrue(prepared)
+        self.assertIn("rate limit", self._read("mod.py"))
+
+    def test_a_provider_failure_does_not_fail_the_task(self):
+        class _Broken:
+            def complete(self, messages, **kwargs):
+                raise RuntimeError("provider is down")
+
+        feedback, prepared = _validate_patch(
+            self._cfg(),
+            checkout=self.co,
+            clone_cache=self.cache,
+            content=self._content(),
+            emit=lambda *a: None,
+            llm=_Broken(),
+        )
+        self.assertIsNone(feedback)
+        self.assertTrue(prepared)
+        self.assertIn("rate limit", self._read("mod.py"))
 
 
 class ValidatePatchTests(unittest.TestCase):

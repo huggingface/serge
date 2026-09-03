@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One extra LLM pass that shortens serge's own prose** (`reviewbot/brevity.py`).
+  Prompt discipline had already been tried: the task prompt's `LENGTH` block
+  tells the model to comment only where the reason for a line is not evident
+  from the line, and verbose models keep writing four lines of comment over a
+  one-line assignment. So both flows now get a single dedicated call whose only
+  job is to shorten:
+  - **Tasks** (`TASK_COMMENT_BREVITY`, default on): every comment the patch
+    added, in one call, **in the worktree just before the repo normalizer
+    runs** — so the comments that reach a PR are the ones the repo's own
+    formatter saw and the gate accepted.
+  - **Reviews** (`REVIEW_COMMENT_BREVITY`, default on): the summary and each
+    inline comment body, before the draft is stored, so the operator edits the
+    text that will actually be posted.
+
+  The pass can only ever shorten. The model is handed comment *text* and
+  returns comment *text* — the marker, the indent and the wrapping are
+  serge's, so a reply cannot become a code line. Comments are located with
+  `tokenize` (running on the applied worktree is what makes that possible: a
+  `#` inside a string literal is not a comment, and a diff line cannot tell
+  you), and a rewritten file is kept only if its **code-token stream is
+  byte-identical** and it still parses. Machine-read comments are never sent at
+  all — lint suppressions, typing pragmas, formatter switches, licence headers,
+  and transformers' own `Copied from`/`Ignore copy` (shortening one would fail
+  `make repo-consistency`). In a review, a fenced ```suggestion block is masked
+  out before the model sees it and must come back intact, an empty answer is
+  treated as "keep" so brevity can never delete a finding, and any body that
+  came back longer keeps its original. Every failure path — provider error,
+  unparseable reply, guard tripping — leaves the original text, which is the
+  behaviour that shipped before this existed. A normalize failure that follows
+  a condensed patch says so in the feedback, because the pass moves the line
+  numbers the normalizer reports. Its tokens are folded into the job's totals
+  but not into `session`'s turn count: it is not a loop turn.
+
+  **Measured live 2026-09-03** against Kimi at prod's caps, on real serge
+  output rather than fixtures:
+
+  - **Reviews are where the verbosity is.** Four published review bodies
+    (three summaries + one inline comment, fetched back off the transformers
+    PRs serge reviewed): **3,160 → 1,929 chars, −39%, in one call** of 1,177
+    in / 443 out tokens, 2.6s. Every finding survived and the ```suggestion
+    block came back byte-identical.
+  - **Patch comments are a smaller prize than expected.** Of seven archived
+    local task runs that produced a patch, only two contain a comment over the
+    100-char floor at all; the worst (236 chars / 3 lines) condensed to 197
+    (−17%), the phimoe one 134 → 126. A full `--brevity` replay of the phimoe
+    group produced a patch with **no comments whatsoever** — the pass is
+    cheap when there is nothing to do, and now says so.
+  - The first live review run **dropped three verdict statements** — *"No
+    correctness, security, or style issues were found"*, a *"correctly
+    fixes"*, and the object of *"verified on a GPU runner that the new
+    expectation matches current behaviour"*. Shortening a sign-off into
+    silence is a different review, so `_REVIEW_SYSTEM_PROMPT` now keeps the
+    verdict (a clean one included) and what a claim is *about*; the re-run
+    restored all three at the same −39%.
+
 - The tool-repeat guard is now **path-aware**. It keyed on the exact arguments,
   so fifty-three reads of one file at a different line range each time were
   fifty-three distinct signatures and it counted zero repeats — while that is
