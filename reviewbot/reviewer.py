@@ -1144,6 +1144,9 @@ def _run_agentic_loop(
     final_force_message: Optional[str] = None,
     validate: Optional[Callable[[ChatResult], Optional[str]]] = None,
     max_validation_retries: int = 0,
+    validation_retry_messages: Optional[
+        Callable[[ChatResult, str, int], list[dict[str, Any]]]
+    ] = None,
     parses: Optional[Callable[[str], bool]] = None,
 ) -> tuple[ChatResult, _AggregateMetrics]:
     """Run a tool-augmented chat loop until the model emits a final
@@ -1234,6 +1237,17 @@ def _run_agentic_loop(
     # Set for one turn to recover a truncated final answer: disable tools and
     # force minimal reasoning so the whole output budget goes to the JSON.
     force_json_only = False
+
+    def _add_validation_feedback(chat: ChatResult, feedback: str) -> None:
+        nonlocal messages
+        if validation_retry_messages is not None:
+            messages = validation_retry_messages(chat, feedback, validation_retries)
+            return
+        # Continue the SAME conversation: append the rejected answer and the
+        # feedback, then loop so the model can browse + correct.
+        messages.append({"role": "assistant", "content": chat.content or None})
+        messages.append({"role": "user", "content": feedback})
+
     while True:
         iteration += 1
         if iteration > ABSOLUTE_ITER_CEILING:
@@ -1359,10 +1373,8 @@ def _run_agentic_loop(
                     f"{validation_retries}/{max_validation_retries}); "
                     "asking the model to fix it",
                 )
-            # Continue the SAME conversation: append the rejected answer and
-            # the feedback, then loop so the model can browse + correct.
-            messages.append({"role": "assistant", "content": chat.content or None})
-            messages.append({"role": "user", "content": feedback})
+            _add_validation_feedback(chat, feedback)
+            force_json_only = validation_retry_messages is not None
             continue
 
         # A "blind" tool turn is one where the model fired tool calls
@@ -1535,8 +1547,7 @@ def _run_agentic_loop(
                 f"{validation_retries}/{max_validation_retries}); "
                 "asking the model to fix it (no tools)",
             )
-        messages.append({"role": "assistant", "content": chat.content or None})
-        messages.append({"role": "user", "content": feedback})
+        _add_validation_feedback(chat, feedback)
 
 
 def _wrap_chunk_cb(

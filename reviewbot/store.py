@@ -115,6 +115,7 @@ PERSIST_EVENT_KINDS = frozenset(
         "chat",
         "normalize_error",
         "patch_apply_error",
+        "rejected_patch",
     }
 )
 

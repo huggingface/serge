@@ -2,43 +2,44 @@ import json
 import os
 import tempfile
 import unittest
+from typing import Any
 from unittest.mock import Mock, patch
 
 from reviewbot.llm_client import ChatCompletionClient, ChatResult, ToolCall
 from reviewbot.patch import parse_patch
-from reviewbot.tools import ToolEnv
 from reviewbot.reviewer import (
     _LOG_MSG_MAX_CHARS,
     _MAX_TRUNCATION_RETRIES,
-    _AggregateMetrics,
-    _UnparseableLLMOutput,
-    _condense_review,
-    _final_answer_defect,
-    _assistant_tool_call_dict,
-    _build_annotated_diff_chunks,
-    _content_preview,
-    _emit_chat_message,
-    _recovery_message_for,
-    _is_model_markup_only,
-    _needs_final_salvage,
-    _salvage_decision,
-    _extract_json,
     _REVIEW_JSON_KEYS,
-    _merge_chunk_event,
-    _merge_chunk_summaries,
-    _prose_outside_json,
-    _run_agentic_loop,
-    _summarize_rejected_comments,
     STOP_ANSWERED,
     STOP_BLIND_TURN_CAP,
     STOP_INPUT_TOKEN_CAP,
     STOP_NO_LLM_TURNS,
     STOP_PATH_REVISIT_GUARD,
     STOP_REPEAT_GUARD,
+    _AggregateMetrics,
+    _assistant_tool_call_dict,
+    _build_annotated_diff_chunks,
+    _condense_review,
+    _content_preview,
+    _emit_chat_message,
+    _extract_json,
+    _final_answer_defect,
+    _is_model_markup_only,
+    _merge_chunk_event,
+    _merge_chunk_summaries,
+    _needs_final_salvage,
+    _prose_outside_json,
+    _recovery_message_for,
+    _run_agentic_loop,
+    _salvage_decision,
+    _summarize_rejected_comments,
+    _UnparseableLLMOutput,
     merge_session_records,
     no_llm_session_record,
     session_record,
 )
+from reviewbot.tools import ToolEnv
 
 
 class EmitChatMessageTests(unittest.TestCase):
@@ -874,6 +875,50 @@ class ValidationGateTests(unittest.TestCase):
                 for m in second_turn
             )
         )
+
+    def test_validation_feedback_can_replace_history_with_compact_retry(self) -> None:
+        cfg = _CfgStub()
+        llm = _FakeLLM(
+            [self._result('{"patch": "v1"}'), self._result('{"patch": "v2"}')]
+        )
+
+        def validate(chat: ChatResult) -> str | None:
+            return "git apply failed" if chat.content == '{"patch": "v1"}' else None
+
+        def compact_retry(
+            chat: ChatResult, feedback: str, retry_number: int
+        ) -> list[dict[str, Any]]:
+            return [
+                {"role": "system", "content": "compact validation retry"},
+                {
+                    "role": "user",
+                    "content": f"retry={retry_number}; {feedback}; {chat.content}",
+                },
+            ]
+
+        chat, _ = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "huge original history"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+            validate=validate,
+            max_validation_retries=2,
+            validation_retry_messages=compact_retry,
+        )
+
+        self.assertEqual(chat.content, '{"patch": "v2"}')
+        self.assertEqual(
+            llm.calls[1]["messages"],
+            [
+                {"role": "system", "content": "compact validation retry"},
+                {
+                    "role": "user",
+                    "content": 'retry=1; git apply failed; {"patch": "v1"}',
+                },
+            ],
+        )
+        self.assertIsNone(llm.calls[1]["tools"])
+        self.assertEqual(llm.calls[1]["extra"], {"reasoning_effort": "low"})
 
     def test_retries_exhausted_returns_last_answer(self) -> None:
         cfg = _CfgStub()

@@ -258,7 +258,7 @@
       if (!body && !calls) return `assistant: (thinking…)${metaStr}`;
       return `assistant:${body ? " " + body : ""}${calls}${metaStr}`;
     }
-    ["step", "tool", "error", "log", "chat", "normalize_error", "patch_apply_error"].forEach(kind => {
+    ["step", "tool", "error", "log", "chat", "normalize_error", "patch_apply_error", "rejected_patch"].forEach(kind => {
       es.addEventListener(kind, (e) => {
         // The browser also fires a native "error" event (no .data) on a
         // dropped connection; ignore those here — es.onerror handles them.
