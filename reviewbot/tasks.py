@@ -62,6 +62,9 @@ from .verify import (
 log = logging.getLogger(__name__)
 
 _NORMALIZE_FEEDBACK_CHARS = 80_000
+_REJECTED_PATCH_EVENT_CHARS = 80_000
+_VALIDATION_RETRY_CONTEXT_CHARS = 120_000
+_VALIDATION_RETRY_OUTPUT_CHARS = 80_000
 
 # The task JSON contract from prompts.py. Passed to `_extract_json` so a stray
 # `{...}` in the reply — notably a leaked tool call's own argument object —
@@ -85,6 +88,14 @@ _TASK_FORCE_FINAL_MESSAGE = (
     "possible\n"
     "Return JSON only: no surrounding prose, no code fences, no extra commentary, "
     "and no tool requests."
+)
+
+_TASK_VALIDATION_RETRY_SYSTEM_MESSAGE = (
+    "You are fixing a previously rejected task patch. Reply with a single "
+    "compact JSON object that starts with `{` and has EXACTLY these keys: "
+    '"title", "body", and "patch". The patch must be a valid unified diff '
+    "against the current checkout, or an empty string if no safe fix is "
+    "possible. Return JSON only: no prose, no code fences, no tool requests."
 )
 _BRANCH_PREFIX_RE = re.compile(r"^serge/[A-Za-z0-9._/-]+$")
 _CANDIDATE_HEADING_RE = re.compile(
@@ -629,6 +640,7 @@ def _validate_patch(
         clone_cache.apply_patch(checkout, patch)
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:1200]
+        emit("rejected_patch", _bounded_rejected_patch(patch))
         emit(
             "patch_apply_error",
             f"`git apply` rejected the proposed patch:\n{stderr}",
@@ -662,6 +674,7 @@ def _validate_patch(
         clone_cache.reset_worktree(checkout)
         cmd = " ".join(command)
         feedback_output = _bounded_normalize_feedback(output)
+        emit("rejected_patch", _bounded_rejected_patch(patch))
         emit(
             "normalize_error",
             f"Normalizer failed (exit {returncode}) for `{cmd}`:\n{output}",
@@ -716,6 +729,82 @@ def _bounded_normalize_feedback(output: str) -> str:
         + f"\n\n--- omitted {omitted} chars of normalize output from LLM feedback ---\n\n"
         + output[-tail:].lstrip()
     ).rstrip()
+
+
+def _bounded_rejected_patch(patch: str) -> str:
+    """Bound rejected patch events kept for operator diagnosis."""
+    return _bound_middle(
+        patch,
+        _REJECTED_PATCH_EVENT_CHARS,
+        "chars of rejected patch",
+    )
+
+
+def _bounded_validation_retry_output(text: str) -> str:
+    """Bound rejected assistant JSON resent to the correction turn."""
+    return _bound_middle(
+        text,
+        _VALIDATION_RETRY_OUTPUT_CHARS,
+        "chars of rejected assistant output",
+    )
+
+
+def _bounded_validation_retry_context(text: str) -> str:
+    """Bound original task context resent to a validation correction turn."""
+    return _bound_middle(
+        text,
+        _VALIDATION_RETRY_CONTEXT_CHARS,
+        "chars of task context",
+    )
+
+
+def _bound_middle(text: str, limit: int, label: str) -> str:
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head
+    omitted = len(text) - limit
+    return (
+        text[:head].rstrip()
+        + f"\n\n--- omitted {omitted} {label} ---\n\n"
+        + text[-tail:].lstrip()
+    ).rstrip()
+
+
+def _task_validation_retry_messages(
+    *,
+    repo_full_name: str,
+    base_ref: str,
+    instruction: str,
+    context: str,
+    existing_diff: Optional[str],
+    rejected_content: Optional[str],
+    feedback: str,
+    retry_number: int,
+) -> list[dict[str, Any]]:
+    """Build the compact no-tools retry prompt for rejected task patches."""
+    body = (
+        f"Repository: {repo_full_name}\n"
+        f"Base ref: {base_ref}\n"
+        f"Validation correction: {retry_number}\n\n"
+        "Original task instruction:\n"
+        f"{instruction.strip() or '(none)'}\n\n"
+        "Original failure context:\n"
+        f"{_bounded_validation_retry_context(context.strip()) or '(none)'}\n\n"
+    )
+    if existing_diff:
+        body += f"Existing diff to preserve:\n{existing_diff.strip()}\n\n"
+    body += (
+        "Validator rejection to fix:\n"
+        f"{feedback.strip()}\n\n"
+        "Rejected assistant output:\n"
+        f"{_bounded_validation_retry_output(rejected_content or '')}\n\n"
+        "Return a corrected task JSON object only."
+    )
+    return [
+        {"role": "system", "content": _TASK_VALIDATION_RETRY_SYSTEM_MESSAGE},
+        {"role": "user", "content": body},
+    ]
 
 
 def _read_repo_conventions(cfg: Config, checkout: Checkout) -> str:
@@ -903,6 +992,20 @@ def prepare_task(
         final_force_message=_TASK_FORCE_FINAL_MESSAGE,
         validate=_validate if normalize_configured else None,
         max_validation_retries=cfg.task_normalize_max_retries,
+        validation_retry_messages=(
+            lambda chat, feedback, retry_number: _task_validation_retry_messages(
+                repo_full_name=req.repo_full_name,
+                base_ref=req.base_ref,
+                instruction=req.instruction,
+                context=req.context,
+                existing_diff=existing_diff,
+                rejected_content=chat.content,
+                feedback=feedback,
+                retry_number=retry_number,
+            )
+        )
+        if normalize_configured
+        else None,
         parses=_parses,
     )
     for brevity_chat in brevity_chats:

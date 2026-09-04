@@ -152,10 +152,11 @@ class JobStoreTests(unittest.TestCase):
             self.assertIn("chat", kinds)
             self.assertIn("tool", kinds)
             self.assertNotIn("patch_apply_error", kinds)
+            self.assertNotIn("rejected_patch", kinds)
             self.assertNotIn("token", kinds)
             self.assertNotIn("reasoning", kinds)
 
-    def test_persists_patch_apply_error_events(self) -> None:
+    def test_persists_patch_validation_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "jobs.db")
             store = JobStore(db)
@@ -172,7 +173,10 @@ class JobStoreTests(unittest.TestCase):
                 created_at=3.0,
                 status="running",
             )
-            history = [{"kind": "patch_apply_error", "text": "patch does not apply"}]
+            history = [
+                {"kind": "patch_apply_error", "text": "patch does not apply"},
+                {"kind": "rejected_patch", "text": "diff --git a/x b/x\n"},
+            ]
             store.save_terminal(
                 "j3",
                 status="error",

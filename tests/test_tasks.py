@@ -11,10 +11,9 @@ from unittest.mock import patch
 
 from reviewbot.clone_cache import Checkout, CloneCache
 from reviewbot.config import Config
-from reviewbot.llm_client import ChatResult
 from reviewbot.github_client import SERGE_GIT_EMAIL
+from reviewbot.llm_client import ChatResult
 from reviewbot.tasks import (
-    prompt_prefix_summary,
     MAX_REVIEWERS,
     NormalizeGateBroken,
     TaskError,
@@ -22,8 +21,10 @@ from reviewbot.tasks import (
     TaskRequest,
     _read_repo_conventions,
     _selected_failure_context,
+    _task_validation_retry_messages,
     _validate_patch,
     build_task_request,
+    prompt_prefix_summary,
     publish_task,
     resolve_existing_pr,
     task_candidate_requests,
@@ -1270,6 +1271,8 @@ class ValidatePatchTests(unittest.TestCase):
         self.assertEqual(len(apply_errors), 1)
         self.assertIn("`git apply` rejected the proposed patch", apply_errors[0])
         self.assertIn("hello.txt", apply_errors[0])
+        rejected_patches = [text for kind, text in events if kind == "rejected_patch"]
+        self.assertEqual(rejected_patches, [bad_patch])
 
     def test_operator_guidance_is_appended_to_feedback(self):
         cfg = self._cfg(
@@ -1280,6 +1283,26 @@ class ValidatePatchTests(unittest.TestCase):
         feedback, prepared = self._validate(cfg, self._content(self._PATCH))
         self.assertFalse(prepared)
         self.assertIn("HOUSE RULE: never add new dependencies.", feedback)
+
+    def test_task_validation_retry_prompt_is_compact_and_json_only(self):
+        messages = _task_validation_retry_messages(
+            repo_full_name="o/r",
+            base_ref="main",
+            instruction="fix the failing test",
+            context="traceback",
+            existing_diff="diff --git a/x b/x\n",
+            rejected_content='{"patch": "bad"}',
+            feedback="git apply failed",
+            retry_number=2,
+        )
+
+        self.assertEqual([m["role"] for m in messages], ["system", "user"])
+        self.assertIn("JSON object", messages[0]["content"])
+        self.assertIn("no tool requests", messages[0]["content"])
+        self.assertIn("fix the failing test", messages[1]["content"])
+        self.assertIn("git apply failed", messages[1]["content"])
+        self.assertIn('{"patch": "bad"}', messages[1]["content"])
+        self.assertNotIn("tool_call_id", json.dumps(messages))
 
     def test_broken_gate_raises_instead_of_blaming_the_patch(self):
         # The prod shape (transformers#48037): the normalizer fails for a reason
