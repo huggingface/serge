@@ -286,6 +286,40 @@ class WebappTasksTests(unittest.TestCase):
         # The LAST failure, not the first — that is the one the run died on.
         self.assertIn("1 failed: docstrings", r.json()["normalizer_error"])
 
+    def test_status_endpoint_exposes_last_patch_apply_error(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._seed_task_job(webapp, status="error")
+        webapp._store.save_terminal(
+            "task-status-1",
+            status="error",
+            error="LLM returned unparseable output (finish_reason=stop)",
+            raw_llm_output=None,
+            draft=None,
+            history=[
+                {
+                    "kind": "patch_apply_error",
+                    "text": "`git apply` rejected the proposed patch:\nfirst",
+                },
+                {"kind": "log", "text": "noise"},
+                {
+                    "kind": "patch_apply_error",
+                    "text": "`git apply` rejected the proposed patch:\nerror: patch failed: hello.txt:1",
+                },
+            ],
+        )
+        with patch.object(webapp, "verify_token", return_value=_Claims()):
+            client = TestClient(webapp.app)
+            r = client.get(
+                "/tasks/acme/widgets/task-status-1/status",
+                headers={"Authorization": "Bearer tok"},
+            )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertIn("patch failed: hello.txt:1", body["patch_apply_error"])
+        self.assertIsNone(body["normalizer_error"])
+
     def test_status_endpoint_normalize_error_null_when_gate_never_failed(self):
         if TestClient is None:
             self.skipTest("fastapi not installed")
@@ -298,6 +332,7 @@ class WebappTasksTests(unittest.TestCase):
                 headers={"Authorization": "Bearer tok"},
             )
         self.assertIsNone(r.json()["normalizer_error"])
+        self.assertIsNone(r.json()["patch_apply_error"])
 
     def test_last_normalize_error_keeps_the_informative_tail(self):
         # Checker output is tail-informative (traceback, then "N failed: …"),
@@ -305,7 +340,7 @@ class WebappTasksTests(unittest.TestCase):
         webapp = self._import_webapp()
         text = (
             "HEAD-MARKER\n"
-            + "x" * webapp._NORMALIZE_STATUS_CHARS
+            + "x" * webapp._VALIDATION_STATUS_CHARS
             + "\n1 failed: docstrings"
         )
         out = webapp._last_normalize_error(

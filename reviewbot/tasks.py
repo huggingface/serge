@@ -629,6 +629,10 @@ def _validate_patch(
         clone_cache.apply_patch(checkout, patch)
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:1200]
+        emit(
+            "patch_apply_error",
+            f"`git apply` rejected the proposed patch:\n{stderr}",
+        )
         return (
             "Your patch was rejected — `git apply` could not apply it to a "
             f"clean checkout:\n\n{stderr}\n\nReturn a corrected unified diff. "
