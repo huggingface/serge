@@ -151,8 +151,41 @@ class JobStoreTests(unittest.TestCase):
             kinds = [e["kind"] for e in json.loads(raw)]
             self.assertIn("chat", kinds)
             self.assertIn("tool", kinds)
+            self.assertNotIn("patch_apply_error", kinds)
             self.assertNotIn("token", kinds)
             self.assertNotIn("reasoning", kinds)
+
+    def test_persists_patch_apply_error_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "jobs.db")
+            store = JobStore(db)
+            store.insert_job(
+                id="j3",
+                user="bob",
+                target_owner="o",
+                target_repo="r",
+                target_number=3,
+                trigger_comment="x",
+                llm_provider="hf",
+                llm_api_base="https://router.huggingface.co/v1",
+                llm_model="moonshotai/Kimi-K2.6",
+                created_at=3.0,
+                status="running",
+            )
+            history = [{"kind": "patch_apply_error", "text": "patch does not apply"}]
+            store.save_terminal(
+                "j3",
+                status="error",
+                error="boom",
+                raw_llm_output=None,
+                draft=None,
+                history=history,
+            )
+            conn = sqlite3.connect(db)
+            raw = conn.execute(
+                "SELECT history_json FROM jobs WHERE id = ?", ("j3",)
+            ).fetchone()[0]
+            self.assertEqual(json.loads(raw), history)
 
     def test_persists_generated_and_published_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

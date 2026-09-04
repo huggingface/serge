@@ -3919,12 +3919,12 @@ def task_info(request: Request, owner: str, repo: str, job_id: str) -> JSONRespo
 # Bound on the normalize output returned by /status. The transformers checker
 # output is tail-informative (the failing checker's traceback, then the
 # "N failed: <name>" summary), so keep the END, not the head.
-_NORMALIZE_STATUS_CHARS = 8_000
+_VALIDATION_STATUS_CHARS = 8_000
 
 
-def _last_normalize_error(row: Optional[dict]) -> Optional[str]:
-    """The most recent ``normalize_error`` event from a task's persisted
-    history, tail-bounded — or None when the normalizer never rejected a patch.
+def _last_validation_error(row: Optional[dict], kind: str) -> Optional[str]:
+    """The most recent validation event of ``kind`` from persisted task history,
+    tail-bounded — or None when that gate never rejected a patch.
 
     Why /status carries this at all: the normalize gate is the single most
     common reason a dispatched task opens no PR, and on the ``error`` path the
@@ -3937,18 +3937,26 @@ def _last_normalize_error(row: Optional[dict]) -> Optional[str]:
     """
     history = (row or {}).get("history") or []
     for event in reversed(history):
-        if isinstance(event, dict) and event.get("kind") == "normalize_error":
+        if isinstance(event, dict) and event.get("kind") == kind:
             text = (event.get("text") or "").strip()
             if not text:
                 return None
-            if len(text) <= _NORMALIZE_STATUS_CHARS:
+            if len(text) <= _VALIDATION_STATUS_CHARS:
                 return text
-            omitted = len(text) - _NORMALIZE_STATUS_CHARS
+            omitted = len(text) - _VALIDATION_STATUS_CHARS
             return (
-                f"--- omitted {omitted} leading chars of normalize output ---\n\n"
-                + text[-_NORMALIZE_STATUS_CHARS:].lstrip()
+                f"--- omitted {omitted} leading chars of validation output ---\n\n"
+                + text[-_VALIDATION_STATUS_CHARS:].lstrip()
             )
     return None
+
+
+def _last_normalize_error(row: Optional[dict]) -> Optional[str]:
+    return _last_validation_error(row, "normalize_error")
+
+
+def _last_patch_apply_error(row: Optional[dict]) -> Optional[str]:
+    return _last_validation_error(row, "patch_apply_error")
 
 
 @app.get("/tasks/{owner}/{repo}/{job_id}/status")
@@ -4003,6 +4011,7 @@ def task_status(request: Request, owner: str, repo: str, job_id: str) -> JSONRes
             "result": job.task_result,
             "error": job.error,
             "normalizer_error": _last_normalize_error(row),
+            "patch_apply_error": _last_patch_apply_error(row),
             "model": job.llm_model,
             "prompt_tokens": (row or {}).get("prompt_tokens"),
             "completion_tokens": (row or {}).get("completion_tokens"),

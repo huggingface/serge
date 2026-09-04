@@ -1245,6 +1245,32 @@ class ValidatePatchTests(unittest.TestCase):
             self.assertEqual(f.read(), "hi from main\n")
         self.assertEqual(self.cache.collect_changes(self.co), [])
 
+    def test_patch_apply_failure_is_persisted_for_humans(self):
+        cfg = self._cfg(task_normalize_command=["true"], task_normalize_timeout=30)
+        bad_patch = (
+            "diff --git a/hello.txt b/hello.txt\n"
+            "--- a/hello.txt\n"
+            "+++ b/hello.txt\n"
+            "@@ -1 +1 @@\n"
+            "-this context does not match\n"
+            "+hi patched\n"
+        )
+        events = []
+        feedback, prepared = _validate_patch(
+            cfg,
+            checkout=self.co,
+            clone_cache=self.cache,
+            content=self._content(bad_patch),
+            emit=lambda kind, text: events.append((kind, text)),
+        )
+
+        self.assertFalse(prepared)
+        self.assertIn("git apply", feedback)
+        apply_errors = [text for kind, text in events if kind == "patch_apply_error"]
+        self.assertEqual(len(apply_errors), 1)
+        self.assertIn("`git apply` rejected the proposed patch", apply_errors[0])
+        self.assertIn("hello.txt", apply_errors[0])
+
     def test_operator_guidance_is_appended_to_feedback(self):
         cfg = self._cfg(
             task_normalize_command=["sh", "-c", _REJECTS_THE_PATCH],

@@ -110,7 +110,7 @@
           if (text.startsWith("Validating the patch with ")) validateLine = text;
           if (text.startsWith("Patch validation failed ")) retryLine = text;
         }
-        if (lastNormalizeAt >= 0 && i >= lastNormalizeAt && kind === "normalize_error") {
+        if (lastNormalizeAt >= 0 && i >= lastNormalizeAt && (kind === "normalize_error" || kind === "patch_apply_error")) {
           normalizeError = text;
         }
       }
@@ -258,7 +258,7 @@
       if (!body && !calls) return `assistant: (thinking…)${metaStr}`;
       return `assistant:${body ? " " + body : ""}${calls}${metaStr}`;
     }
-    ["step", "tool", "error", "log", "chat", "normalize_error"].forEach(kind => {
+    ["step", "tool", "error", "log", "chat", "normalize_error", "patch_apply_error"].forEach(kind => {
       es.addEventListener(kind, (e) => {
         // The browser also fires a native "error" event (no .data) on a
         // dropped connection; ignore those here — es.onerror handles them.
