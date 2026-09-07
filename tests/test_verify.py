@@ -378,3 +378,124 @@ def test_a_real_model_is_still_passed_through():
     (_o, _r, _wf, _ref, inputs) = gh.dispatched[0]
     assert inputs["model"] == "whisper"
     assert inputs["run_collateral"] == "true"
+
+
+# ── patch_needs_collateral ───────────────────────────────────────────────────
+# The gate re-runs the group's node-ids only, so a patch that edits scaffolding
+# the whole class shares is unverified where it matters. transformers#48425 is
+# the case: it changed the `input_audio` fixture, verified its 6 targeted tests
+# green, and broke `test_to_rus_speech` in the same class.
+
+_TARGETED = [
+    "tests/models/seamless_m4t_v2/test_modeling_seamless_m4t_v2.py"
+    "::SeamlessM4Tv2ModelIntegrationTest::test_speech_to_speech_model"
+]
+
+
+def _patch(path, *lines):
+    head = (
+        f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,6 +1,6 @@\n"
+    )
+    return head + "".join(f"{ln}\n" for ln in lines)
+
+
+def test_a_shared_cached_property_fixture_asks_for_collateral():
+    patch = _patch(
+        "tests/models/seamless_m4t_v2/test_modeling_seamless_m4t_v2.py",
+        "     @cached_property",
+        "     def input_audio(self):",
+        "         set_seed(42)",
+        "-        return self.processor(audio=[features.tolist()], **kw)",
+        "+        return self.processor(audio=features.tolist(), **kw)",
+    )
+    assert verify.patch_needs_collateral(patch, _TARGETED) is True
+
+
+def test_a_teardown_asks_for_collateral():
+    patch = _patch(
+        "tests/models/glm4_moe/test_modeling_glm4_moe.py",
+        "     def tearDown(self):",
+        "-        cleanup(torch_device, gc_collect=False)",
+        "+        cleanup(torch_device, gc_collect=True)",
+    )
+    assert verify.patch_needs_collateral(patch, _TARGETED) is True
+
+
+def test_a_sibling_test_asks_for_collateral():
+    patch = _patch(
+        "tests/models/x/test_modeling_x.py",
+        "     def test_some_other_thing(self):",
+        "-        self.assertEqual(a, 1)",
+        "+        self.assertEqual(a, 2)",
+    )
+    assert verify.patch_needs_collateral(patch, _TARGETED) is True
+
+
+def test_a_change_inside_the_targeted_test_does_not():
+    patch = _patch(
+        "tests/models/seamless_m4t_v2/test_modeling_seamless_m4t_v2.py",
+        "     def test_speech_to_speech_model(self):",
+        "         out = model.generate(**inputs)",
+        '-        self.assertEqual(text, "a")',
+        '+        self.assertEqual(text, "b")',
+    )
+    assert verify.patch_needs_collateral(patch, _TARGETED) is False
+
+
+def test_an_expectation_hunk_with_no_def_in_context_does_not():
+    patch = _patch(
+        "tests/models/seamless_m4t_v2/test_modeling_seamless_m4t_v2.py",
+        "         out = model.generate(**inputs)",
+        '-        self.assertEqual(text, "a")',
+        '+        self.assertEqual(text, "b")',
+        "         self.assertTrue(ok)",
+    )
+    assert verify.patch_needs_collateral(patch, _TARGETED) is False
+
+
+def test_a_source_only_patch_does_not():
+    patch = _patch(
+        "src/transformers/models/x/modeling_x.py",
+        "     def forward(self, x):",
+        "-        return x",
+        "+        return x + 1",
+    )
+    assert verify.patch_needs_collateral(patch, _TARGETED) is False
+
+
+def test_a_source_change_next_to_a_test_change_still_counts():
+    """A patch touching both is judged on its test half."""
+    patch = _patch(
+        "src/transformers/models/x/modeling_x.py",
+        "-        return x",
+        "+        return x + 1",
+    ) + _patch(
+        "tests/models/x/test_modeling_x.py",
+        "     def setUp(self):",
+        "-        self.model_id = 'a'",
+        "+        self.model_id = 'b'",
+    )
+    assert verify.patch_needs_collateral(patch, _TARGETED) is True
+
+
+def test_no_node_ids_treats_every_def_as_unwatched():
+    patch = _patch(
+        "tests/models/x/test_modeling_x.py",
+        "     def test_thing(self):",
+        "-        self.assertEqual(a, 1)",
+        "+        self.assertEqual(a, 2)",
+    )
+    assert verify.patch_needs_collateral(patch, []) is True
+
+
+def test_the_gate_passes_the_computed_collateral_flag_not_the_config_one():
+    """A guard against re-pinning the gate to `cfg.verify_run_collateral`, which
+    is off in prod: the whole point is that a scaffolding patch turns it on."""
+    import inspect
+
+    from reviewbot import tasks
+
+    src = inspect.getsource(tasks._make_verify_gate)
+    assert "patch_needs_collateral(" in src
+    assert "run_collateral=collateral" in src
+    assert "run_collateral=cfg.verify_run_collateral" not in src

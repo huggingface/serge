@@ -69,6 +69,24 @@ _LAYOUT = re.compile(r"[\s,()\[\]{}:]+")
 
 _COMMENT = re.compile(r"^\s*#")
 
+# Calls that change the SHAPE or ORDER of what an assertion compares, not the
+# thing it asserts about. Adding one of these to the actual side redefines
+# passing exactly as editing the expected literal does, and it is harder to see:
+# transformers#48553 added `.flatten()` to `output.sequences.squeeze().tolist()`
+# so a `[2, N]` result would compare against a flat 8-token expectation. Rule 2
+# read the new identifier as a code change and called it a real fix.
+#
+# Kept to operations that only re-arrange a comparison. `.to(...)`, `.cpu()`,
+# `.float()` and friends are deliberately absent: those change the value's
+# device or dtype, and a patch that adds one is making a substantive claim.
+_SHAPE_OP = re.compile(
+    r"\.(?:flatten|ravel|reshape|view|squeeze|unsqueeze|transpose|permute|sort"
+    r"|argsort|tolist|item|round)\s*\((?:[^()]*)\)"
+    r"|\.(?:T|item)\b"
+    r"|\[\s*-?\d+\s*\]"
+    r"|\b(?:sorted|set|list|abs|len|tuple)\s*\("
+)
+
 # Values that are not a new baseline but a broken one. Kept short and literal on
 # purpose: this list is quoted at a human, so a false positive costs a sentence
 # in a PR body, and a miss costs nothing that the label itself does not already
@@ -117,6 +135,20 @@ def _residue(lines: list[str]) -> str:
     return _LAYOUT.sub(" ", joined).strip()
 
 
+def _shape_residue(lines: list[str]) -> str:
+    """:func:`_residue`, with shape/ordering operations dropped as well.
+
+    Two sides that agree here but differ under :func:`_residue` differ only in
+    how the compared values are re-arranged — which is an assertion rewrite
+    wearing a method call.
+    """
+    return _residue([_SHAPE_OP.sub("", ln) for ln in lines])
+
+
+def _shape_ops(lines: list[str]) -> int:
+    return sum(len(_SHAPE_OP.findall(ln)) for ln in lines)
+
+
 def _literals(lines: list[str]) -> list[str]:
     out: list[str] = []
     for m in _STRING_LITERAL.finditer("\n".join(lines)):
@@ -149,6 +181,9 @@ class PatchClassification:
     test_files: list[str] = field(default_factory=list)
     #: Added literal values that read as broken rather than merely new.
     degenerate_values: list[str] = field(default_factory=list)
+    #: Test files where the change is a reshaped comparison rather than a new
+    #: literal — `.flatten()`, `[0]`, `sorted(...)` added to an assertion.
+    reshaped_comparisons: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict:
         return {
@@ -156,16 +191,26 @@ class PatchClassification:
             "source_files": self.source_files,
             "test_files": self.test_files,
             "degenerate_values": self.degenerate_values,
+            "reshaped_comparisons": self.reshaped_comparisons,
         }
 
     def reason(self) -> str:
         """One sentence for a PR body or a log line."""
         if not self.expectation_only:
             return ""
-        base = (
-            "This patch changes only expected values in test files — the "
-            "assertions were rewritten, not the code under test."
-        )
+        if self.reshaped_comparisons:
+            base = (
+                "This patch rewrites how an assertion compares its values "
+                "(a reshaping or extracting call added to one side, e.g. "
+                "`.flatten()`, `[0]`, `sorted(...)`) rather than changing the "
+                "code under test. A shape or ordering difference is a sign the "
+                "inputs changed, so re-arranging the comparison hides it."
+            )
+        else:
+            base = (
+                "This patch changes only expected values in test files — the "
+                "assertions were rewritten, not the code under test."
+            )
         if self.degenerate_values:
             shown = ", ".join(f"`{v}`" for v in self.degenerate_values[:3])
             base += (
@@ -245,7 +290,16 @@ def classify_patch(
             continue
         saw_change = True
         if _residue(old) != _residue(new):
-            literal_only = False
+            # A residue difference explained entirely by shape/ordering
+            # operations appearing on one side is an assertion rewrite, not a
+            # code change: same skeleton, different comparison.
+            if _shape_residue(old) == _shape_residue(new) and _shape_ops(
+                new
+            ) != _shape_ops(old):
+                if path not in result.reshaped_comparisons:
+                    result.reshaped_comparisons.append(path)
+            else:
+                literal_only = False
 
     for path in changed_files if changed_files is not None else result.changed_files:
         if path not in result.changed_files:
