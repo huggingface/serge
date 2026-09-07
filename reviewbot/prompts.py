@@ -539,7 +539,15 @@ def build_user_prompt(
 # as reviews (LLM proposes comments; serge publishes).
 # ---------------------------------------------------------------------------
 
-MAX_INSTRUCTION_CHARS = 8000
+# The instruction is the trusted channel and it is head-truncated, so anything
+# past this is silently dropped from the END — which is where the caller appends
+# its newest guidance. transformers-ci's integration-failure triage sends a
+# shared trunk plus a per-category block, and the `output_mismatch` one reached
+# 8,821 chars in transformers-ci#114: the whole point of that change (do not
+# rewrite the actual side of an assertion; a shape mismatch means the input
+# moved) sat in the 821 chars that fell off. Kept well above today's largest
+# block, and transformers-ci has a test that fails if a category outgrows it.
+MAX_INSTRUCTION_CHARS = 12000
 MAX_CONTEXT_CHARS = 40000
 # How much of the END of a task context is protected from truncation. The
 # appended GPU reproduce/verify block lives there and is the authoritative
