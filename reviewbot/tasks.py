@@ -54,6 +54,7 @@ from .verify import (
     VerifyOutcome,
     extract_verify_targets,
     gate_did_not_run,
+    patch_needs_collateral,
     run_gpu_reproduce,
     run_gpu_verify,
     should_retry,
@@ -1312,6 +1313,21 @@ def _make_verify_gate(
     if not cfg.verify_on_gpu:
         return None
     block = _select_failure_block(req, plan)
+    # The gate re-runs the group's own node-ids, which is full coverage for a
+    # patch confined to those tests and none at all for a patch that edits the
+    # scaffolding they share with the rest of the file. Ask for the collateral
+    # suite in the second case even when it is globally off.
+    node_ids, _, _ = extract_verify_targets(block, cfg.verify_machine_type)
+    collateral = cfg.verify_run_collateral or patch_needs_collateral(
+        plan.patch, node_ids
+    )
+    if collateral and not cfg.verify_run_collateral:
+        emit_fn(
+            "log",
+            "GPU verify: the patch touches shared test scaffolding, so the "
+            "collateral suite runs too (the targeted node-ids alone would not "
+            "see a sibling test break).",
+        )
 
     def _gate(base_sha: str, candidate_sha: str) -> VerifyOutcome:
         outcome = run_gpu_verify(
@@ -1325,7 +1341,7 @@ def _make_verify_gate(
             workflow_file=cfg.verify_workflow_file,
             ref=cfg.verify_ref,
             default_machine_type=cfg.verify_machine_type,
-            run_collateral=cfg.verify_run_collateral,
+            run_collateral=collateral,
             transformersci_ref=cfg.verify_transformersci_ref,
             poll_timeout=effective_poll_timeout(
                 cfg.verify_poll_timeout, getattr(cfg, "task_runner_timeout", None)

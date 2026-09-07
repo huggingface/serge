@@ -422,3 +422,85 @@ class UnjudgedOutcomeTests(unittest.TestCase):
             src.count("expectation_only=classification.expectation_only"),
             "a _commit_changes return path is missing expectation_only",
         )
+
+
+class ReshapedComparisonTests(unittest.TestCase):
+    """transformers#48553: `.flatten()` added to the actual side of an
+    assertion. Rule 2 saw a new identifier and called it a real fix, so serge
+    published "verified on GPU" for a patch that cannot make the test pass."""
+
+    PATH = "tests/models/seamless_m4t_v2/test_modeling_seamless_m4t_v2.py"
+
+    def _patch(self, old: str, new: str, path: str | None = None) -> str:
+        path = path or self.PATH
+        return (
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n"
+            f"+++ b/{path}\n"
+            "@@ -1,1 +1,1 @@\n"
+            f"-{old}\n"
+            f"+{new}\n"
+        )
+
+    def _classify(self, old: str, new: str, path: str | None = None):
+        path = path or self.PATH
+        return classify_patch(self._patch(old, new, path), changed_files=[path])
+
+    def test_the_real_48553_diff_is_caught(self):
+        got = self._classify(
+            "        self.assertListEqual(expected, output.sequences.squeeze().tolist())",
+            "        self.assertListEqual(expected, output.sequences.squeeze().flatten().tolist())",
+        )
+        self.assertTrue(got.expectation_only)
+        self.assertEqual(got.reshaped_comparisons, [self.PATH])
+
+    def test_an_added_index_is_caught(self):
+        got = self._classify(
+            "        self.assertEqual(expected, decode(output))",
+            "        self.assertEqual(expected, decode(output)[0])",
+        )
+        self.assertTrue(got.expectation_only)
+
+    def test_sorting_one_side_is_caught(self):
+        got = self._classify(
+            "        self.assertEqual(expected, got)",
+            "        self.assertEqual(sorted(expected), sorted(got))",
+        )
+        self.assertTrue(got.expectation_only)
+
+    def test_the_reason_names_the_rewrite_not_a_new_value(self):
+        got = self._classify(
+            "        self.assertListEqual(expected, out.squeeze().tolist())",
+            "        self.assertListEqual(expected, out.squeeze().flatten().tolist())",
+        )
+        self.assertIn("rewrites how an assertion compares", got.reason())
+        self.assertNotIn("changes only expected values", got.reason())
+
+    def test_a_dtype_or_device_move_is_still_a_real_fix(self):
+        """`.to(...)`/`.float()` change the value, not its shape — a patch that
+        adds one is making a substantive claim and keeps its verification."""
+        got = self._classify(
+            "        got = model(**inputs).logits",
+            "        got = model(**inputs).logits.float()",
+        )
+        self.assertFalse(got.expectation_only)
+        self.assertEqual(got.reshaped_comparisons, [])
+
+    def test_a_new_kwarg_is_still_a_real_fix(self):
+        """#48440's shape, which was merged as a real fix."""
+        got = self._classify(
+            "        out = model.generate(**inputs, max_new_tokens=20)",
+            "        out = model.generate(**inputs, max_new_tokens=20, tokenizer=tokenizer)",
+        )
+        self.assertFalse(got.expectation_only)
+
+    def test_a_source_file_still_wins(self):
+        """A reshape in a source file is not an expectation change: the split on
+        `source_files` is authoritative."""
+        path = "src/transformers/models/foo/modeling_foo.py"
+        got = self._classify(
+            "        x = hidden.squeeze()",
+            "        x = hidden.squeeze().flatten()",
+            path=path,
+        )
+        self.assertFalse(got.expectation_only)

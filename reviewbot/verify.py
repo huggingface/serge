@@ -158,6 +158,91 @@ def extract_verify_targets(
     return node_ids, model, machine_type
 
 
+# Scaffolding a whole test class shares. A patch that edits one of these can
+# break tests the failure group never named, and the gate only re-runs the
+# group's own node-ids — which is how transformers#48425 changed the
+# `input_audio` fixture from one 2-channel sample to two mono samples, verified
+# its own 6 targeted tests green, and left `test_to_rus_speech` (same class,
+# same fixture) comparing a nested list against a flat expectation. The collateral
+# suite exists for exactly this; it just had to be asked for.
+_SCAFFOLDING_MARKERS = (
+    "def setUp",
+    "def tearDown",
+    "def setUpClass",
+    "def tearDownClass",
+    "@cached_property",
+    "@classmethod",
+    "@property",
+    "@staticmethod",
+)
+_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)")
+
+
+def _hunks_by_file(patch: str):
+    """Yield ``(path, hunk_lines)`` per hunk of a unified diff, hunk_lines being
+    every line of the hunk including context."""
+    path: Optional[str] = None
+    hunk: list[str] = []
+    for raw in patch.splitlines():
+        if (
+            raw.startswith("diff --git ")
+            or raw.startswith("+++ ")
+            or raw.startswith("--- ")
+        ):
+            if hunk and path:
+                yield path, hunk
+            hunk = []
+            if raw.startswith("+++ "):
+                target = raw[4:].strip()
+                if target != "/dev/null":
+                    path = target[2:] if target.startswith("b/") else target
+            elif raw.startswith("diff --git "):
+                path = None
+            continue
+        if raw.startswith("@@"):
+            if hunk and path:
+                yield path, hunk
+            hunk = []
+            continue
+        if path:
+            hunk.append(raw)
+    if hunk and path:
+        yield path, hunk
+
+
+def patch_needs_collateral(patch: str, node_ids: list[str]) -> bool:
+    """Whether this patch edits scaffolding the targeted tests only share.
+
+    The gate re-runs the group's node-ids, so a patch confined to a targeted
+    test's own body is fully covered by it. A patch that changes a `setUp`, a
+    `cached_property` fixture, a helper, or a sibling test is not: the tests it
+    can break are the ones nobody is watching. Those runs get the collateral
+    suite (`tests/models/<model>`) on both trees as well.
+
+    Decided from the hunk text alone — the patch is the model's proposal, so its
+    `@@` headers carry no function context to trust. A hunk counts as
+    scaffolding when it shows a scaffolding marker, or a `def` that is not one
+    of the targeted tests.
+    """
+    targeted = {nid.rsplit("::", 1)[-1] for nid in node_ids}
+    for path, hunk in _hunks_by_file(patch):
+        if not path.endswith(".py"):
+            continue
+        parts = path.split("/")
+        name = parts[-1]
+        is_test = "tests" in parts or name.startswith("test_") or name == "conftest.py"
+        if not is_test:
+            continue
+        for line in hunk:
+            body = line[1:] if line[:1] in "+- " else line
+            if any(marker in body for marker in _SCAFFOLDING_MARKERS):
+                return True
+            m = _DEF_RE.match(body)
+            if m and m.group(1) not in targeted:
+                return True
+    return False
+
+
 def parse_verify_result_zip(zip_bytes: bytes) -> Optional[dict]:
     """Extract and parse ``verify-result.json`` from an artifact zip."""
     try:

@@ -122,21 +122,24 @@ envVars:
     # found" and, again, every task fails.
     uv pip install -e . --system --no-deps --no-build-isolation
 
-    # ruff lint + format over the whole repo.
-    make style
-
-    # The repo consistency checkers, in the order transformers itself runs them.
-    # --fix rewrites what it can (check-only checkers are skipped in fix mode);
-    # --keep-going reports every failure instead of stopping at the first, so one
-    # gate run tells the model everything it has to correct.
-    CHECKERS=ruff_check,ruff_format,init_isort,sort_auto_mappings
-    CHECKERS=$CHECKERS,types,modeling_structure,auto_mappings,imports
-    CHECKERS=$CHECKERS,import_complexity,copies,modular_conversion,doc_toc
-    CHECKERS=$CHECKERS,modeling_rules_doc,docstrings,dummies,repo,inits
-    CHECKERS=$CHECKERS,pipeline_typing,config_docstrings,config_attributes
-    CHECKERS=$CHECKERS,doctest_list,update_metadata,deps_table
-
-    python utils/checkers.py "$CHECKERS" --fix --keep-going
+    # The repo normalizer: ruff lint + format plus every consistency checker,
+    # with --fix and --keep-going, so one gate run tells the model everything it
+    # has to correct. This is `python utils/checkers.py $(ALL_CHECKERS) --fix
+    # --keep-going` -- the target exists precisely so the list cannot drift, and
+    # spelling the list out here is what made it drift: the hand-copied set was
+    # missing `noisy_comments` (a repo checker for comments that restate the
+    # code, which is exactly what an LLM patch adds), `reviewers` and
+    # `add_dates`, all three of which CI runs. A patch could clear this gate and
+    # still land a red `check-code-quality` / `Check repository consistency`.
+    #
+    # transformers is set up for this sandbox: checkers that need a package
+    # declare it (`needs_requirements`), so the ones that would reach for pip in
+    # a --network none container are the only ones that try, and the env var
+    # below turns even that off. `add_dates` shells out to git and only looks at
+    # the models the patch actually touches, so a test-only patch never reaches
+    # the network through it.
+    export TRANSFORMERS_SKIP_CHECKER_REQUIREMENTS=1
+    make fix-repo
     '
   TASK_NORMALIZE_TIMEOUT: "1800"
   TASK_NORMALIZE_MAX_RETRIES: "2"
