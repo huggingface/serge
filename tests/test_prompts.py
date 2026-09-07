@@ -3,6 +3,7 @@ import unittest
 from reviewbot.prompts import (
     CONTEXT_TAIL_RESERVE_CHARS,
     MAX_CONTEXT_CHARS,
+    MAX_INSTRUCTION_CHARS,
     _truncate_middle,
     build_task_user_prompt,
     build_followup_system_prompt,
@@ -247,3 +248,33 @@ class ChangedExpectationsRuleTests(unittest.TestCase):
         """The template is rendered with str.format, so the `Expectations({...})`
         example has to be brace-escaped or every review prompt raises."""
         self.assertIn("`Expectations({...})`", self._prompt())
+
+
+class InstructionBudgetTests(unittest.TestCase):
+    """The instruction is head-truncated, so an over-long one loses its END.
+
+    transformers-ci sends a shared trunk plus a per-category block, appending
+    the newest guidance last: at the old 8,000-char cap its `output_mismatch`
+    instruction (8,821 chars after transformers-ci#114) lost exactly the bullets
+    that change had added, and nothing said so — the model just saw a truncation
+    marker where the reasoning should have been.
+    """
+
+    def _instruction_in(self, text: str) -> str:
+        return build_task_user_prompt(
+            repo_full_name="huggingface/transformers",
+            base_ref="main",
+            instruction=text,
+            context="ctx",
+        )
+
+    def test_a_real_sized_per_category_instruction_survives_whole(self) -> None:
+        instruction = "x" * 9000 + "TAIL-OF-THE-GUIDANCE"
+        prompt = self._instruction_in(instruction)
+        self.assertIn("TAIL-OF-THE-GUIDANCE", prompt)
+        self.assertNotIn("truncated", prompt)
+
+    def test_the_cap_still_bites_eventually(self) -> None:
+        prompt = self._instruction_in("x" * (MAX_INSTRUCTION_CHARS + 10) + "LOST")
+        self.assertNotIn("LOST", prompt)
+        self.assertIn("truncated", prompt)
