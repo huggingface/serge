@@ -220,6 +220,40 @@ class GitHubClient:
             page += 1
         return files
 
+    def get_pr_review_comments(self, owner: str, repo: str, number: int) -> list[dict]:
+        comments: list[dict] = []
+        page = 1
+        while True:
+            r = self.session.get(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/comments",
+                params={"per_page": 100, "page": page},
+                timeout=60,
+            )
+            r.raise_for_status()
+            batch = r.json()
+            comments.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return comments
+
+    def get_pr_reviews(self, owner: str, repo: str, number: int) -> list[dict]:
+        reviews: list[dict] = []
+        page = 1
+        while True:
+            r = self.session.get(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/reviews",
+                params={"per_page": 100, "page": page},
+                timeout=60,
+            )
+            r.raise_for_status()
+            batch = r.json()
+            reviews.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return reviews
+
     def get_file_contents(
         self, owner: str, repo: str, path: str, ref: Optional[str] = None
     ) -> Optional[str]:
