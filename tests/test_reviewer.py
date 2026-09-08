@@ -530,6 +530,7 @@ class _CfgStub:
         tool_repeat_limit: int = 0,
         tool_path_revisit_limit: int = 0,
         tool_path_trip_after: int = 0,
+        tool_result_window: int = 0,
         review_comment_brevity: bool = True,
         comment_brevity_min_chars: int = 100,
         comment_brevity_max_items: int = 40,
@@ -544,6 +545,7 @@ class _CfgStub:
         self.tool_repeat_limit = tool_repeat_limit
         self.tool_path_revisit_limit = tool_path_revisit_limit
         self.tool_path_trip_after = tool_path_trip_after
+        self.tool_result_window = tool_result_window
 
 
 class _FakeLLM:
@@ -1265,6 +1267,78 @@ class StopReasonTests(unittest.TestCase):
         )
         self.assertEqual(metrics.stop_reason, STOP_INPUT_TOKEN_CAP)
 
+    def test_peak_is_the_widest_turn_not_the_sum(self) -> None:
+        """The number that made 2M look like a context problem. `prompt_tokens`
+        sums each turn's whole prompt because the loop re-sends the
+        conversation; only the peak says how big any one request was."""
+        metrics = _AggregateMetrics()
+        for prompt in (5_100, 31_522, 56_400, 3_528):
+            metrics.record_call(
+                ChatResult(
+                    content="",
+                    usage={"prompt_tokens": prompt, "completion_tokens": 10},
+                )
+            )
+        self.assertEqual(metrics.prompt_tokens, 96_550)
+        self.assertEqual(metrics.peak_prompt_tokens, 56_400)
+        self.assertEqual(metrics.turns, 4)
+
+    def test_a_silent_provider_leaves_cached_unknown_not_zero(self) -> None:
+        """Reporting an unknown as 0 would assert the run was entirely uncached
+        on no evidence, and `prompt_tokens` is only an upper bound on the bill
+        when we cannot tell."""
+        metrics = _AggregateMetrics()
+        metrics.record_call(ChatResult(content="", usage={"prompt_tokens": 100}))
+        self.assertIsNone(metrics.cached_tokens)
+        self.assertIsNone(session_record(metrics)["cached_tokens"])
+
+    def test_cached_tokens_sum_over_the_turns_that_reported_them(self) -> None:
+        metrics = _AggregateMetrics()
+        metrics.record_call(ChatResult(content="", usage={"prompt_tokens": 100}))
+        metrics.record_call(
+            ChatResult(
+                content="",
+                usage={
+                    "prompt_tokens": 900,
+                    "prompt_tokens_details": {"cached_tokens": 800},
+                },
+            )
+        )
+        metrics.record_call(
+            ChatResult(
+                content="",
+                usage={
+                    "prompt_tokens": 900,
+                    "prompt_tokens_details": {"cached_tokens": 850},
+                },
+            )
+        )
+        self.assertEqual(metrics.cached_tokens, 1_650)
+        self.assertEqual(metrics.prompt_tokens, 1_900)
+
+    def test_record_usage_does_not_spend_a_turn(self) -> None:
+        """The brevity passes are not the loop browsing the PR, and `turns` is
+        read as loop iterations by the serge-agent-sessions dashboard."""
+        metrics = _AggregateMetrics()
+        metrics.record_usage(
+            ChatResult(content="", usage={"prompt_tokens": 700, "cached_tokens": 200})
+        )
+        self.assertEqual(metrics.turns, 0)
+        self.assertEqual(metrics.prompt_tokens, 700)
+        self.assertEqual(metrics.peak_prompt_tokens, 700)
+        self.assertEqual(metrics.cached_tokens, 200)
+
+    def test_the_loop_records_the_peak_it_saw(self) -> None:
+        cfg = _CfgStub(llm_max_input_tokens=100_000)
+        _, metrics = _run_agentic_loop(
+            _FakeLLM([self._tool_turn(60_000), self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.peak_prompt_tokens, 60_000)
+        self.assertGreater(metrics.prompt_tokens, metrics.peak_prompt_tokens)
+
     def test_repeat_guard(self) -> None:
         cfg = _CfgStub(tool_max_iterations=0, tool_repeat_limit=2)
         _, metrics = _run_agentic_loop(
@@ -1411,6 +1485,39 @@ class SessionRecordTests(unittest.TestCase):
         self.assertEqual(merge_session_records(a, {}), a)
         self.assertEqual(merge_session_records(None, None), {})
 
+    def test_merging_takes_the_widest_peak_not_the_total(self) -> None:
+        """Each round is a fresh conversation, so summing peaks would invent a
+        request that never happened."""
+        a = {"peak_prompt_tokens": 40_000, "rounds": 1, "stop_reason": STOP_ANSWERED}
+        b = {"peak_prompt_tokens": 56_400, "rounds": 1, "stop_reason": STOP_ANSWERED}
+        self.assertEqual(merge_session_records(a, b)["peak_prompt_tokens"], 56_400)
+        self.assertEqual(merge_session_records(b, a)["peak_prompt_tokens"], 56_400)
+
+    def test_merging_two_unknown_cache_figures_stays_unknown(self) -> None:
+        """`int(x or 0)` would fold "neither round knew" into a confident zero,
+        which reads as "nothing was cached" — the opposite of the truth."""
+        a = {"cached_tokens": None, "rounds": 1, "stop_reason": STOP_ANSWERED}
+        b = {"cached_tokens": None, "rounds": 1, "stop_reason": STOP_ANSWERED}
+        self.assertIsNone(merge_session_records(a, b)["cached_tokens"])
+
+    def test_a_known_cache_figure_survives_an_unknown_one(self) -> None:
+        known = {"cached_tokens": 1_200, "rounds": 1, "stop_reason": STOP_ANSWERED}
+        unknown = {"cached_tokens": None, "rounds": 1, "stop_reason": STOP_ANSWERED}
+        self.assertEqual(merge_session_records(known, unknown)["cached_tokens"], 1_200)
+        self.assertEqual(merge_session_records(unknown, known)["cached_tokens"], 1_200)
+        self.assertEqual(
+            merge_session_records(known, dict(known))["cached_tokens"], 2_400
+        )
+
+    def test_a_legacy_record_without_the_new_keys_still_merges(self) -> None:
+        """Session records are JSON written by older builds; a missing key must
+        not raise or invent a value."""
+        legacy = {"turns": 5, "prompt_tokens": 100, "rounds": 1}
+        merged = merge_session_records(legacy, dict(legacy))
+        self.assertEqual(merged["prompt_tokens"], 200)
+        self.assertEqual(merged["peak_prompt_tokens"], 0)
+        self.assertIsNone(merged["cached_tokens"])
+
     def test_a_job_that_never_ran_the_loop_still_reports(self) -> None:
         """Reproduce-first classifying a group ENVIRONMENT is 0 LLM turns, and
         that has to be countable — otherwise it is indistinguishable from serge
@@ -1419,6 +1526,146 @@ class SessionRecordTests(unittest.TestCase):
         self.assertEqual(record["rounds"], 0)
         self.assertEqual(record["turns"], 0)
         self.assertEqual(record["stop_reason"], STOP_NO_LLM_TURNS)
+
+
+class TranscriptWindowLoopTests(unittest.TestCase):
+    """The loop has to send the *windowed* transcript, not just compute one.
+
+    Patching the window itself keeps these tests independent of how big a real
+    tool result happens to be — what is under test is the wiring: which list
+    reaches the provider, what budget is asked for, and which turn opts out.
+    """
+
+    def _tool_turn(self) -> ChatResult:
+        return ChatResult(
+            content="",
+            usage={"prompt_tokens": 10_000, "completion_tokens": 20},
+            tool_calls=[ToolCall(id="t", name="grep", arguments='{"pattern": "Foo"}')],
+        )
+
+    def _answer(self) -> ChatResult:
+        return ChatResult(
+            content='{"summary": "ok", "comments": []}',
+            usage={"prompt_tokens": 1_000, "completion_tokens": 10},
+        )
+
+    def test_the_windowed_messages_are_what_reaches_the_provider(self) -> None:
+        sentinel = [{"role": "user", "content": "windowed"}]
+        llm = _FakeLLM([self._tool_turn(), self._answer()])
+        with patch(
+            "reviewbot.reviewer.elide_old_tool_results",
+            return_value=(sentinel, 7, 90_000),
+        ):
+            _, metrics = _run_agentic_loop(
+                llm,  # type: ignore[arg-type]
+                [{"role": "user", "content": "x"}],
+                cfg=_CfgStub(tool_result_window=20),  # type: ignore[arg-type]
+                tool_env=ToolEnv(repo_root="/tmp"),
+            )
+        self.assertEqual(llm.calls[0]["messages"], sentinel)
+        self.assertEqual(metrics.elided_tool_results, 7)
+        self.assertEqual(metrics.elided_chars, 90_000)
+
+    def test_the_configured_window_is_the_budget_asked_for(self) -> None:
+        llm = _FakeLLM([self._tool_turn(), self._answer()])
+        with patch(
+            "reviewbot.reviewer.elide_old_tool_results",
+            side_effect=lambda messages, **kw: (messages, 0, 0),
+        ) as window:
+            _run_agentic_loop(
+                llm,  # type: ignore[arg-type]
+                [{"role": "user", "content": "x"}],
+                cfg=_CfgStub(tool_result_window=12),  # type: ignore[arg-type]
+                tool_env=ToolEnv(repo_root="/tmp"),
+            )
+        self.assertTrue(window.call_args_list)
+        for call in window.call_args_list:
+            self.assertEqual(call.kwargs["keep_recent"], 12)
+
+    def test_the_window_is_off_by_default(self) -> None:
+        """Every measured run to date sent the whole transcript; the shipped
+        default must not change that silently."""
+        llm = _FakeLLM([self._tool_turn(), self._answer()])
+        with patch(
+            "reviewbot.reviewer.elide_old_tool_results",
+            side_effect=lambda messages, **kw: (messages, 0, 0),
+        ) as window:
+            _run_agentic_loop(
+                llm,  # type: ignore[arg-type]
+                [{"role": "user", "content": "x"}],
+                cfg=_CfgStub(),  # type: ignore[arg-type]
+                tool_env=ToolEnv(repo_root="/tmp"),
+            )
+        for call in window.call_args_list:
+            self.assertEqual(call.kwargs["keep_recent"], 0)
+
+    def test_a_cfg_without_the_field_does_not_crash_the_loop(self) -> None:
+        """Older per-task runner pods rebuild Config from their own env, and a
+        review pod on a previous image has no such attribute."""
+
+        class _Ancient:
+            llm_max_tokens = 1024
+            tool_max_iterations = 30
+            llm_max_input_tokens = 0
+            llm_reasoning_effort = None
+
+        _, metrics = _run_agentic_loop(
+            _FakeLLM([self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=_Ancient(),  # type: ignore[arg-type]
+            tool_env=None,
+        )
+        self.assertEqual(metrics.stop_reason, STOP_ANSWERED)
+        self.assertEqual(metrics.elided_tool_results, 0)
+
+    def test_the_salvage_turn_gets_the_whole_transcript(self) -> None:
+        """`force_json_only` is the turn that has to *produce* the patch out of
+        what it read; starving it is the one failure the window must not cause.
+        """
+        llm = _FakeLLM(
+            [
+                self._tool_turn(),
+                # Empty final answer -> salvage re-ask with tools off.
+                ChatResult(content="", usage={"prompt_tokens": 900}),
+                self._answer(),
+            ]
+        )
+        with patch(
+            "reviewbot.reviewer.elide_old_tool_results",
+            side_effect=lambda messages, **kw: (messages, 0, 0),
+        ) as window:
+            _run_agentic_loop(
+                llm,  # type: ignore[arg-type]
+                [{"role": "user", "content": "x"}],
+                cfg=_CfgStub(tool_result_window=5),  # type: ignore[arg-type]
+                tool_env=ToolEnv(repo_root="/tmp"),
+            )
+        budgets = [call.kwargs["keep_recent"] for call in window.call_args_list]
+        self.assertIn(5, budgets)
+        self.assertIn(0, budgets)
+
+    def test_the_widest_request_is_reported_not_the_running_total(self) -> None:
+        """Elision is recomputed from the full transcript every turn, so adding
+        the per-turn figures up would count one saving once per turn left."""
+        llm = _FakeLLM([self._tool_turn(), self._tool_turn(), self._answer()])
+        counts = iter([(3, 1_000), (9, 5_000), (4, 2_000)])
+
+        def _window(messages, **kw):
+            try:
+                elided, saved = next(counts)
+            except StopIteration:
+                elided, saved = 0, 0
+            return messages, elided, saved
+
+        with patch("reviewbot.reviewer.elide_old_tool_results", side_effect=_window):
+            _, metrics = _run_agentic_loop(
+                llm,  # type: ignore[arg-type]
+                [{"role": "user", "content": "x"}],
+                cfg=_CfgStub(tool_result_window=8),  # type: ignore[arg-type]
+                tool_env=ToolEnv(repo_root="/tmp"),
+            )
+        self.assertEqual(metrics.elided_tool_results, 9)
+        self.assertEqual(metrics.elided_chars, 5_000)
 
 
 class PathRevisitLoopTests(unittest.TestCase):

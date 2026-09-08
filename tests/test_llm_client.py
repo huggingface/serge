@@ -7,8 +7,10 @@ import requests
 
 from reviewbot.llm_client import (
     ChatCompletionClient,
+    ChatResult,
     LLMResponseError,
     _parse_text_tool_calls,
+    cached_tokens_from_usage,
 )
 
 
@@ -1166,6 +1168,80 @@ class TextToolCallRecoveryTests(unittest.TestCase):
         self.assertEqual([c.name for c in result.tool_calls], ["grep"])
         # The structured field was authoritative, so content is left alone.
         self.assertEqual(result.content, self.PROD_CONTENT)
+
+
+class CachedTokenReadingTests(unittest.TestCase):
+    """Reading the prefix-cache figure off a usage block.
+
+    Why it matters: the agent loop re-sends the whole conversation every turn,
+    so summed `prompt_tokens` is an upper bound on the bill. How loose that
+    bound is depends entirely on this number, and None (the provider said
+    nothing) must never collapse into 0 (nothing was cached).
+    """
+
+    def test_openai_and_hf_router_nest_it_under_details(self) -> None:
+        chat = ChatResult(
+            content="",
+            usage={
+                "prompt_tokens": 56_400,
+                "prompt_tokens_details": {"cached_tokens": 51_200},
+            },
+        )
+        self.assertEqual(chat.cached_tokens, 51_200)
+
+    def test_the_anthropic_shim_spelling_is_read(self) -> None:
+        chat = ChatResult(
+            content="",
+            usage={"prompt_tokens": 900, "cache_read_input_tokens": 750},
+        )
+        self.assertEqual(chat.cached_tokens, 750)
+
+    def test_a_flat_cached_tokens_is_read(self) -> None:
+        chat = ChatResult(content="", usage={"prompt_tokens": 900, "cached_tokens": 40})
+        self.assertEqual(chat.cached_tokens, 40)
+
+    def test_a_silent_provider_reads_as_unknown(self) -> None:
+        chat = ChatResult(content="", usage={"prompt_tokens": 900})
+        self.assertIsNone(chat.cached_tokens)
+
+    def test_a_reported_zero_is_kept_as_zero(self) -> None:
+        """A provider that says "nothing was cached" is real information, and
+        distinct from one that says nothing at all."""
+        chat = ChatResult(
+            content="",
+            usage={"prompt_tokens": 900, "prompt_tokens_details": {"cached_tokens": 0}},
+        )
+        self.assertEqual(chat.cached_tokens, 0)
+
+    def test_junk_is_ignored_rather_than_returned(self) -> None:
+        for usage in (
+            {"prompt_tokens_details": {"cached_tokens": "800"}},
+            {"prompt_tokens_details": "800"},
+            {"cached_tokens": None},
+            {"cached_tokens": True},
+            {},
+        ):
+            with self.subTest(usage=usage):
+                self.assertIsNone(ChatResult(content="", usage=usage).cached_tokens)
+
+    def test_details_win_over_the_flat_spelling(self) -> None:
+        chat = ChatResult(
+            content="",
+            usage={
+                "prompt_tokens_details": {"cached_tokens": 700},
+                "cached_tokens": 1,
+            },
+        )
+        self.assertEqual(chat.cached_tokens, 700)
+
+    def test_the_helper_reads_a_bare_usage_dict(self) -> None:
+        """Split out so the per-call log line does not have to build a
+        ChatResult just to log the number."""
+        self.assertEqual(
+            cached_tokens_from_usage({"prompt_tokens_details": {"cached_tokens": 12}}),
+            12,
+        )
+        self.assertIsNone(cached_tokens_from_usage({}))
 
 
 if __name__ == "__main__":

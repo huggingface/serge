@@ -910,17 +910,21 @@ def prepare_task(
         existing_diff=existing_diff,
     )
 
-    # This prefix is resent on EVERY turn, so its size -- not the number of tool
-    # calls -- sets how many turns the input-token cap buys. Measured on a real
-    # 51-turn task (mm_grounding_dino, 2026-08-31): turn 1 cost 25,335 input
-    # tokens and the conversation itself then grew only ~510 tokens a turn, so
-    # ~63% of the whole 2M budget went on re-sending this prefix. The known
-    # components (system template, conventions, tool schemas, dispatched ITF
-    # context) account for only ~3.2k of those 25.3k, and the residue is
-    # believed to be the GPU reproduce/verify feedback that `_with_feedback`
-    # appends to `req.context`. "Believed" is the problem: it was reached by
-    # subtraction because the request body is never logged. Log the breakdown
-    # once per task so the dominant component is a fact in the job row.
+    # This prefix is resent on EVERY turn, so log its breakdown once per task —
+    # it is the only way the dominant component of a session's bill is a fact in
+    # the job row rather than something reached by subtraction.
+    #
+    # It is no longer the dominant component, and this comment used to say it
+    # was. Measured on mm_grounding_dino (2026-08-31, 51 turns), turn 1 cost
+    # 25,335 input tokens and the conversation grew only ~510 a turn, so ~63% of
+    # the 2M budget went on re-sending this prefix. Re-measured across all 8
+    # tasks that hit the cap in the 30 days to 2026-09-08, the prefix is
+    # 16.7k–20.2k chars (~5k tokens) and the transcript is what dominates: on
+    # d9d4b022 the prefix was 14% of a 2,094,215-token session and 62
+    # accumulated tool results were the other 86%, with the widest single
+    # request at 56,400 tokens. So shrinking this buys little now, and the
+    # lever is `TOOL_RESULT_WINDOW` (:mod:`reviewbot.transcript`). Keep logging
+    # it anyway: that conclusion is only checkable because this line exists.
     _emit(
         "log",
         prompt_prefix_summary(
@@ -1010,9 +1014,9 @@ def prepare_task(
         parses=_parses,
     )
     for brevity_chat in brevity_chats:
-        metrics.prompt_tokens += brevity_chat.prompt_tokens or 0
-        metrics.completion_tokens += brevity_chat.completion_tokens or 0
-        metrics.latency_seconds += brevity_chat.latency_seconds or 0.0
+        # Tokens and latency, but not a turn — same reasoning as the review-side
+        # brevity pass in reviewer._condense_review.
+        metrics.record_usage(brevity_chat)
     metrics_line = _format_aggregated_metrics(metrics)
     _emit("log", f"LLM done: {metrics_line}")
 
