@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import Mock, patch
 
+import requests
+
 from reviewbot.github_client import GitHubClient
 from reviewbot.review_history import build_prior_review_context
 from reviewbot.reviewer import _load_prior_review_context
@@ -185,11 +187,25 @@ class PriorReviewLoaderTests(unittest.TestCase):
         gh.get_pr_reviews.assert_called_once_with("acme", "project", 7)
         gh.get_pr_review_comments.assert_called_once_with("acme", "project", 7)
 
-    def test_loader_is_fail_soft(self) -> None:
+    def test_loader_is_fail_soft_on_transport_error(self) -> None:
         gh = Mock()
-        gh.get_pr_reviews.side_effect = RuntimeError("GitHub unavailable")
+        gh.get_pr_reviews.side_effect = requests.ConnectionError("GitHub unavailable")
 
         self.assertIsNone(_load_prior_review_context(gh, "acme", "project", 7))
+
+    def test_loader_propagates_http_errors(self) -> None:
+        for status_code in (401, 404, 429):
+            with self.subTest(status_code=status_code):
+                gh = Mock()
+                response = requests.Response()
+                response.status_code = status_code
+                gh.get_pr_reviews.side_effect = requests.HTTPError(
+                    f"{status_code} from GitHub",
+                    response=response,
+                )
+
+                with self.assertRaises(requests.HTTPError):
+                    _load_prior_review_context(gh, "acme", "project", 7)
 
 
 if __name__ == "__main__":

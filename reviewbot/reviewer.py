@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
+import requests
+
 from . import __version__
 from .brevity import condense_review_bodies
 from .compression import MessageCompressor
@@ -1741,7 +1743,10 @@ def _load_prior_review_context(
             gh.get_pr_reviews(owner, repo, number),
             gh.get_pr_review_comments(owner, repo, number),
         )
-    except Exception:
+    except requests.HTTPError:
+        log.exception("failed to fetch prior review history")
+        raise
+    except requests.RequestException:
         log.exception("failed to fetch prior review history")
         return None
 
