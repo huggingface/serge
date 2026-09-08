@@ -11,6 +11,7 @@ secret_file=""
 expected_context=""
 dry_run=0
 from_head=0
+allow_removals=0
 image_wait_timeout=900
 
 usage() {
@@ -21,13 +22,16 @@ Options:
   -n, --namespace NAME       Kubernetes namespace (default: serge)
   -r, --release NAME         Helm release name (default: serge)
   -f, --values FILE          Helm values file; repeat to layer overlays, later
-                             files win (default: deploy/helm/env/prod.yaml)
+                             files win. REQUIRED — the production values are not
+                             in this repo, see deploy/helm/env/example.yaml
       --secret-file FILE     Apply a local Secret manifest before deploying
       --context NAME         Require this kubectl context before deploying
       --from-head            Pin image.tag to HEAD's sha-<commit>, waiting for
                              CI to publish that image to GHCR first, then write
                              the tag into the values file before deploying
       --dry-run              Render manifests without changing the cluster
+      --allow-removals       Proceed even though these values DROP settings the
+                             live release has (see the drift preflight below)
   -h, --help                 Show this help
 EOF
 }
@@ -62,6 +66,10 @@ while [[ $# -gt 0 ]]; do
       dry_run=1
       shift
       ;;
+    --allow-removals)
+      allow_removals=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -89,8 +97,15 @@ if [[ ! -d "${CHART_DIR}" ]]; then
   exit 1
 fi
 
+# No default values file, on purpose. This chart's own env/ holds an EXAMPLE,
+# never the deployed configuration: production values are tracked outside this
+# repo (transformers-ci-playbooks, serge/env/prod.yaml) and are passed with -f.
+# A default here is how a deploy silently ships example config — see the drift
+# preflight below and deploy/scripts/values_drift.py.
 if [[ "${#values_files[@]}" -eq 0 ]]; then
-  values_files=("${CHART_DIR}/env/prod.yaml")
+  echo "no values file given: pass -f <file> (production values live in the" >&2
+  echo "transformers-ci-playbooks repo as serge/env/prod.yaml)" >&2
+  exit 2
 fi
 
 for vf in "${values_files[@]}"; do
@@ -199,6 +214,76 @@ if ! kubectl version --request-timeout=10s >/dev/null 2>&1; then
 fi
 
 kubectl get namespace "${namespace}" >/dev/null 2>&1 || kubectl create namespace "${namespace}"
+
+# Preflight: refuse a values file that DROPS configuration the live release has.
+#
+# On 2026-09-04 serge was upgraded from inside this repo with the chart's own
+# env/prod.yaml (then a stale copy of the real thing) instead of the tracked
+# production values. helm said "Upgrade complete", the pod stayed 1/1 Running,
+# and nothing else looked wrong -- but VERIFY_ON_GPU, VERIFY_REPRODUCE_FIRST,
+# both *_COMMENT_BREVITY keys and the whole backups block were simply absent.
+# For three nightlies serge opened fix PRs with no GPU verification (and no
+# "not verified" note, because that footer only exists when a run does), one of
+# which was merged; the SQLite backup CronJob was gone for four days.
+#
+# A values file that is *almost* right fails silently, so the check is on the
+# shape of the change, not on a list of keys someone has to remember to update:
+# an upgrade that removes settings has to say so with --allow-removals.
+check_values_drift() {
+  if ! helm status "${release}" -n "${namespace}" >/dev/null 2>&1; then
+    return 0  # first install — there is nothing to drop yet
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "warning: python3 not found — skipping the values drift check" >&2
+    return 0
+  fi
+
+  local live_json new_json dropped rc
+  live_json="$(mktemp)"
+  new_json="$(mktemp)"
+  # shellcheck disable=SC2064  # expand the paths now, not at trap time
+  trap "rm -f '${live_json}' '${new_json}'" RETURN
+
+  helm get values "${release}" -n "${namespace}" -o json > "${live_json}"
+  # `.config` of a client-side dry run is exactly the merged user-supplied
+  # values this deploy would send — helm does the -f layering, so the check
+  # needs no YAML parser of its own.
+  helm upgrade --install "${release}" "${CHART_DIR}" \
+    -n "${namespace}" \
+    "${helm_values_args[@]}" \
+    --dry-run=client -o json \
+    | python3 -c 'import json,sys; json.dump(json.load(sys.stdin).get("config") or {}, sys.stdout)' \
+    > "${new_json}"
+
+  set +e
+  dropped="$(python3 "${ROOT_DIR}/deploy/scripts/values_drift.py" "${live_json}" "${new_json}")"
+  rc=$?
+  set -e
+  if [[ "${rc}" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ "${rc}" -ne 3 ]]; then
+    echo "values drift check failed (exit ${rc}); refusing to deploy blind" >&2
+    exit 1
+  fi
+
+  echo >&2
+  echo "These settings are live on release '${release}' and are NOT in ${values_files[*]}:" >&2
+  echo "${dropped}" | sed 's/^/  - /' >&2
+  echo >&2
+  if [[ "${allow_removals}" -eq 1 ]]; then
+    echo "--allow-removals given; proceeding." >&2
+    return 0
+  fi
+  echo "Deploying would unset them. That is usually the wrong values file:" >&2
+  echo "serge's production values are tracked in transformers-ci-playbooks as" >&2
+  echo "serge/env/prod.yaml — deploy with -f ../env/prod.yaml from a checkout" >&2
+  echo "inside that work root. If the removal is intended, re-run with" >&2
+  echo "--allow-removals." >&2
+  exit 1
+}
+
+check_values_drift
 
 if [[ -n "${secret_file}" ]]; then
   if [[ ! -f "${secret_file}" ]]; then

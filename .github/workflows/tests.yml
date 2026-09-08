@@ -69,4 +69,4 @@ jobs:
         run: helm lint deploy/helm
 
       - name: Render production values
-        run: helm template serge deploy/helm -n serge -f deploy/helm/env/prod.yaml
+        run: helm template serge deploy/helm -n serge -f deploy/helm/env/example.yaml

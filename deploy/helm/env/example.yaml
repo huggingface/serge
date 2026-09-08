@@ -1,0 +1,75 @@
+# EXAMPLE values — NOT what runs anywhere.
+#
+# This repo holds the chart; it deliberately does NOT hold the values any
+# environment is deployed with. serge's production values are tracked in
+# huggingface/transformers-ci-playbooks as `serge/env/prod.yaml`, next to the
+# runbooks, and are passed explicitly:
+#
+#   deploy/scripts/deploy.sh --context <ctx> -n serge -f ../env/prod.yaml
+#
+# (run from a serge checkout inside that work root, so `../env` resolves to it).
+#
+# The file below exists so `helm template`/`helm lint` have something complete
+# to render in CI, and so the knobs a real values file must set are visible in
+# one place. Deploying it would unset most of what production runs — which is
+# why deploy.sh has no default -f and refuses an upgrade that drops live
+# settings (see deploy/scripts/values_drift.py).
+
+image:
+  tag: latest
+
+replicas: 1
+
+serviceAccount:
+  create: true
+
+existingSecret: serge-secrets
+
+persistence:
+  enabled: true
+  size: 5Gi
+  storageClass: ""
+
+ingress:
+  enabled: true
+  host: serge.example.com
+  path: /
+  className: "alb"
+  annotations:
+    alb.ingress.kubernetes.io/scheme: "internal"
+    alb.ingress.kubernetes.io/target-type: "ip"
+    alb.ingress.kubernetes.io/healthcheck-path: "/healthz"
+
+# Non-secret runtime config, mounted as a ConfigMap and consumed via envFrom.
+# A real deployment sets far more here (the GPU verify loop, the normalizer
+# command, the review/task LLM caps, the web allow-list); see the tracked
+# prod.yaml named above for the full, commented set.
+envVars:
+  PORT: "8080"
+  LOG_LEVEL: "INFO"
+  LLM_API_BASE: https://router.huggingface.co/v1
+  LLM_MODEL: moonshotai/Kimi-K2.6
+  TASK_API_ENABLED: "1"
+  TASK_EXECUTION: kubernetes
+  WEB_ALLOWED_ORG: example-org
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# Per-task runner pods behind an allowlisting egress proxy. Both images are
+# built from this repo by .github/workflows/docker.yml and must move together
+# with image.tag above.
+taskExecution:
+  kubernetes:
+    enabled: true
+    reviewPods: true
+    image: ghcr.io/huggingface/serge-task-runner:latest
+    timeout: 7200
+    memory: "6Gi"
+    egress:
+      image: ghcr.io/huggingface/serge-egress:latest

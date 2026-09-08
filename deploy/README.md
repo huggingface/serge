@@ -8,8 +8,12 @@ deploy it into its own cluster without changing application code.
 
 - `helm/` contains the Helm chart for the web app: Deployment, Service,
   ConfigMap, optional Ingress, optional ServiceAccount, and a PersistentVolumeClaim.
-- `helm/env/prod.yaml` contains the production values used for
-  `serge.huggingface.tech` on the open-source EKS cluster.
+- `helm/env/example.yaml` is an EXAMPLE values file — it is what CI renders,
+  and it is not deployed anywhere. **The production values are not in this
+  repo**: they are tracked in `huggingface/transformers-ci-playbooks` as
+  `serge/env/prod.yaml`, next to the runbooks, and passed with `-f`.
+  `deploy.sh` has no default values file, and refuses an upgrade whose values
+  drop settings the live release has (`scripts/values_drift.py`).
 - `helm/serge-secrets.example.yaml` is a template for the sensitive runtime env.
   Copy it to `helm/serge-secrets.yaml`, fill it locally, and never commit it.
 - `scripts/deploy.sh` checks the current Kubernetes context, creates the namespace
@@ -41,8 +45,11 @@ deploy/scripts/deploy.sh -n serge --secret-file deploy/helm/serge-secrets.yaml
 Deploy without applying a Secret file, assuming `serge-secrets` already exists:
 
 ```bash
-deploy/scripts/deploy.sh -n serge -f deploy/helm/env/prod.yaml
+deploy/scripts/deploy.sh -n serge -f ../env/prod.yaml
 ```
+
+(`../env/prod.yaml` is the tracked production values file — run the script from
+a serge checkout inside the playbooks work root, where `../env` resolves to it.)
 
 Use `--context` when you want the script to refuse any other kube context:
 
@@ -50,7 +57,7 @@ Use `--context` when you want the script to refuse any other kube context:
 deploy/scripts/deploy.sh \
   --context infra:opensource-aws-use1-prod-54 \
   -n serge \
-  -f deploy/helm/env/prod.yaml
+  -f ../env/prod.yaml
 ```
 
 Fetch recent logs:

@@ -19,10 +19,10 @@ $(VENV)/.installed: pyproject.toml
 	touch $(VENV)/.installed
 
 format: $(VENV)/.installed
-	$(RUFF) format reviewbot tests
+	$(RUFF) format reviewbot tests deploy/scripts
 
 style: format
-	$(RUFF) check --fix reviewbot tests
+	$(RUFF) check --fix reviewbot tests deploy/scripts
 
 test: $(VENV)/.installed
 	$(VENV_PYTHON) -m pytest tests/

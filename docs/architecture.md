@@ -242,7 +242,9 @@ one per request, as `batch/v1` Jobs.
   the repo's build/lint stack), and horizontal isolation per request.
 
 See [Deploying serge](https://github.com/huggingface/serge/tree/main/deploy) and
-the production values in `deploy/helm/env/prod.yaml`.
+the production values tracked outside this repo, in
+`transformers-ci-playbooks` as `serge/env/prod.yaml` (this repo carries only
+`deploy/helm/env/example.yaml`).
 
 #### Regenerating the diagram
 
