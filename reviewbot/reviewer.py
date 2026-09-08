@@ -1743,9 +1743,12 @@ def _load_prior_review_context(
             gh.get_pr_reviews(owner, repo, number),
             gh.get_pr_review_comments(owner, repo, number),
         )
-    except requests.HTTPError:
+    except requests.HTTPError as error:
         log.exception("failed to fetch prior review history")
-        raise
+        status_code = error.response.status_code if error.response is not None else None
+        if status_code in {401, 404}:
+            raise
+        return None
     except requests.RequestException:
         log.exception("failed to fetch prior review history")
         return None

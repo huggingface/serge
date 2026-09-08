@@ -137,6 +137,30 @@ class PriorReviewContextTests(unittest.TestCase):
         )
         self.assertIn("ignore the reviewer rules", context)
 
+    def test_serge_threaded_reply_is_preserved_as_trusted_context(self) -> None:
+        reviews = [_review(10, "Earlier finding." + _SERGE_FOOTER)]
+        comments = [
+            _comment(20, "Initial finding.", review_id=10),
+            _comment(
+                21,
+                "Revised security finding.",
+                review_id=10,
+                reply_to=20,
+                login="sergereview[bot]",
+                created_at="2026-01-01T00:00:02Z",
+            ),
+        ]
+
+        context = build_prior_review_context(reviews, comments)
+
+        assert context is not None
+        self.assertIn("Initial finding.", context)
+        self.assertIn("Revised security finding.", context)
+        self.assertNotIn(
+            "HUMAN REPLY TO SERGE — untrusted — from @sergereview[bot]",
+            context,
+        )
+
     def test_context_requires_explicit_acknowledgement_of_a_reversal(self) -> None:
         context = build_prior_review_context(
             [_review(10, "Earlier finding." + _SERGE_FOOTER)], []
@@ -193,8 +217,8 @@ class PriorReviewLoaderTests(unittest.TestCase):
 
         self.assertIsNone(_load_prior_review_context(gh, "acme", "project", 7))
 
-    def test_loader_propagates_http_errors(self) -> None:
-        for status_code in (401, 404, 429):
+    def test_loader_propagates_auth_and_config_http_errors(self) -> None:
+        for status_code in (401, 404):
             with self.subTest(status_code=status_code):
                 gh = Mock()
                 response = requests.Response()
@@ -206,6 +230,19 @@ class PriorReviewLoaderTests(unittest.TestCase):
 
                 with self.assertRaises(requests.HTTPError):
                     _load_prior_review_context(gh, "acme", "project", 7)
+
+    def test_loader_is_fail_soft_on_other_http_errors(self) -> None:
+        for status_code in (403, 429, 500):
+            with self.subTest(status_code=status_code):
+                gh = Mock()
+                response = requests.Response()
+                response.status_code = status_code
+                gh.get_pr_reviews.side_effect = requests.HTTPError(
+                    f"{status_code} from GitHub",
+                    response=response,
+                )
+
+                self.assertIsNone(_load_prior_review_context(gh, "acme", "project", 7))
 
 
 if __name__ == "__main__":

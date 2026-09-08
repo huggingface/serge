@@ -54,7 +54,6 @@ def build_prior_review_context(
         comment
         for comment in comments
         if comment.get("pull_request_review_id") in serge_review_logins
-        and not comment.get("in_reply_to_id")
         and _login(comment)
         == serge_review_logins[comment.get("pull_request_review_id")]
     ]
