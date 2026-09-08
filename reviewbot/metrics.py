@@ -40,6 +40,22 @@ _JOB_GAUGES: tuple[tuple[str, str, str], ...] = (
         "LLM_MAX_INPUT_TOKENS; a job running several rounds can exceed it.",
     ),
     (
+        "serge_job_peak_input_tokens",
+        "peak_prompt_tokens",
+        "Largest single request's prompt in the job. serge_job_input_tokens is "
+        "this figure summed over every turn, because the loop re-sends the "
+        "whole conversation each time; only this one says how close the model "
+        "came to its context limit.",
+    ),
+    (
+        "serge_job_cached_input_tokens",
+        "cached_tokens",
+        "Input tokens the provider served from its prefix cache. Absent, not "
+        "zero, when the provider reported no cache figure — so "
+        "serge_job_input_tokens is an upper bound on the bill wherever this "
+        "series has no sample.",
+    ),
+    (
         "serge_job_output_tokens",
         "completion_tokens",
         "Cumulative output tokens billed to the job.",
@@ -63,6 +79,20 @@ _JOB_GAUGES: tuple[tuple[str, str, str], ...] = (
         "counted per path as visits-1. Not the same as repeat_calls: a re-read "
         "of a different line range of the same file is a revisit but not an "
         "exact repeat, and that is the shape that dominates.",
+    ),
+    (
+        "serge_job_elided_tool_results",
+        "elided_tool_results",
+        "Tool results the browse-transcript window replaced with a stub in the "
+        "widest single request (TOOL_RESULT_WINDOW). 0 when the window is off, "
+        "which is the default.",
+    ),
+    (
+        "serge_job_elided_chars",
+        "elided_chars",
+        "Characters the browse-transcript window removed from the widest "
+        "single request. A max across turns, not a sum: elision is recomputed "
+        "from the full transcript every turn.",
     ),
     (
         "serge_job_validation_retries",

@@ -64,6 +64,25 @@ def _is_anthropic_base(api_base: str) -> bool:
     return "api.anthropic.com" in api_base.lower()
 
 
+def cached_tokens_from_usage(usage: dict[str, Any]) -> Optional[int]:
+    """Pull the prefix-cache hit count out of a ``usage`` block, or None.
+
+    Split out of :attr:`ChatResult.cached_tokens` so the per-call log line can
+    read it straight off the raw usage dict. See that property for why None and
+    zero must stay distinguishable, and for the three spellings.
+    """
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        value = details.get("cached_tokens")
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    for key in ("cache_read_input_tokens", "cached_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
 class LLMResponseError(requests.HTTPError):
     """Non-OK HTTP response from the chat-completions endpoint that
     exhausted retries (or wasn't retryable to begin with). Carries the
@@ -122,6 +141,26 @@ class ChatResult:
     def completion_tokens(self) -> Optional[int]:
         v = self.usage.get("completion_tokens")
         return v if isinstance(v, int) else None
+
+    @property
+    def cached_tokens(self) -> Optional[int]:
+        """How many of ``prompt_tokens`` the provider served from its prefix
+        cache, or None when it did not say.
+
+        None is NOT zero, and the difference is the whole point of reading
+        this: the agent loop is append-only, so every turn re-sends the entire
+        conversation and ``prompt_tokens`` summed over a session is an *upper
+        bound* on what was billed. Reporting an unknown as 0 would assert that
+        a run was entirely uncached on no evidence — so a provider that says
+        nothing exports no sample at all (see ``metrics._number``).
+
+        Three spellings for the same number, because serge talks to three
+        shapes of OpenAI-compatible endpoint: OpenAI and the HF Router nest it
+        under ``prompt_tokens_details``, Anthropic's OpenAI shim reports
+        ``cache_read_input_tokens`` next to ``prompt_tokens``, and some vLLM
+        builds put a flat ``cached_tokens`` at the top level.
+        """
+        return cached_tokens_from_usage(self.usage)
 
 
 # Rate-limit headers, in the spellings the OpenAI-compatible endpoints serge
@@ -747,10 +786,13 @@ class ChatCompletionClient:
                     )
             latency = time.monotonic() - started
             log.info(
-                "LLM call ok in %.1fs (prompt=%s, completion=%s, stream=%s, "
-                "tool_calls=%d, finish=%s)",
+                "LLM call ok in %.1fs (prompt=%s, cached=%s, completion=%s, "
+                "stream=%s, tool_calls=%d, finish=%s)",
                 latency,
                 usage.get("prompt_tokens"),
+                # None here means the provider reported no cache figure, not
+                # that nothing was cached; see ChatResult.cached_tokens.
+                cached_tokens_from_usage(usage),
                 usage.get("completion_tokens"),
                 self.stream,
                 len(tool_calls),

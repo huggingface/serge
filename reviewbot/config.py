@@ -89,6 +89,14 @@ class Config:
     # stop the agentic loop, ask the model for a final review with tools
     # off, and skip any remaining diff chunks. Set to 0 to disable.
     llm_max_input_tokens: int = 2_000_000
+    # How many of the newest browse-tool results to keep verbatim in the
+    # transcript sent each turn; older ones travel as a stub the model can
+    # re-run (:mod:`reviewbot.transcript`). 0 — the default — sends the whole
+    # transcript, which is what every run measured to date did. Non-zero is a
+    # spend lever, not a quality one: the cap above counts each turn's entire
+    # prompt, and on prod task d9d4b022 86% of a 2M-token session was the
+    # transcript being re-sent. Read that module before setting it.
+    tool_result_window: int = 0
     # How many *repeated* (byte-identical) tool calls to tolerate before
     # declaring the agent stuck and forcing a final answer. Each repeat is told
     # it is repeating; past this many the loop stops rather than spending the
@@ -222,6 +230,11 @@ class Config:
     # normal review values.
     task_llm_max_input_tokens: Optional[int] = None
     task_tool_max_iterations: Optional[int] = None
+    # Task-only transcript window. Tasks are where the cap actually binds --
+    # 16 of the 86 jobs in the 30 days to 2026-09-08 ended on
+    # `input_token_cap`, at 65 turns on average — so this can be rolled out to
+    # tasks without touching reviews.
+    task_tool_result_window: Optional[int] = None
     # Cap on serge-authored commits per fix branch (follow-up loop guard).
     task_max_followups: int = 5
 
@@ -536,6 +549,7 @@ class Config:
             # PRs complete without being forced to truncate.
             tool_max_iterations=_int_env("TOOL_MAX_ITERATIONS", 30),
             llm_max_input_tokens=_int_env("LLM_MAX_INPUT_TOKENS", 2_000_000),
+            tool_result_window=_int_env("TOOL_RESULT_WINDOW", 0),
             tool_repeat_limit=_int_env("TOOL_REPEAT_LIMIT", 6),
             tool_path_revisit_limit=_int_env("TOOL_PATH_REVISIT_LIMIT", 3),
             tool_path_trip_after=_int_env("TOOL_PATH_TRIP_AFTER", 40),
@@ -576,6 +590,7 @@ class Config:
                 _int_env("TASK_LLM_MAX_INPUT_TOKENS", 0) or None
             ),
             task_tool_max_iterations=(_int_env("TASK_TOOL_MAX_ITERATIONS", 0) or None),
+            task_tool_result_window=(_int_env("TASK_TOOL_RESULT_WINDOW", 0) or None),
             task_max_followups=_int_env("TASK_MAX_FOLLOWUPS", 5),
             task_execution=task_execution,
             review_execution=review_execution,

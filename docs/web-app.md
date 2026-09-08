@@ -110,6 +110,33 @@ retries, and two numbers about how the budget was spent browsing:
 | `serge_job_repeat_calls` | Tool calls that re-ran an *earlier call verbatim* — what `TOOL_REPEAT_LIMIT` counts. |
 | `serge_job_path_revisits` | Calls that re-opened a *path already opened*, counted per path as visits−1. A second `read_file` of the same file at a different line range is a revisit but not a verbatim repeat, and that is the shape that dominates in practice. |
 
+### Reading the token numbers
+
+`serge_job_input_tokens` is **not** the size of a context. The loop re-sends the
+whole conversation every turn, so it is each turn's prompt *summed over the
+session* — the API-billing sense of "input tokens", and the quantity
+`LLM_MAX_INPUT_TOKENS` caps. Two more series exist so it can be read correctly:
+
+| Metric | Meaning |
+| ------ | ------- |
+| `serge_job_peak_input_tokens` | The largest single request's prompt. The only one that says whether the model came near its context limit. |
+| `serge_job_cached_input_tokens` | Input tokens the provider served from its prefix cache. **Absent, not zero,** when the provider reported no cache figure — wherever it has no sample, `serge_job_input_tokens` is an upper bound on the bill, not the bill. |
+
+The gap between the two is wide in practice. On prod task `d9d4b022`
+(transformers#48534, 2026-09-07) the sum was 2,094,215 and the peak 56,400 — 37×
+— because 62 accumulated tool results were re-billed once per remaining turn,
+while the fixed prompt prefix was only ~5,100 tokens (14% of the session).
+Because the sum grows quadratically in turns, doubling the cap buys roughly
+1.5× the turns, not 2×.
+
+`TOOL_RESULT_WINDOW` (and `TASK_TOOL_RESULT_WINDOW`) trades that sum down by
+sending only the newest N tool results verbatim and replacing older ones with a
+stub the model can re-run; `serge_job_elided_tool_results` and
+`serge_job_elided_chars` report what the widest single request dropped. It
+defaults to **0 (off)**: the loop being append-only is the shape a provider
+prefix-cache wants, and rewriting history invalidates that cache, so check
+`serge_job_cached_input_tokens` before assuming a window saves money.
+
 Both have a nudge attached (`TOOL_REPEAT_LIMIT` / `TOOL_PATH_REVISIT_LIMIT`) and a separate cut-off budget (`TOOL_REPEAT_LIMIT` / `TOOL_PATH_TRIP_AFTER`), because they are different failures: one model is stuck on a single call, the other is browsing in circles.
 
 The label that matters most is `stop_reason` on `serge_job_info`:

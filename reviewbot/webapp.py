@@ -108,11 +108,13 @@ log = logging.getLogger("serge.web")
 cfg = Config.from_env(require_app=False, require_web=True)
 log.info(
     "Config: llm_stream=%s, llm_max_tokens=%d, tool_max_iterations=%s, "
-    "llm_max_input_tokens=%s, max_diff_chars=%d, mention_trigger=%r",
+    "llm_max_input_tokens=%s, tool_result_window=%s, max_diff_chars=%d, "
+    "mention_trigger=%r",
     cfg.llm_stream,
     cfg.llm_max_tokens,
     cfg.tool_max_iterations if cfg.tool_max_iterations > 0 else "unlimited",
     cfg.llm_max_input_tokens if cfg.llm_max_input_tokens > 0 else "unlimited",
+    cfg.tool_result_window if cfg.tool_result_window > 0 else "off",
     cfg.max_diff_chars,
     cfg.mention_trigger,
 )
@@ -503,6 +505,11 @@ def _resolve_task_worker_cfg(
         ),
         tool_max_iterations=cfg.task_tool_max_iterations or cfg.tool_max_iterations,
         tool_max_iterations_strict=cfg.task_tool_max_iterations is not None,
+        tool_result_window=(
+            cfg.task_tool_result_window
+            if cfg.task_tool_result_window is not None
+            else cfg.tool_result_window
+        ),
     )
     return worker_cfg, provider, llm_api_base, llm_model or None
 

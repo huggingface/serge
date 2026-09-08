@@ -41,6 +41,10 @@ def _row(job_id: str, **overrides) -> dict:
             "path_revisits": 14,
             "validation_retries": 1,
             "truncation_retries": 0,
+            "peak_prompt_tokens": 56_400,
+            "cached_tokens": 1_800_000,
+            "elided_tool_results": 0,
+            "elided_chars": 0,
             "rounds": 1,
         },
     }
@@ -89,6 +93,51 @@ class ExpositionShapeTests(unittest.TestCase):
         self.assertIn('serge_job_distinct_paths{job_id="a"} 12', body)
         self.assertIn('serge_job_rounds{job_id="a"} 1', body)
         self.assertIn('serge_job_llm_seconds{job_id="a"} 1234.5', body)
+
+    def test_the_peak_is_exported_next_to_the_cumulative_total(self) -> None:
+        """serge_job_input_tokens is the cumulative bill, not a context size —
+        the peak is the only series that says how wide a single request got."""
+        body = render_job_metrics([_row("a")])
+        self.assertIn('serge_job_input_tokens{job_id="a"} 2111885', body)
+        self.assertIn('serge_job_peak_input_tokens{job_id="a"} 56400', body)
+        self.assertIn('serge_job_cached_input_tokens{job_id="a"} 1800000', body)
+
+    def test_an_unknown_cache_figure_exports_no_sample(self) -> None:
+        """Absent is the honest encoding of "the provider told us nothing".
+        Exporting 0 would claim the run was entirely uncached, and a dashboard
+        would then report a bill that was never charged."""
+        row = _row("a")
+        row["session"] = {**row["session"], "cached_tokens": None}
+        body = render_job_metrics([row])
+        self.assertEqual(_samples(body, "serge_job_cached_input_tokens"), [])
+        self.assertNotIn("serge_job_cached_input_tokens", body)
+        # The rest of the job still exports.
+        self.assertIn('serge_job_input_tokens{job_id="a"} 2111885', body)
+
+    def test_a_session_from_an_older_build_exports_what_it_has(self) -> None:
+        """Session records are JSON written by an older build as easily as this
+        one; a missing key must skip its sample, not break the scrape."""
+        row = _row("a")
+        row["session"] = {
+            "turns": 12,
+            "prompt_tokens": 500,
+            "stop_reason": "answered",
+            "rounds": 1,
+        }
+        body = render_job_metrics([row])
+        self.assertIn('serge_job_input_tokens{job_id="a"} 500', body)
+        self.assertEqual(_samples(body, "serge_job_peak_input_tokens"), [])
+
+    def test_the_elision_counters_are_exported(self) -> None:
+        row = _row("a")
+        row["session"] = {
+            **row["session"],
+            "elided_tool_results": 34,
+            "elided_chars": 121_000,
+        }
+        body = render_job_metrics([row])
+        self.assertIn('serge_job_elided_tool_results{job_id="a"} 34', body)
+        self.assertIn('serge_job_elided_chars{job_id="a"} 121000', body)
 
     def test_finished_timestamp_orders_the_window(self) -> None:
         body = render_job_metrics([_row("a")])

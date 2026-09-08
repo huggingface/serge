@@ -66,6 +66,7 @@ RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
     "llm_max_input_tokens",
     "tool_max_iterations",
     "tool_max_iterations_strict",
+    "tool_result_window",
     "tool_repeat_limit",
     "task_scope_commit_to_patch",
     "task_commit_always_include",

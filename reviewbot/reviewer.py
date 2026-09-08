@@ -24,6 +24,7 @@ from .prompts import (
     build_user_prompt,
 )
 from .tool_repeat import ToolRepeatGuard
+from .transcript import elide_old_tool_results
 from .tools import (
     RepoHelperTool,
     ToolEnv,
@@ -470,6 +471,20 @@ class _AggregateMetrics:
     latency_seconds: float = 0.0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Largest single call's prompt in this loop, as opposed to `prompt_tokens`,
+    # which is that figure *summed over every turn*. Both are needed and they
+    # answer different questions: the sum is what the input-token cap governs
+    # and roughly what gets billed, while the peak is the only one that says
+    # whether the model was anywhere near its context limit. On prod task
+    # d9d4b022 the sum was 2,094,215 and the peak 56,400 — a 37x gap that made
+    # the cap look like a context problem when it is a spend problem.
+    peak_prompt_tokens: int = 0
+    # Prompt tokens the provider served from its prefix cache, summed over the
+    # turns that reported one. Stays None when no turn reported any, which is
+    # the honest reading of a provider that says nothing — see
+    # :attr:`llm_client.ChatResult.cached_tokens`. Without it, `prompt_tokens`
+    # is only an upper bound on the bill and there is no way to tell how loose.
+    cached_tokens: Optional[int] = None
     # Why the loop stopped. ``STOP_ANSWERED`` is the *only* value meaning the
     # model decided it was done; every other value is a guard cutting it off and
     # forcing an answer out of whatever budget was left. Worth recording per job:
@@ -485,6 +500,42 @@ class _AggregateMetrics:
     # the truncated-final-answer salvage respectively.
     validation_retries: int = 0
     truncation_retries: int = 0
+    # Widest single request's browse-transcript elision (see
+    # :mod:`reviewbot.transcript`): how many tool results were replaced by a
+    # stub, and how many characters that removed. A MAX across turns, not a
+    # sum — elision is recomputed from the full transcript on every turn, so
+    # adding the per-turn figures up would count the same saving once per
+    # remaining turn. Both are 0 when the window is off, which is the default.
+    elided_tool_results: int = 0
+    elided_chars: int = 0
+
+    def record_usage(self, chat: "ChatResult") -> None:
+        """Fold one LLM call's tokens and latency in, without spending a turn.
+
+        For calls that are not the agentic loop browsing the PR: the comment
+        brevity pass on either side. ``turns`` is read as loop iterations by the
+        serge-agent-sessions dashboard, so those calls must not inflate it.
+
+        Every site that folds usage in at all goes through here or
+        :meth:`record_call`. There are five of them, and `peak_prompt_tokens`
+        and `cached_tokens` were both added long after the first three — a
+        counter wired into five places by hand is one that will silently be
+        wrong at one of them.
+        """
+        self.latency_seconds += chat.latency_seconds or 0.0
+        if chat.prompt_tokens is not None:
+            self.prompt_tokens += chat.prompt_tokens
+            self.peak_prompt_tokens = max(self.peak_prompt_tokens, chat.prompt_tokens)
+        if chat.completion_tokens is not None:
+            self.completion_tokens += chat.completion_tokens
+        cached = chat.cached_tokens
+        if cached is not None:
+            self.cached_tokens = (self.cached_tokens or 0) + cached
+
+    def record_call(self, chat: "ChatResult") -> None:
+        """Fold in one LLM call that *was* a turn of the agentic loop."""
+        self.turns += 1
+        self.record_usage(chat)
 
 
 # Loop-exit reasons, recorded on _AggregateMetrics.stop_reason. Only ANSWERED
@@ -526,6 +577,9 @@ def no_llm_session_record(stop_reason: str = STOP_NO_LLM_TURNS) -> dict[str, Any
         "turns": 0,
         "tool_calls": 0,
         "prompt_tokens": 0,
+        "peak_prompt_tokens": 0,
+        # Not 0: no call was made, so no provider ever reported a cache figure.
+        "cached_tokens": None,
         "completion_tokens": 0,
         "seconds": 0.0,
         "stop_reason": stop_reason,
@@ -534,6 +588,8 @@ def no_llm_session_record(stop_reason: str = STOP_NO_LLM_TURNS) -> dict[str, Any
         "path_revisits": 0,
         "validation_retries": 0,
         "truncation_retries": 0,
+        "elided_tool_results": 0,
+        "elided_chars": 0,
         "rounds": 0,
     }
 
@@ -563,6 +619,10 @@ def session_record(m: "_AggregateMetrics") -> dict[str, Any]:
         "turns": m.turns,
         "tool_calls": m.tool_calls,
         "prompt_tokens": m.prompt_tokens,
+        "peak_prompt_tokens": m.peak_prompt_tokens,
+        # May be None — "the provider told us nothing", which must not be
+        # reported as "nothing was cached". metrics._number drops the sample.
+        "cached_tokens": m.cached_tokens,
         "completion_tokens": m.completion_tokens,
         "seconds": round(m.latency_seconds, 1),
         "stop_reason": m.stop_reason,
@@ -571,6 +631,8 @@ def session_record(m: "_AggregateMetrics") -> dict[str, Any]:
         "path_revisits": m.path_revisits,
         "validation_retries": m.validation_retries,
         "truncation_retries": m.truncation_retries,
+        "elided_tool_results": m.elided_tool_results,
+        "elided_chars": m.elided_chars,
         "rounds": 1,
     }
 
@@ -587,6 +649,30 @@ _SESSION_SUMS = (
     "validation_retries",
     "truncation_retries",
 )
+
+# Counters where folding two loops together means taking the larger, not adding:
+# each round is a fresh conversation, so the widest prompt the job ever sent is
+# the widest any one round sent — summing them would invent a context that never
+# existed. `distinct_paths` is here for the older reason that summing it
+# double-counts a file two chunks both opened.
+_SESSION_MAXES = (
+    "distinct_paths",
+    "peak_prompt_tokens",
+    "elided_tool_results",
+    "elided_chars",
+)
+
+
+def _merge_optional_sum(left: Any, right: Any) -> Optional[int]:
+    """Add two counters that may each be None, where None means "unknown".
+
+    None + None is None (still unknown); None + 5 is 5. Used for
+    ``cached_tokens``, where a provider that reports nothing must not be folded
+    in as a zero and make the job look entirely uncached.
+    """
+    if left is None and right is None:
+        return None
+    return int(left or 0) + int(right or 0)
 
 
 def _rounds(record: dict[str, Any]) -> int:
@@ -626,9 +712,15 @@ def merge_session_records(
         + float(part.get("seconds", 0.0) or 0.0),
         1,
     )
-    merged["distinct_paths"] = max(
-        int(merged.get("distinct_paths", 0) or 0),
-        int(part.get("distinct_paths", 0) or 0),
+    for key in _SESSION_MAXES:
+        merged[key] = max(
+            int(merged.get(key, 0) or 0),
+            int(part.get(key, 0) or 0),
+        )
+    # Kept out of _SESSION_SUMS because None must survive the fold: `int(x or 0)`
+    # would turn "neither round knew" into a confident zero.
+    merged["cached_tokens"] = _merge_optional_sum(
+        merged.get("cached_tokens"), part.get("cached_tokens")
     )
     merged["rounds"] = _rounds(merged) + _rounds(part)
     if part.get("stop_reason", STOP_ANSWERED) != STOP_ANSWERED:
@@ -650,6 +742,12 @@ def _merge_metrics(total: "_AggregateMetrics", part: "_AggregateMetrics") -> Non
     # summing them double-counts a file two chunks both opened. An upper bound is
     # the honest reading available without keeping every path around.
     total.distinct_paths = max(total.distinct_paths, part.distinct_paths)
+    # Peaks and elision figures are per-request, so the job-level value is the
+    # widest one any chunk saw, not the total (see _SESSION_MAXES).
+    total.peak_prompt_tokens = max(total.peak_prompt_tokens, part.peak_prompt_tokens)
+    total.elided_tool_results = max(total.elided_tool_results, part.elided_tool_results)
+    total.elided_chars = max(total.elided_chars, part.elided_chars)
+    total.cached_tokens = _merge_optional_sum(total.cached_tokens, part.cached_tokens)
     # A cut-off chunk means the session was cut off, whatever later chunks did.
     if part.stop_reason != STOP_ANSWERED:
         total.stop_reason = part.stop_reason
@@ -866,12 +964,7 @@ def _synthesize_merged_summary(
         log.warning("synthesis merge failed: %s", exc)
         return None, None
 
-    metrics.turns += 1
-    metrics.latency_seconds += chat.latency_seconds
-    if chat.prompt_tokens is not None:
-        metrics.prompt_tokens += chat.prompt_tokens
-    if chat.completion_tokens is not None:
-        metrics.completion_tokens += chat.completion_tokens
+    metrics.record_call(chat)
     _emit_metrics(emit, metrics)
 
     text = (chat.content or "").strip()
@@ -924,9 +1017,7 @@ def _condense_review(
         # Tokens and latency, but not a turn: this is not the agentic loop
         # browsing the PR, and `session`'s turn count is read as loop
         # iterations (see the serge-agent-sessions dashboard).
-        metrics.prompt_tokens += result.chat.prompt_tokens or 0
-        metrics.completion_tokens += result.chat.completion_tokens or 0
-        metrics.latency_seconds += result.chat.latency_seconds or 0.0
+        metrics.record_usage(result.chat)
     return shortened[0]
 
 
@@ -1202,6 +1293,15 @@ def _run_agentic_loop(
     input_tokens_cap: Optional[int] = (
         cfg.llm_max_input_tokens if cfg.llm_max_input_tokens > 0 else None
     )
+    # How many of the newest tool results to keep verbatim in the transcript;
+    # older ones are sent as a stub (:mod:`reviewbot.transcript`). 0 — the
+    # default — sends the whole transcript, which is the behaviour every
+    # measured run above had. Worth knowing before turning it on: the loop is
+    # append-only today, which is the shape a provider prefix-cache wants, and
+    # rewriting history invalidates that cache from the elision point on. If
+    # the provider is discounting cache reads, a window can cost *more* than it
+    # saves — read serge_job_cached_input_tokens first.
+    tool_result_window: int = getattr(cfg, "tool_result_window", 0) or 0
     # Absolute backstop: at least twice the configured blind-turn cap,
     # but never below 60. Prevents a runaway model from chaining tool
     # calls indefinitely while still leaving real investigations room
@@ -1217,6 +1317,9 @@ def _run_agentic_loop(
     )
     iteration = 0
     blind_tool_turns = 0
+    # The window is reported to the journal once, not once a turn: it elides on
+    # every one of 50+ turns and a line each would bury the run log.
+    elision_announced = False
     validation_retries = 0
     truncation_retries = 0
     # The defect the last re-ask was issued for. A re-ask that produces the same
@@ -1307,8 +1410,37 @@ def _run_agentic_loop(
             emit("log", f"LLM turn (blind={label})")
         turn_tools = None if force_json_only else tools_arg
         turn_effort = "low" if force_json_only else cfg.llm_reasoning_effort
-        chat = llm.complete(
+        # Window the transcript for browse turns only. `force_json_only` is the
+        # salvage turn that has to *produce* the patch out of what it read, so
+        # it gets the full transcript however big it is — one wide request is
+        # cheap next to the sum, and starving the answer is the one failure this
+        # must not cause. Same reasoning keeps the forced final answer below
+        # unwindowed.
+        request_messages, elided, elided_chars = elide_old_tool_results(
             messages,
+            keep_recent=0 if force_json_only else tool_result_window,
+        )
+        if elided:
+            metrics.elided_tool_results = max(metrics.elided_tool_results, elided)
+            metrics.elided_chars = max(metrics.elided_chars, elided_chars)
+            log.info(
+                "Elided %d older tool result(s) (%d chars) from the request; "
+                "keeping the newest %d verbatim",
+                elided,
+                elided_chars,
+                tool_result_window,
+            )
+            if not elision_announced and emit is not None:
+                emit(
+                    "log",
+                    f"Browse transcript windowed to the newest "
+                    f"{tool_result_window} tool results; {elided} older "
+                    f"result(s) ({elided_chars:,} chars) are being sent as a "
+                    "stub the model can re-run",
+                )
+                elision_announced = True
+        chat = llm.complete(
+            request_messages,
             max_tokens=cfg.llm_max_tokens,
             tools=turn_tools,
             tool_choice="auto" if turn_tools else None,
@@ -1316,12 +1448,7 @@ def _run_agentic_loop(
             extra={"reasoning_effort": turn_effort} if turn_effort else None,
         )
         force_json_only = False
-        metrics.turns += 1
-        metrics.latency_seconds += chat.latency_seconds
-        if chat.prompt_tokens is not None:
-            metrics.prompt_tokens += chat.prompt_tokens
-        if chat.completion_tokens is not None:
-            metrics.completion_tokens += chat.completion_tokens
+        metrics.record_call(chat)
         _emit_metrics(emit, metrics)
         # Log what the model emitted this turn (content + finish_reason +
         # tool-call names). Captures the empty final turn behind
@@ -1494,12 +1621,7 @@ def _run_agentic_loop(
             chunk_callback=chunk_cb,
             extra=final_extra,
         )
-        metrics.turns += 1
-        metrics.latency_seconds += chat.latency_seconds
-        if chat.prompt_tokens is not None:
-            metrics.prompt_tokens += chat.prompt_tokens
-        if chat.completion_tokens is not None:
-            metrics.completion_tokens += chat.completion_tokens
+        metrics.record_call(chat)
         _emit_metrics(emit, metrics)
         _emit_chat_message(
             emit,
@@ -1604,17 +1726,22 @@ def _emit_metrics(
         if metrics.latency_seconds > 0
         else 0.0
     )
-    payload = json.dumps(
-        {
-            "in": metrics.prompt_tokens,
-            "out": metrics.completion_tokens,
-            "rate": round(rate, 1),
-            "seconds": round(metrics.latency_seconds, 1),
-            "turns": metrics.turns,
-            "tools": metrics.tool_calls,
-        }
-    )
-    emit("metrics", payload)
+    payload: dict[str, Any] = {
+        "in": metrics.prompt_tokens,
+        "out": metrics.completion_tokens,
+        "rate": round(rate, 1),
+        "seconds": round(metrics.latency_seconds, 1),
+        "turns": metrics.turns,
+        "tools": metrics.tool_calls,
+    }
+    # Additive: review.js reads only `in`. `peak` is what makes the per-turn
+    # deltas in a job's journal readable without differencing `in` by hand, and
+    # `cached` is omitted rather than zeroed when the provider said nothing.
+    if metrics.peak_prompt_tokens:
+        payload["peak"] = metrics.peak_prompt_tokens
+    if metrics.cached_tokens is not None:
+        payload["cached"] = metrics.cached_tokens
+    emit("metrics", json.dumps(payload))
 
 
 # Per-message log cap. Assistant turns are small (the model's own output),
