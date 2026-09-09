@@ -26,7 +26,7 @@ from .prompts import (
     build_user_prompt,
 )
 from .review_history import build_prior_review_context
-from .tool_repeat import ToolRepeatGuard
+from .tool_repeat import ToolRepeatGuard, normalize_arguments
 from .transcript import elide_old_tool_results
 from .tools import (
     RepoHelperTool,
@@ -503,6 +503,13 @@ class _AggregateMetrics:
     # the truncated-final-answer salvage respectively.
     validation_retries: int = 0
     truncation_retries: int = 0
+    # Tool turns that spent the iteration budget: no reasoning, no content, and
+    # nothing asked for that the session had not already asked for. Recorded
+    # because the definition changed on 2026-09-09 and the old one was inert on
+    # the production model (30 of 30 turns counted as blind on review
+    # b489863b) — without this counter, "did that change anything?" can only be
+    # answered by hand-replaying a job journal before it is evicted.
+    blind_tool_turns: int = 0
     # Widest single request's browse-transcript elision (see
     # :mod:`reviewbot.transcript`): how many tool results were replaced by a
     # stub, and how many characters that removed. A MAX across turns, not a
@@ -591,6 +598,7 @@ def no_llm_session_record(stop_reason: str = STOP_NO_LLM_TURNS) -> dict[str, Any
         "path_revisits": 0,
         "validation_retries": 0,
         "truncation_retries": 0,
+        "blind_tool_turns": 0,
         "elided_tool_results": 0,
         "elided_chars": 0,
         "rounds": 0,
@@ -634,6 +642,7 @@ def session_record(m: "_AggregateMetrics") -> dict[str, Any]:
         "path_revisits": m.path_revisits,
         "validation_retries": m.validation_retries,
         "truncation_retries": m.truncation_retries,
+        "blind_tool_turns": m.blind_tool_turns,
         "elided_tool_results": m.elided_tool_results,
         "elided_chars": m.elided_chars,
         "rounds": 1,
@@ -651,6 +660,7 @@ _SESSION_SUMS = (
     "path_revisits",
     "validation_retries",
     "truncation_retries",
+    "blind_tool_turns",
 )
 
 # Counters where folding two loops together means taking the larger, not adding:
@@ -741,6 +751,7 @@ def _merge_metrics(total: "_AggregateMetrics", part: "_AggregateMetrics") -> Non
     total.path_revisits += part.path_revisits
     total.validation_retries += part.validation_retries
     total.truncation_retries += part.truncation_retries
+    total.blind_tool_turns += part.blind_tool_turns
     # Each chunk browses with a fresh guard, so distinct paths are per-chunk and
     # summing them double-counts a file two chunks both opened. An upper bound is
     # the honest reading available without keeping every path around.
@@ -1280,12 +1291,18 @@ def _run_agentic_loop(
     # final answer just as well across every provider we target.
 
     # ``tool_max_iterations <= 0`` means "no cap". By default, the cap
-    # counts only *blind* tool turns: the model emitted tool calls
-    # without any reasoning OR content. Productive turns — where the
-    # model either thought (reasoning_chars > 0), said something
-    # (content), or returned a final answer (no tool calls) — don't
-    # burn the budget. /tasks can opt into a stricter mode where the cap
-    # counts total tool calls, preserving budget for the final patch JSON.
+    # counts only *blind* tool turns: the model fired tool calls without
+    # reasoning, without content, AND without asking for anything it had
+    # not already asked for. Productive turns — where the model thought
+    # (reasoning_chars > 0), said something (content), asked for a file,
+    # range or pattern new to the session, or returned a final answer (no
+    # tool calls) — don't burn the budget. /tasks can opt into a stricter
+    # mode where the cap counts total tool calls, preserving budget for
+    # the final patch JSON.
+    #
+    # The novelty clause is load-bearing, not a refinement: the older
+    # reasoning-only test is INERT on the model in production. See the
+    # blind-turn determination below for the measurements.
     iter_cap: Optional[int] = (
         cfg.tool_max_iterations if cfg.tool_max_iterations > 0 else None
     )
@@ -1320,6 +1337,10 @@ def _run_agentic_loop(
     )
     iteration = 0
     blind_tool_turns = 0
+    # Normalized signatures of every tool call the session has asked for, used
+    # to tell an investigating turn from a re-issuing one (see the blind-turn
+    # determination below).
+    seen_call_signatures: set[str] = set()
     # The window is reported to the journal once, not once a turn: it elides on
     # every one of 50+ turns and a line each would bury the run log.
     elision_announced = False
@@ -1338,6 +1359,7 @@ def _run_agentic_loop(
         metrics.path_revisits = repeat_guard.path_revisits
         metrics.validation_retries = validation_retries
         metrics.truncation_retries = truncation_retries
+        metrics.blind_tool_turns = blind_tool_turns
         return chat, metrics
 
     # Set for one turn to recover a truncated final answer: disable tools and
@@ -1507,15 +1529,56 @@ def _run_agentic_loop(
             force_json_only = validation_retry_messages is not None
             continue
 
-        # A "blind" tool turn is one where the model fired tool calls
-        # without reasoning or content — i.e. chaining tools without
-        # thinking between them. Those are the turns we want to limit;
-        # tool calls preceded by reasoning are healthy investigation.
+        # A "blind" tool turn is one where the model fired tool calls without
+        # reasoning, without content, and without asking for anything new —
+        # i.e. chaining tools without thinking between them.
+        #
+        # Why the reasoning test is not enough on its own: it is INERT for the
+        # model in production. Kimi does not interleave reasoning with tool
+        # calls; it thinks once, when it writes the answer. Measured on reviews
+        # b489863b (K2.6) and 936b0d05 (K2.7-Coder), 2026-09-08: 30 of 30 tool
+        # turns had reasoning_chars=0 and empty content, every one of them
+        # `finish_reason=tool_calls`, and ALL the reasoning arrived on the final
+        # turn (72,063 and 10,759 chars). Both reviews were investigating
+        # normally and both were cut off at TOOL_MAX_ITERATIONS, so the
+        # exemption never fired once and the cap silently degenerated into a
+        # flat 30-tool-turn limit. Five of the eight reviews that ran that day
+        # ended this way.
+        #
+        # Novelty is the model-agnostic reading of the same intent. The failure
+        # this cap exists for is a model re-issuing calls it has already made
+        # (tool_repeat.py carries the prod cases: one grep 21 times, another
+        # 44), and such a turn asks for nothing new by construction. A turn that
+        # opens a file, line range or pattern the session has not seen is
+        # investigating, whether or not the provider chooses to show us any
+        # thinking. Signatures are normalized the same way the repeat guard
+        # normalizes them, but tracked here rather than there on purpose: the
+        # guard stops counting when TOOL_REPEAT_LIMIT=0, and the meaning of the
+        # iteration cap must not depend on an unrelated setting.
+        #
+        # What novelty deliberately does NOT catch is the browsing-in-circles
+        # shape — re-reading one file at a different line range each time (prod
+        # task 9d210794: 137 of 153 calls), which is a fresh signature every
+        # time and so reads as productive here. That is fine: it has its own
+        # budget in ToolRepeatGuard (TOOL_PATH_REVISIT_LIMIT nudge,
+        # TOOL_PATH_TRIP_AFTER cut-off) and its own stop reason. Both of those
+        # guards are untouched by this — the only thing that changed is what
+        # spends the *iteration* cap, so nothing that used to be stopped stops
+        # being stopped.
         thought = bool(chat.reasoning_chars) or bool((chat.content or "").strip())
-        if not thought:
+        asked_for_something_new = False
+        for tool_call in chat.tool_calls:
+            signature = (
+                f"{tool_call.name}\x00{normalize_arguments(tool_call.arguments)}"
+            )
+            if signature not in seen_call_signatures:
+                seen_call_signatures.add(signature)
+                asked_for_something_new = True
+        if not thought and not asked_for_something_new:
             blind_tool_turns += 1
             log.info(
-                "Blind tool turn (no reasoning/content); blind_tool_turns=%d",
+                "Blind tool turn (no reasoning/content, nothing new asked for); "
+                "blind_tool_turns=%d",
                 blind_tool_turns,
             )
 

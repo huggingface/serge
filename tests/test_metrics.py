@@ -41,6 +41,7 @@ def _row(job_id: str, **overrides) -> dict:
             "path_revisits": 14,
             "validation_retries": 1,
             "truncation_retries": 0,
+            "blind_tool_turns": 46,
             "peak_prompt_tokens": 56_400,
             "cached_tokens": 1_800_000,
             "elided_tool_results": 0,
@@ -127,6 +128,14 @@ class ExpositionShapeTests(unittest.TestCase):
         body = render_job_metrics([row])
         self.assertIn('serge_job_input_tokens{job_id="a"} 500', body)
         self.assertEqual(_samples(body, "serge_job_peak_input_tokens"), [])
+
+    def test_blind_turns_are_exported_for_comparison_with_turns(self) -> None:
+        """A job where these equal serge_job_turns and stop_reason is
+        blind_turn_cap was cut off without the exemption firing once — the
+        shape 5 of 8 reviews had on 2026-09-08."""
+        body = render_job_metrics([_row("a")])
+        self.assertIn('serge_job_blind_tool_turns{job_id="a"} 46', body)
+        self.assertIn('serge_job_turns{job_id="a"} 46', body)
 
     def test_the_elision_counters_are_exported(self) -> None:
         row = _row("a")
