@@ -81,6 +81,15 @@ _JOB_GAUGES: tuple[tuple[str, str, str], ...] = (
         "exact repeat, and that is the shape that dominates.",
     ),
     (
+        "serge_job_blind_tool_turns",
+        "blind_tool_turns",
+        "Tool turns that spent the TOOL_MAX_ITERATIONS budget: no reasoning, "
+        "no content, and nothing asked for the session had not already asked "
+        "for. Compare with serge_job_turns — a job where these are equal and "
+        "stop_reason is blind_turn_cap was cut off without the exemption ever "
+        "firing.",
+    ),
+    (
         "serge_job_elided_tool_results",
         "elided_tool_results",
         "Tool results the browse-transcript window replaced with a stub in the "

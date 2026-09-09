@@ -1349,19 +1349,111 @@ class StopReasonTests(unittest.TestCase):
         )
         self.assertEqual(metrics.stop_reason, STOP_REPEAT_GUARD)
 
+    def _silent_grep(self, pattern: str, call_id: str = "t") -> ChatResult:
+        """A tool turn with no reasoning and no content — the shape every turn
+        of a real Kimi review has."""
+        return ChatResult(
+            content="",
+            usage={"prompt_tokens": 1_000, "completion_tokens": 10},
+            tool_calls=[
+                ToolCall(
+                    id=call_id,
+                    name="grep",
+                    arguments='{"pattern": "%s"}' % pattern,
+                )
+            ],
+        )
+
     def test_blind_turn_cap(self) -> None:
+        """Re-issuing one call with nothing to show for it burns the budget."""
         cfg = _CfgStub(tool_max_iterations=2, tool_repeat_limit=0)
-        turns = [
+        turns = [self._silent_grep("Foo", f"t{i}") for i in range(4)]
+        _, metrics = _run_agentic_loop(
+            _FakeLLM(turns + [self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.stop_reason, STOP_BLIND_TURN_CAP)
+
+    def test_distinct_searches_do_not_burn_the_budget(self) -> None:
+        """The regression this definition exists for.
+
+        Until 2026-09-09 the cap counted any turn without reasoning or content,
+        and Kimi emits neither on a tool turn — it thinks once, when it writes
+        the answer. So reviews investigating perfectly normally were cut off at
+        TOOL_MAX_ITERATIONS: 30 of 30 turns counted as blind on prod review
+        b489863b, and 5 of the 8 reviews on 2026-09-08 ended that way. Four
+        different searches is investigation, whatever the provider shows us.
+        """
+        cfg = _CfgStub(tool_max_iterations=2, tool_repeat_limit=0)
+        turns = [self._silent_grep(f"P{i}", f"t{i}") for i in range(4)]
+        _, metrics = _run_agentic_loop(
+            _FakeLLM(turns + [self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.stop_reason, STOP_ANSWERED)
+        self.assertEqual(metrics.blind_tool_turns, 0)
+
+    def test_a_turn_is_productive_if_any_one_call_is_new(self) -> None:
+        """Mixed turns are the common real shape — a repeat alongside a fresh
+        read still moved the investigation forward."""
+        cfg = _CfgStub(tool_max_iterations=1, tool_repeat_limit=0)
+        repeat_plus_new = [
             ChatResult(
                 content="",
                 usage={"prompt_tokens": 1_000, "completion_tokens": 10},
                 tool_calls=[
-                    ToolCall(
-                        id=f"t{i}", name="grep", arguments='{"pattern": "P%d"}' % i
-                    )
+                    ToolCall(id="a", name="grep", arguments='{"pattern": "Foo"}'),
+                    ToolCall(id="b", name="grep", arguments='{"pattern": "New%d"}' % i),
                 ],
             )
-            for i in range(4)
+            for i in range(3)
+        ]
+        _, metrics = _run_agentic_loop(
+            _FakeLLM(repeat_plus_new + [self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.stop_reason, STOP_ANSWERED)
+
+    def test_reasoning_still_exempts_a_repeated_call(self) -> None:
+        """The original exemption is kept, not replaced: a model that thinks
+        out loud is investigating even when it re-reads."""
+        cfg = _CfgStub(tool_max_iterations=2, tool_repeat_limit=0)
+        turns = []
+        for i in range(4):
+            turn = self._silent_grep("Foo", f"t{i}")
+            turn.reasoning_chars = 500
+            turns.append(turn)
+        _, metrics = _run_agentic_loop(
+            _FakeLLM(turns + [self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.blind_tool_turns, 0)
+
+    def test_argument_spelling_does_not_disguise_a_repeat(self) -> None:
+        """Signatures are normalized, so key order and whitespace cannot buy
+        extra turns."""
+        cfg = _CfgStub(tool_max_iterations=2, tool_repeat_limit=0)
+        spellings = (
+            '{"pattern": "Foo", "path": "src"}',
+            '{"path": "src", "pattern": "Foo"}',
+            '{"pattern":"Foo","path":"src"}',
+            '{ "path" : "src" , "pattern" : "Foo" }',
+        )
+        turns = [
+            ChatResult(
+                content="",
+                usage={"prompt_tokens": 1_000, "completion_tokens": 10},
+                tool_calls=[ToolCall(id=f"t{i}", name="grep", arguments=raw)],
+            )
+            for i, raw in enumerate(spellings)
         ]
         _, metrics = _run_agentic_loop(
             _FakeLLM(turns + [self._answer()]),  # type: ignore[arg-type]
