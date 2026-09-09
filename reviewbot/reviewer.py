@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
+import requests
+
 from . import __version__
 from .brevity import condense_review_bodies
 from .compression import MessageCompressor
@@ -23,6 +25,7 @@ from .prompts import (
     build_system_prompt,
     build_user_prompt,
 )
+from .review_history import build_prior_review_context
 from .tool_repeat import ToolRepeatGuard
 from .transcript import elide_old_tool_results
 from .tools import (
@@ -1859,6 +1862,25 @@ def _summarize_rejected_comments(
     return ", ".join(refs)
 
 
+def _load_prior_review_context(
+    gh: GitHubClient, owner: str, repo: str, number: int
+) -> Optional[str]:
+    try:
+        return build_prior_review_context(
+            gh.get_pr_reviews(owner, repo, number),
+            gh.get_pr_review_comments(owner, repo, number),
+        )
+    except requests.HTTPError as error:
+        log.exception("failed to fetch prior review history")
+        status_code = error.response.status_code if error.response is not None else None
+        if status_code in {401, 404}:
+            raise
+        return None
+    except requests.RequestException:
+        log.exception("failed to fetch prior review history")
+        return None
+
+
 def _load_review_rules(
     gh: GitHubClient, owner: str, repo: str, pr: dict, cfg: Config
 ) -> str:
@@ -1990,6 +2012,14 @@ def prepare_review(
     pr = gh.get_pr(req.owner, req.repo, req.number)
     files = gh.get_pr_files(req.owner, req.repo, req.number)
     _emit("log", f"Fetched PR with {len(files)} changed file(s)")
+    prior_review_context = _load_prior_review_context(
+        gh, req.owner, req.repo, req.number
+    )
+    if prior_review_context:
+        _emit(
+            "log",
+            f"Loaded {len(prior_review_context)} chars of prior Serge review history",
+        )
 
     _emit("step", "context")
     ctx_result = run_context_script(
@@ -2098,6 +2128,10 @@ def prepare_review(
             chunk_index=idx,
             chunk_total=len(diff_chunks),
         )
+        if prior_review_context:
+            runner_context = "\n\n".join(
+                part for part in (runner_context, prior_review_context) if part
+            )
         user_prompt = build_user_prompt(
             repo_full_name=f"{req.owner}/{req.repo}",
             number=req.number,
