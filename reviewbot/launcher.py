@@ -51,6 +51,8 @@ RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
     "task_normalize_timeout",
     "task_normalize_max_retries",
     "task_normalize_memory",
+    "task_preflight_command",
+    "task_preflight_timeout",
     "task_max_followups",
     "review_rules_path",
     "helper_tools_path",

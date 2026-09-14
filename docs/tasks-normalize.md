@@ -52,6 +52,34 @@ The loop never costs you the fix:
 - **Sandbox unavailable / timeout** (infrastructure, not the model's fault):
   the applied patch is accepted un-normalized rather than blaming the model.
 
+### Preflight: is the gate passable at all?
+
+The gate installs the worktree with `--no-deps` — mandatory, because the task
+pod's egress allowlist has no PyPI — so it **cannot repair its own
+environment**. When the target repo's `main` moves a dependency pin past what
+the runner image holds, every checker that imports the package dies on a
+failure that has nothing to do with the patch, and no patch can pass.
+
+`TASK_PREFLIGHT_COMMAND` runs on the pristine checkout *before* the agent loop
+starts. A non-zero exit raises the same broken-gate error the baseline check
+raises, except it costs seconds instead of a full agent loop per candidate.
+Give it the gate's own install plus the smallest thing that would break:
+
+```
+TASK_PREFLIGHT_COMMAND=bash -lc 'uv pip install -e . --system --no-deps --no-build-isolation && python -c "import transformers"'
+```
+
+Why it exists: transformers#48685 moved the `huggingface-hub` pin from
+`>=1.5.0` to `>=1.31.0` on 2026-09-12; the task-runner image had been built on
+2026-09-09. Every checker importing transformers died on `cannot import name
+'httpx' from 'huggingface_hub.utils'`, and the 09-12 and 09-13 nightlies lost 5
+failure groups for ~8.4M input tokens before anyone looked. The fix is still an
+operator's (rebuild the runner image), but the bill is now near zero and the
+error names the cause on the first group instead of the last.
+
+A probe that cannot *run* (sandbox unavailable) fails open — that says nothing
+about the gate, and the real gate is still ahead.
+
 ### No injection surface
 
 The normalize command is **operator/repo configuration, never request-supplied**.
@@ -135,6 +163,7 @@ var table. The minimum for transformers:
 TASK_NORMALIZE_COMMAND=bash -lc 'make style && make fix-repo'
 TASK_NORMALIZE_IMAGE=serge/transformers-quality:latest
 TASK_SANDBOX_BACKEND=docker
+TASK_PREFLIGHT_COMMAND=bash -lc 'uv pip install -e . --system --no-deps --no-build-isolation && python -c "import transformers"'
 ```
 
 The per-repo write opt-in (`task_write_enabled` on the repo's provider config)

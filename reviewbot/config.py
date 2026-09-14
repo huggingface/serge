@@ -299,6 +299,20 @@ class Config:
     task_normalize_image: Optional[str] = None
     task_normalize_timeout: int = 1800
     task_normalize_memory: Optional[str] = None
+    # Cheap "is the gate even passable" probe, run on the PRISTINE checkout
+    # before any LLM work (see ``tasks.check_task_preflight``). The normalize
+    # gate installs the worktree with ``--no-deps`` because the task pod's
+    # egress allowlist has no PyPI, so it cannot repair a dependency pin that
+    # moved on the target repo's ``main`` past what the runner image holds:
+    # every checker that imports the package then dies and no patch can pass.
+    # Give this the same install plus the smallest thing that would break --
+    # for transformers, ``uv pip install -e . --system --no-deps`` then
+    # ``python -c "import transformers"`` -- and the whole class of image drift
+    # costs seconds instead of a full agent loop per candidate. Unset = no
+    # probe (serge stays repo-agnostic). Operator config, never
+    # request-supplied.
+    task_preflight_command: Optional[list[str]] = None
+    task_preflight_timeout: int = 300
     # How many times the LLM may be asked to correct its patch when the
     # normalizer rejects it (or the patch fails to apply). 0 disables the
     # feedback loop (validate once, accept whatever the model produced). The
@@ -622,6 +636,10 @@ class Config:
             ).strip()
             or None,
             task_normalize_max_retries=_int_env("TASK_NORMALIZE_MAX_RETRIES", 2),
+            task_preflight_command=(
+                shlex.split(os.environ.get("TASK_PREFLIGHT_COMMAND") or "") or None
+            ),
+            task_preflight_timeout=_int_env("TASK_PREFLIGHT_TIMEOUT", 300),
             task_normalize_guidance=(
                 os.environ.get("TASK_NORMALIZE_GUIDANCE") or ""
             ).strip()

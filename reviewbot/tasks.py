@@ -501,6 +501,82 @@ def _run_repo_normalizer(
         return None, ""
 
 
+def check_task_preflight(
+    cfg: Config,
+    *,
+    checkout: Checkout,
+    clone_cache: CloneCache,
+    emit: Callable[[str, str], None],
+) -> None:
+    """Prove the normalize gate is passable at all, before any LLM work.
+
+    Runs ``cfg.task_preflight_command`` (operator config, unset = skipped) on
+    the pristine checkout. A non-zero exit means the gate rejects the *unpatched*
+    base, so no patch this task could write would ever pass it, and the task
+    fails immediately with :class:`NormalizeGateBroken`.
+
+    :func:`_check_normalizer_baseline` already draws that distinction, but only
+    on the failure path — after a full agent loop has been paid for, once per
+    candidate, every night until an operator notices. Two nights in September
+    2026 are the whole argument for this function: transformers#48685 moved the
+    ``huggingface-hub`` pin from ``>=1.5.0`` to ``>=1.31.0`` on 2026-09-12, the
+    task-runner image had been built on 2026-09-09, and the gate's
+    ``--no-deps`` install (mandatory — the task pod's egress allowlist has no
+    PyPI) could not upgrade it. Every checker importing transformers died on
+    ``cannot import name 'httpx' from 'huggingface_hub.utils'``; 5 groups were
+    lost over the 09-12 and 09-13 nightlies for ~8.4M input tokens, and the
+    probe that would have caught it is an editable install plus one ``import``,
+    about ten seconds.
+
+    Leaves the worktree pristine. Fails **open** when the sandbox itself cannot
+    run the probe: that is infrastructure, and the real gate is still ahead.
+    """
+    command = cfg.task_preflight_command
+    if not command:
+        return
+    emit("step", "preflight")
+    emit(
+        "log",
+        f"Preflight — checking the normalize gate is passable: `{' '.join(command)}`…",
+    )
+    try:
+        returncode, output = run_normalize(
+            command,
+            workdir=checkout.path,
+            write_root=checkout.path,
+            backend=cfg.task_sandbox_backend,
+            image=cfg.task_normalize_image,
+            mode=cfg.helper_sandbox,
+            timeout=cfg.task_preflight_timeout,
+            memory=cfg.task_normalize_memory,
+        )
+    except NormalizeError as exc:
+        # The probe could not run. Not evidence of anything about the gate, and
+        # the gate itself still runs later, so do not fail the task over it.
+        log.warning("preflight unavailable: %s", exc)
+        emit("log", f"Preflight unavailable ({exc}); continuing.")
+        return
+    finally:
+        # The probe installs and may write (build artefacts, __pycache__), and
+        # everything downstream assumes an untouched base.
+        clone_cache.reset_worktree(checkout)
+
+    if returncode == 0:
+        emit("log", "Preflight passed.")
+        return
+
+    message = (
+        f"The task-runner environment fails the preflight check (`{' '.join(command)}`, "
+        f"exit {returncode}) on the unpatched checkout, so the normalize gate cannot be "
+        "passed by any patch and no LLM work was started. This needs an operator, not a "
+        "retry. Common cause: the task-runner image has drifted from the target repo's "
+        "`main` (a dependency pin moved, and the gate's editable install runs with "
+        f"`--no-deps`).\n\n{_bounded_normalize_feedback(output)}"
+    )
+    emit("normalize_error", f"Preflight fails on the pristine checkout:\n{output}")
+    raise NormalizeGateBroken(message)
+
+
 def _check_normalizer_baseline(
     cfg: Config,
     *,
