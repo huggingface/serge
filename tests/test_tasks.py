@@ -13,6 +13,7 @@ from reviewbot.clone_cache import Checkout, CloneCache
 from reviewbot.config import Config
 from reviewbot.github_client import SERGE_GIT_EMAIL
 from reviewbot.llm_client import ChatResult
+from reviewbot.normalize import NormalizeError
 from reviewbot.tasks import (
     MAX_REVIEWERS,
     NormalizeGateBroken,
@@ -24,6 +25,7 @@ from reviewbot.tasks import (
     _task_validation_retry_messages,
     _validate_patch,
     build_task_request,
+    check_task_preflight,
     prompt_prefix_summary,
     publish_task,
     resolve_existing_pr,
@@ -1428,6 +1430,126 @@ class ValidatePatchTests(unittest.TestCase):
         feedback, prepared = self._validate(cfg, self._content(""))
         self.assertIsNone(feedback)
         self.assertFalse(prepared)
+
+
+class TaskPreflightTests(unittest.TestCase):
+    """check_task_preflight — the cheap "can this gate be passed at all" probe
+    that runs before any LLM work. Same real-worktree fixture as
+    ValidatePatchTests, bwrap backend + sandbox off."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = self._tmp.name
+        self.src = os.path.join(root, "src")
+        os.makedirs(self.src)
+        _git(self.src, "init", "--quiet", "-b", "main")
+        with open(os.path.join(self.src, "hello.txt"), "w") as f:
+            f.write("hi from main\n")
+        _git(self.src, "add", "-A")
+        _git(self.src, "commit", "--quiet", "-m", "main commit")
+        self.cache = CloneCache(os.path.join(root, "cache"))
+        self.co = self.cache.acquire_ref(
+            token="",
+            owner="acme",
+            repo="widget",
+            ref="main",
+            job_id="abcd1234",
+            remote_url=self.src,
+        )
+
+    def _cfg(self, **overrides):
+        base = dict(helper_sandbox="off", task_sandbox_backend="bwrap")
+        base.update(overrides)
+        return _make_cfg(**base)
+
+    def _run(self, cfg, events=None):
+        return check_task_preflight(
+            cfg,
+            checkout=self.co,
+            clone_cache=self.cache,
+            emit=(lambda kind, text: events.append((kind, text)))
+            if events is not None
+            else (lambda *a: None),
+        )
+
+    def test_unset_command_runs_nothing(self):
+        # Serge stays repo-agnostic: no probe configured, no probe run.
+        self._run(self._cfg(task_preflight_command=None))
+
+    def test_broken_environment_raises_before_any_llm_work(self):
+        # The 2026-09-12 shape: the runner image drifted from the target repo's
+        # main, so the unpatched checkout cannot pass the gate. Must raise here,
+        # where it costs seconds, not after a full agent loop per candidate.
+        marker = os.path.join(self._tmp.name, "runs")
+        cfg = self._cfg(
+            task_preflight_command=[
+                "sh",
+                "-c",
+                f'echo x >> "{marker}"; echo "cannot import name httpx" >&2; exit 1',
+            ],
+            task_preflight_timeout=30,
+        )
+        events: list = []
+        with self.assertRaises(NormalizeGateBroken) as caught:
+            self._run(cfg, events)
+
+        message = str(caught.exception)
+        self.assertIn("cannot import name httpx", message)
+        self.assertIn("no LLM work was started", message)
+        self.assertIn("--no-deps", message)
+        # Not 422: that makes the runner move to the next candidate, but a
+        # broken environment breaks every one of them.
+        self.assertEqual(caught.exception.status_code, 500)
+        self.assertTrue(
+            any(
+                kind == "normalize_error" and "pristine checkout" in text
+                for kind, text in events
+            )
+        )
+        with open(marker) as f:
+            self.assertEqual(len(f.read().split()), 1)
+
+    def test_healthy_environment_passes_and_leaves_the_worktree_pristine(self):
+        # A probe legitimately writes (an editable install, build artefacts);
+        # everything downstream assumes an untouched base.
+        cfg = self._cfg(
+            task_preflight_command=[
+                "sh",
+                "-c",
+                "echo scribble > hello.txt; echo built > artefact.txt; exit 0",
+            ],
+            task_preflight_timeout=30,
+        )
+        self._run(cfg)
+        self.assertEqual(self.cache.collect_changes(self.co), [])
+        with open(os.path.join(self.co.path, "hello.txt")) as f:
+            self.assertEqual(f.read(), "hi from main\n")
+
+    def test_a_failing_probe_also_leaves_the_worktree_pristine(self):
+        cfg = self._cfg(
+            task_preflight_command=[
+                "sh",
+                "-c",
+                "echo scribble > hello.txt; exit 2",
+            ],
+            task_preflight_timeout=30,
+        )
+        with self.assertRaises(NormalizeGateBroken):
+            self._run(cfg)
+        self.assertEqual(self.cache.collect_changes(self.co), [])
+
+    def test_unavailable_sandbox_fails_open(self):
+        # The probe could not run at all. That says nothing about the gate, and
+        # the real gate still runs later — so do not fail the task over it.
+        cfg = self._cfg(
+            task_preflight_command=["sh", "-c", "exit 0"], task_preflight_timeout=30
+        )
+        with patch(
+            "reviewbot.tasks.run_normalize",
+            side_effect=NormalizeError("normalize sandbox unavailable: no bwrap"),
+        ):
+            self._run(cfg)
 
 
 class PublishPreparedTests(unittest.TestCase):

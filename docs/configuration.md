@@ -129,6 +129,8 @@ before. See [normalize validation](tasks-normalize.md) for the full setup.
 | `TASK_NORMALIZE_TIMEOUT` | `1800` | Per-run timeout (seconds). |
 | `TASK_NORMALIZE_MEMORY` | unset | Optional docker `--memory` cap (e.g. `4g`). |
 | `TASK_NORMALIZE_MAX_RETRIES` | `2` | How many times a normalizer rejection is fed back to the model for correction. `0` = validate once, no corrective re-prompts. |
+| `TASK_PREFLIGHT_COMMAND` | unset | Argv run on the **pristine** checkout before any LLM work, to prove the gate is passable at all (e.g. `bash -lc 'uv pip install -e . --system --no-deps && python -c "import transformers"'`). A non-zero exit fails the task immediately as a broken gate. Unset disables the probe. Operator/repo config — never request-supplied. |
+| `TASK_PREFLIGHT_TIMEOUT` | `300` | Per-run timeout (seconds) for the preflight probe. |
 | `TASK_NORMALIZE_GUIDANCE` | unset | Free-text policy injected into the task system prompt and the normalize-failure feedback (e.g. "prefer root-cause fixes over `# noqa`"). For anything the command itself can't express. |
 
 Task fixes also read the repo's own conventions file (`REVIEW_RULES_PATH`,

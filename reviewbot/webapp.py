@@ -92,6 +92,7 @@ from .tasks import (
     TaskResult,
     TaskRequest,
     build_task_request,
+    check_task_preflight,
     format_pr_files_diff,
     prepare_and_publish_candidate,
     resolve_existing_pr,
@@ -1246,6 +1247,17 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             )
         emit("log", f"Checkout ready in {time.monotonic() - t0:.1f}s")
         worker_cfg = dataclasses.replace(worker_cfg, repo_checkout_path=checkout.path)
+
+        # Before any LLM work: prove the normalize gate can be passed at all.
+        # Raises NormalizeGateBroken when the runner image has drifted from the
+        # target repo's `main` — a full task's bill for an unwinnable gate is
+        # what this costs otherwise (see tasks.check_task_preflight).
+        check_task_preflight(
+            worker_cfg,
+            checkout=checkout,
+            clone_cache=_clone_cache,
+            emit=emit,
+        )
 
         candidate_reqs = task_candidate_requests(req)
         last_no_change: Optional[TaskResult] = None
