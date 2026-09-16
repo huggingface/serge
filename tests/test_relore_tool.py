@@ -207,6 +207,7 @@ def test_inflight_argv(env):
         ("history_thread", {"number": 1}),
         ("history_why", {"path": "a.py", "line": 1}),
         ("history_inflight", {"number": 1}),
+        ("history_copies", {"symbol": "X"}),
     ],
 )
 def test_every_verb_is_scoped_to_serges_repo(env, name, args):
@@ -368,8 +369,48 @@ def test_silent_success_is_named_rather_than_returned_as_nothing(monkeypatch, en
 def test_output_is_capped(monkeypatch, env):
     _fake_run(monkeypatch, _Proc(stdout="x" * 50_000))
     out = run_relore_tool(env, "history_search", {"query": "x"})
-    assert len(out) < 50_000
-    assert "truncated" in out
+    assert len(out) <= relore_tool.MAX_RELORE_OUTPUT_CHARS
+    assert "dropped from the MIDDLE" in out
+
+
+def test_truncation_keeps_both_ends(monkeypatch, env):
+    # The tail is where the answer lives: history_copies orders groups
+    # largest-first, so the copy that DIVERGED is the last thing printed, and
+    # relore closes every page with the envelope's END sentinel. Head-only
+    # truncation drops both.
+    page = (
+        "<<<RELORE-UNTRUSTED>>>\nHEAD-MARKER 180 definitions in 5 shapes\n"
+        + "\n".join(f"   src/models/m{i}/modeling_m{i}.py:{i}" for i in range(4000))
+        + "\n-- shape 5: 2 copies\n   TAIL-MARKER-the-one-that-diverged\n"
+        "<<<RELORE-UNTRUSTED-END>>>"
+    )
+    _fake_run(monkeypatch, _Proc(stdout=page))
+    out = run_relore_tool(env, "history_copies", {"symbol": "rotate_half"})
+    assert len(out) <= relore_tool.MAX_RELORE_OUTPUT_CHARS
+    assert "HEAD-MARKER" in out
+    assert "TAIL-MARKER-the-one-that-diverged" in out
+    assert out.rstrip().endswith("<<<RELORE-UNTRUSTED-END>>>")
+
+
+def test_copies_argv(env):
+    assert _argv(env, "history_copies", symbol="rotate_half") == [
+        "relore",
+        "--plain",
+        "copies",
+        "rotate_half",
+        "--repo",
+        "huggingface/serge",
+    ]
+
+
+def test_copies_exact_flag(env):
+    assert "--exact" in _argv(env, "history_copies", symbol="X", exact=True)
+    assert "--exact" not in _argv(env, "history_copies", symbol="X")
+
+
+def test_copies_requires_a_symbol(env):
+    with pytest.raises(relore_tool.ReloreToolError, match="symbol is required"):
+        _argv(env, "history_copies")
 
 
 def test_a_bad_argument_never_reaches_the_subprocess(monkeypatch, env):
