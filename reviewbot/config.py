@@ -51,6 +51,15 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+# The dataclass default and the ``from_env`` fallback are the SAME name on
+# purpose. They were two literals until 2026-09-16, when lowering the repeat cap
+# changed only the dataclass one — every production path builds its Config
+# through ``from_env``, so the change shipped, deployed and did nothing, and the
+# test asserted the field default so it passed. A constant makes the drift
+# unrepresentable.
+DEFAULT_TOOL_REPEAT_LIMIT = 3
+
+
 @dataclass
 class Config:
     # Only used in webhook mode (GitHub App). In Action mode the runner
@@ -109,7 +118,7 @@ class Config:
     # session either repeats twice and moves on, or runs straight to the cap.
     # So the three turns after the first nudge are pure waste, and lowering the
     # cap cannot affect a session that behaves, because those never reach 3.
-    tool_repeat_limit: int = 3
+    tool_repeat_limit: int = DEFAULT_TOOL_REPEAT_LIMIT
     # The same problem measured a second way. The counter above keys on the
     # exact arguments, so re-reading one file at a different line range each
     # time is invisible to it — and that is the shape that dominates (prod task
@@ -588,7 +597,7 @@ class Config:
             tool_max_iterations=_int_env("TOOL_MAX_ITERATIONS", 30),
             llm_max_input_tokens=_int_env("LLM_MAX_INPUT_TOKENS", 2_000_000),
             tool_result_window=_int_env("TOOL_RESULT_WINDOW", 0),
-            tool_repeat_limit=_int_env("TOOL_REPEAT_LIMIT", 6),
+            tool_repeat_limit=_int_env("TOOL_REPEAT_LIMIT", DEFAULT_TOOL_REPEAT_LIMIT),
             tool_path_revisit_limit=_int_env("TOOL_PATH_REVISIT_LIMIT", 3),
             tool_path_trip_after=_int_env("TOOL_PATH_TRIP_AFTER", 40),
             task_scope_commit_to_patch=_bool_env("TASK_SCOPE_COMMIT_TO_PATCH", True),
