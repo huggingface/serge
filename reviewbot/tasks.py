@@ -962,7 +962,7 @@ def prepare_task(
                 log.debug("chunk_callback raised; suppressing", exc_info=True)
 
     _emit("log", f"Preparing task for {req.repo_full_name} (base={req.base_ref})")
-    tool_env = _make_tool_env(cfg, helper_tools=[])
+    tool_env = _make_tool_env(cfg, helper_tools=[], repo_full_name=req.repo_full_name)
 
     llm = ChatCompletionClient(
         cfg.llm_api_base,
@@ -977,6 +977,7 @@ def prepare_task(
         conventions,
         cfg.task_normalize_guidance,
         tools_enabled=tool_env is not None,
+        history_tools=tool_env is not None and tool_env.relore is not None,
     )
     user_prompt = build_task_user_prompt(
         repo_full_name=req.repo_full_name,

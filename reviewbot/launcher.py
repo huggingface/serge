@@ -53,6 +53,12 @@ RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
     "task_normalize_memory",
     "task_preflight_command",
     "task_preflight_timeout",
+    # The history lens is resolved per-deployment, and the runner pod cannot
+    # recover it from its own environment — so it travels here, like the
+    # normalize + preflight settings above.
+    "relore_api",
+    "relore_repos",
+    "relore_timeout",
     "task_max_followups",
     "review_rules_path",
     "helper_tools_path",

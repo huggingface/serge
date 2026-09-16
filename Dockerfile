@@ -24,6 +24,26 @@ RUN python -m venv /opt/app/.venv \
     && /opt/app/.venv/bin/pip install --upgrade pip \
     && /opt/app/.venv/bin/pip install -e '.[web,kubernetes]'
 
+# The `relore` client, for the project-history tools (reviewbot/relore_tool.py).
+#
+# PINNED, and the pin is a contract, not a convenience. relore's client and
+# daemon must be the exact same version: a mismatch is refused with 426 rather
+# than answered, because an older client would otherwise get a complete-looking
+# reply missing whatever it does not know to ask for. So RELORE_REF must name
+# the commit the deployed daemon was built from, and bumping one without the
+# other is caught loudly at the first call instead of quietly in the answers.
+#
+# Installed at BUILD time on purpose: the task pod's egress allowlist has no
+# PyPI (and no github.com raw access for pip), so this cannot be a runtime
+# install. `relore` alone — NOT `relore[server]`, which drags in SQLAlchemy and
+# a web server serge has no use for.
+# The repo publishes no tags, and its own deployment pins `image.tag:
+# sha-<short>`, so this is the same commit spelled the way pip takes it.
+# Keep it equal to relore/env/prod.yaml's image.tag in the playbooks repo.
+ARG RELORE_REF=e0cbec92155e02b3a3bf495767e5a209b6f6e50c  # relore 0.3.17, the deployed daemon
+RUN /opt/app/.venv/bin/pip install --no-cache-dir \
+      "relore @ git+https://github.com/huggingface/relore@${RELORE_REF}"
+
 ENV PATH="/opt/app/.venv/bin:${PATH}"
 ENV PORT=8080
 

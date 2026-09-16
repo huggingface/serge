@@ -56,6 +56,26 @@ RUN pip install --no-cache-dir --upgrade \
 COPY . /opt/serge
 RUN pip install --no-cache-dir /opt/serge
 
+# The `relore` client, for the project-history tools (reviewbot/relore_tool.py).
+#
+# PINNED, and the pin is a contract, not a convenience. relore's client and
+# daemon must be the exact same version: a mismatch is refused with 426 rather
+# than answered, because an older client would otherwise get a complete-looking
+# reply missing whatever it does not know to ask for. So RELORE_REF must name
+# the commit the deployed daemon was built from, and bumping one without the
+# other is caught loudly at the first call instead of quietly in the answers.
+#
+# Installed at BUILD time on purpose: the task pod's egress allowlist has no
+# PyPI (and no github.com raw access for pip), so this cannot be a runtime
+# install. `relore` alone — NOT `relore[server]`, which drags in SQLAlchemy and
+# a web server serge has no use for.
+# The repo publishes no tags, and its own deployment pins `image.tag:
+# sha-<short>`, so this is the same commit spelled the way pip takes it.
+# Keep it equal to relore/env/prod.yaml's image.tag in the playbooks repo.
+ARG RELORE_REF=e0cbec92155e02b3a3bf495767e5a209b6f6e50c  # relore 0.3.17, the deployed daemon
+RUN pip install --no-cache-dir \
+      "relore @ git+https://github.com/huggingface/relore@${RELORE_REF}"
+
 # Defaults for the in-pod run. serge overrides / augments these via the pod env
 # and the mounted spec; the pod firewall enforces egress, so the normalizer runs
 # directly (TASK_SANDBOX_BACKEND=off) with no nested sandbox.

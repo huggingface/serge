@@ -28,6 +28,7 @@ from .prompts import (
 from .review_history import build_prior_review_context
 from .tool_repeat import ToolRepeatGuard, normalize_arguments
 from .transcript import elide_old_tool_results
+from .relore_tool import make_relore_env
 from .tools import (
     RepoHelperTool,
     ToolEnv,
@@ -768,8 +769,18 @@ def _merge_metrics(total: "_AggregateMetrics", part: "_AggregateMetrics") -> Non
 
 
 def _make_tool_env(
-    cfg: Config, helper_tools: list[RepoHelperTool] | None = None
+    cfg: Config,
+    helper_tools: list[RepoHelperTool] | None = None,
+    *,
+    repo_full_name: str | None = None,
 ) -> Optional[ToolEnv]:
+    """Build the browse-tool environment, plus the project-history lens when the
+    deployment has one for ``repo_full_name``.
+
+    ``repo_full_name`` is serge's own fact about what is being reviewed or
+    patched — it becomes ``--repo`` on every relore call and is never reachable
+    from the tool schema (see :mod:`reviewbot.relore_tool`).
+    """
     if not cfg.repo_checkout_path:
         if helper_tools:
             log.info(
@@ -782,6 +793,7 @@ def _make_tool_env(
             repo_root=cfg.repo_checkout_path,
             helper_tools={tool.name: tool for tool in helper_tools or []},
             sandbox_mode=cfg.helper_sandbox,
+            relore=make_relore_env(cfg, repo_full_name),
         )
     except Exception:
         log.exception("repo checkout path invalid; running without browse tools")
@@ -2141,7 +2153,9 @@ def prepare_review(
     review_rules = _load_review_rules(gh, req.owner, req.repo, pr, cfg)
     helper_tools = _load_helper_tools(gh, req.owner, req.repo, pr, cfg)
     _install_helper_tools_with_emit(helper_tools, _emit)
-    tool_env = _make_tool_env(cfg, helper_tools)
+    tool_env = _make_tool_env(
+        cfg, helper_tools, repo_full_name=f"{req.owner}/{req.repo}"
+    )
 
     llm = ChatCompletionClient(
         cfg.llm_api_base,
@@ -2152,7 +2166,9 @@ def prepare_review(
         compressor=MessageCompressor.from_env(),
     )
     system_prompt = build_system_prompt(
-        review_rules, tools_enabled=tool_env is not None
+        review_rules,
+        tools_enabled=tool_env is not None,
+        history_tools=tool_env is not None and tool_env.relore is not None,
     )
     total_metrics = _AggregateMetrics()
     all_valid: list[dict[str, Any]] = []
@@ -2601,7 +2617,9 @@ def run_followup(
     review_rules = _load_review_rules(gh, req.owner, req.repo, pr, cfg)
     helper_tools = _load_helper_tools(gh, req.owner, req.repo, pr, cfg)
     _install_helper_tools_with_emit(helper_tools, _emit)
-    tool_env = _make_tool_env(cfg, helper_tools)
+    tool_env = _make_tool_env(
+        cfg, helper_tools, repo_full_name=f"{req.owner}/{req.repo}"
+    )
 
     llm = ChatCompletionClient(
         cfg.llm_api_base,
@@ -2613,7 +2631,9 @@ def run_followup(
     )
 
     system_prompt = build_followup_system_prompt(
-        review_rules, tools_enabled=tool_env is not None
+        review_rules,
+        tools_enabled=tool_env is not None,
+        history_tools=tool_env is not None and tool_env.relore is not None,
     )
     user_prompt = build_followup_user_prompt(
         repo_full_name=f"{req.owner}/{req.repo}",

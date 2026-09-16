@@ -24,11 +24,17 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import requests
 
+from .relore_tool import (
+    RELORE_TOOL_NAMES,
+    RELORE_TOOL_SPECS,
+    ReloreEnv,
+    run_relore_tool,
+)
 from .sandbox import AUTO, SandboxUnavailable, wrap_command
 
 log = logging.getLogger(__name__)
@@ -555,6 +561,12 @@ def _run_helper_install(helper: RepoHelperTool) -> HelperInstallResult:
 
 def build_tool_specs(env: "ToolEnv") -> list[dict[str, Any]]:
     specs = list(TOOL_SPECS)
+    # The project-history tools, only when the operator pointed serge at a
+    # relore daemon AND this repository is indexed there. Offered as part of the
+    # same schema as the browse tools so the model reaches for history and code
+    # in one loop, rather than as a separate phase it has to be told to run.
+    if env.relore is not None:
+        specs.extend(RELORE_TOOL_SPECS)
     for helper in env.helper_tools.values():
         properties: dict[str, Any] = {}
         if helper.allow_args:
@@ -592,6 +604,10 @@ class ToolEnv:
     helper_tools: dict[str, RepoHelperTool] = field(default_factory=dict)
     # Isolation policy for helper subprocesses; see reviewbot/sandbox.py.
     sandbox_mode: str = AUTO
+    # The project-history lens, or None when it is off for this repo. Unlike the
+    # other tools this one is not rooted at the checkout — it asks a daemon about
+    # the repository's issue and review history. See reviewbot/relore_tool.py.
+    relore: Optional[ReloreEnv] = None
 
     def __post_init__(self) -> None:
         self.repo_root = os.path.realpath(self.repo_root)
@@ -612,6 +628,10 @@ def run_tool(env: ToolEnv, name: str, arguments: dict[str, Any]) -> str:
             return _grep(env, arguments)
         if name == "fetch_url":
             return _fetch_url(arguments)
+        if name in RELORE_TOOL_NAMES:
+            if env.relore is None:
+                return f"error: {name} is not available in this run"
+            return run_relore_tool(env.relore, name, arguments)
         helper = env.helper_tools.get(name)
         if helper is not None:
             return _run_repo_helper(env, helper, arguments)

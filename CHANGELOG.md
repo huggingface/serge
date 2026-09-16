@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Project-history tools, in both the review loop and the task (ITF) loop**
+  (`reviewbot/relore_tool.py`). serge can now ask `relore` — the index over this
+  org's issues, PR descriptions, reviews and inline review comments — what the
+  project already decided, via four read-only tools: `history_search`,
+  `history_thread`, `history_why` and `history_inflight`. They answer what a
+  checkout cannot. A review that is about to flag a convention can check whether
+  a maintainer already ruled it correct (`kind="rationale"` keeps the answer to
+  people with write access, because a confident wrong answer from a passer-by is
+  worse than none). A task can ask `history_inflight <issue>` *before* it
+  diagnoses anything: writing a patch for a fix that has been in review for hours
+  is the most expensive mistake the loop makes, and that is one call. Smoke-run
+  against production: `inflight 48630` returns the two pull requests already
+  claiming to close it.
+
+  serge shells out to the pinned `relore` client rather than calling `/api/v1`,
+  because three things live in the client and would drift silently if
+  re-implemented: the client/daemon version handshake (a mismatch is refused with
+  426 rather than answered with a complete-looking reply missing whatever the
+  client did not know to ask for), the server-side untrusted-content envelope —
+  relayed verbatim, never re-wrapped, since serge's own markers around the whole
+  page would put relore's `[authoritative]` labels inside a "do not trust the
+  text below" region — and the error vocabulary that tells a daemon that is down
+  apart from an empty index apart from a stale client.
+
+  Off unless configured: `RELORE_API` plus a `RELORE_REPOS` list, and the tools
+  enter the model's schema only for a PR or task on a repo in it. `--repo` is
+  always serge's own fact and is not reachable from the tool schema. The client
+  is installed at image build time (`RELORE_REF` in `Dockerfile` and
+  `docker/Dockerfile.task-runner`) — a task pod's egress allowlist has no PyPI —
+  and that pin must name the commit the deployed daemon was built from. Task pods
+  reach the daemon through `serge-egress`, so its host needs an `allowDomains`
+  entry. See `docs/configuration.md`.
+
 - **One extra LLM pass that shortens serge's own prose** (`reviewbot/brevity.py`).
   Prompt discipline had already been tried: the task prompt's `LENGTH` block
   tells the model to comment only where the reason for a line is not evident
