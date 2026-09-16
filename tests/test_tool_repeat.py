@@ -5,7 +5,11 @@ exhausted the 2M input-token cap in ~55 turns without ever reasoning about the
 fix, and produced a patch that failed GPU verification — three rounds running.
 """
 
+import os
 import unittest
+from unittest.mock import patch
+
+from reviewbot.config import DEFAULT_TOOL_REPEAT_LIMIT, Config
 
 from reviewbot.tool_repeat import (
     ToolRepeatGuard,
@@ -485,12 +489,27 @@ class ApplyTests(unittest.TestCase):
 
 
 class RepeatLimitDefaultTests(unittest.TestCase):
-    def test_the_default_limit_is_three(self):
-        # Lowered 6 -> 3 on 2026-09-16. Across the 25 prod sessions that
-        # recorded a stop reason, `repeats` is only ever 0, 1, 2 or 6 — never
-        # 3, 4 or 5. The nudge fires at 3 and no session has ever recovered
-        # after it, so the grace between nudge and cut-off was pure waste, and
-        # a session that behaves never reaches 3 to begin with.
-        from reviewbot.config import Config
+    """Lowered 6 -> 3 on 2026-09-16. Across the 25 prod sessions that recorded a
+    stop reason, `repeats` is only ever 0, 1, 2 or 6 — never 3, 4 or 5. The nudge
+    fires at 3 and no session has ever recovered after it, so the grace between
+    nudge and cut-off was pure waste, and a session that behaves never reaches 3.
 
-        self.assertEqual(Config.__dataclass_fields__["tool_repeat_limit"].default, 3)
+    Asserted through ``from_env``, not on the dataclass field. The first version
+    of this test checked the field default and passed while production — which
+    builds every Config through ``from_env`` — was still running the old value
+    from a second hardcoded literal."""
+
+    def test_the_default_reaches_a_config_built_from_the_environment(self):
+        with patch.dict(os.environ, {"LLM_API_KEY": "token"}, clear=True):
+            cfg = Config.from_env(require_app=False)
+        self.assertEqual(cfg.tool_repeat_limit, 3)
+        self.assertEqual(DEFAULT_TOOL_REPEAT_LIMIT, 3)
+
+    def test_the_environment_still_wins(self):
+        with patch.dict(
+            os.environ,
+            {"LLM_API_KEY": "token", "TOOL_REPEAT_LIMIT": "9"},
+            clear=True,
+        ):
+            cfg = Config.from_env(require_app=False)
+        self.assertEqual(cfg.tool_repeat_limit, 9)
