@@ -313,6 +313,22 @@ class Config:
     # request-supplied.
     task_preflight_command: Optional[list[str]] = None
     task_preflight_timeout: int = 300
+
+    # -- project history (relore) ------------------------------------------
+    # Base URL of the relore daemon that indexes this org's issue/PR history.
+    # Empty = the history tools are not offered at all. The client is installed
+    # in the images; see reviewbot/relore_tool.py for why we shell out to it
+    # rather than calling /api/v1 by hand.
+    relore_api: Optional[str] = None
+    # Which repositories that daemon actually indexes, OWNER/NAME, comma
+    # separated. The history tools appear in the schema only for a PR or task on
+    # one of these: relore indexes a handful of repos, and on an unindexed one
+    # every call would come back empty while the model spent turns finding that
+    # out. Config rather than discovery, so the tool schema is deterministic and
+    # a deploy decides it.
+    relore_repos: tuple[str, ...] = ()
+    # Per-call wall clock for the client subprocess.
+    relore_timeout: int = 45
     # How many times the LLM may be asked to correct its patch when the
     # normalizer rejects it (or the patch fails to apply). 0 disables the
     # feedback loop (validate once, accept whatever the model produced). The
@@ -640,6 +656,13 @@ class Config:
                 shlex.split(os.environ.get("TASK_PREFLIGHT_COMMAND") or "") or None
             ),
             task_preflight_timeout=_int_env("TASK_PREFLIGHT_TIMEOUT", 300),
+            relore_api=(os.environ.get("RELORE_API") or "").strip() or None,
+            relore_repos=tuple(
+                name.strip()
+                for name in (os.environ.get("RELORE_REPOS") or "").split(",")
+                if name.strip()
+            ),
+            relore_timeout=_int_env("RELORE_TIMEOUT", 45),
             task_normalize_guidance=(
                 os.environ.get("TASK_NORMALIZE_GUIDANCE") or ""
             ).strip()

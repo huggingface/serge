@@ -64,6 +64,50 @@ package is missing or a compression call fails, so a review never breaks on it.
 | `TOOL_PATH_REVISIT_LIMIT` | `tool_path_revisit_limit` | `3` | Visits to one file/directory before every further visit is told what it already has. Catches the re-read-at-a-different-line-range shape `TOOL_REPEAT_LIMIT` cannot see. `0` disables the nudge. |
 | `TOOL_PATH_TRIP_AFTER` | `tool_path_trip_after` | `40` | Total re-opens across all paths before the loop is cut off. Set well above a healthy session. `0` keeps the nudges but never cuts off. |
 
+### Project history (relore)
+
+`relore` indexes a repository's issue and pull-request history — issue bodies, PR
+descriptions, reviews and inline review comments — and serves it ranked,
+trust-tiered and aged. When it is configured, **both** the review loop and the
+task (ITF) loop gain four read-only tools: `history_search`, `history_thread`,
+`history_why` and `history_inflight`. They answer the questions a checkout
+cannot: *is this intentional*, *has anyone hit this*, *why is this line here*,
+and — before a task writes anything — *is somebody already fixing this*.
+
+serge shells out to the pinned `relore` client rather than calling its HTTP API,
+because the client carries three things worth not re-implementing: the
+client/daemon version handshake (a mismatch is refused, not answered), the
+server-side untrusted-content envelope around retrieved text, and the error
+vocabulary that tells a daemon that is down apart from an empty index. See
+`reviewbot/relore_tool.py`.
+
+| Env var | Default | Description |
+| ------- | ------- | ----------- |
+| `RELORE_API` | unset | Base URL of the relore daemon. Unset = the history tools are not offered at all. |
+| `RELORE_REPOS` | unset | Comma-separated `OWNER/NAME` list of the repositories that daemon indexes. The tools appear in the model's schema **only** for a PR or task on one of these — on an unindexed repo every call returns empty and the agent spends turns finding that out. Keep it in step with what relore actually polls. |
+| `RELORE_TIMEOUT` | `45` | Per-call wall clock (seconds) for the client subprocess. |
+
+Three things the deployment must get right:
+
+- **The client is installed at image build time**, pinned by the `RELORE_REF`
+  build arg in `Dockerfile` and `docker/Dockerfile.task-runner`. It must name the
+  commit the deployed daemon was built from: client and daemon must be the exact
+  same version or every call is refused with `426`. A task pod's egress allowlist
+  has no PyPI, so this can never be a runtime install.
+- **Task pods reach the daemon through the egress proxy.** Their NetworkPolicy
+  allows egress only to `serge-egress`, serge's callback and kube-dns, so the
+  daemon's host must be in `taskExecution.kubernetes.egress.allowDomains`.
+  Without it every history call from a task pod times out and the agent silently
+  loses the lens.
+- **`--repo` is serge's fact, not the model's.** It is set from the pull request
+  or task being worked on and is not reachable from the tool schema, so a review
+  of one repo can never quote decisions from another.
+
+Retrieved text arrives inside relore's `<<<RELORE-UNTRUSTED>>>` envelope with
+each quoted line prefixed `>`. serge relays it verbatim — it is data, never
+instructions, and the system prompt says so.
+
+
 ## GitHub App
 
 | Env var | Required for | Description |
