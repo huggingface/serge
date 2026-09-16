@@ -35,6 +35,8 @@ how often it has had to.
 
 from __future__ import annotations
 
+import hashlib
+
 import json
 
 
@@ -47,6 +49,24 @@ _NUDGE = (
     "tell you anything new, and each attempt consumes a large share of your "
     "remaining token budget. Either search for something different (a different "
     "pattern, a different path) or stop searching and give your final answer now."
+)
+
+# Returned INSTEAD of a repeated call's payload when the call returned exactly
+# the bytes it returned last time. The model already has them earlier in this
+# conversation, and a tool result is not paid for once: it is re-sent with every
+# later turn, so the sixth copy of an 8KB grep is billed for the rest of the
+# session. Collapsing it changes nothing the model can know and removes the
+# growth.
+#
+# Keyed on the RESULT, never on the call alone. An identical re-run does still
+# execute, because a re-read after the normalize gate applied a patch must see
+# the new content — so when the bytes differ, the new ones are served in full
+# and nothing is collapsed.
+_IDENTICAL_RESULT = (
+    "[serge] This {name} call is identical to one you already made in this "
+    "session AND returned exactly the same bytes, which are already above in "
+    "this conversation. They are not repeated here — scroll up rather than "
+    "asking again."
 )
 
 _TRIPPED_NOTE = (
@@ -194,6 +214,10 @@ class ToolRepeatGuard:
         self.path_visits: dict[str, int] = {}
         # Range labels already served per path, in order, for the nudge text.
         self.path_ranges: dict[str, list[str]] = {}
+        # signature -> digest of what that call last returned, so a repeat
+        # that genuinely changed is never collapsed. Digests, not bodies:
+        # the transcript already holds the bodies.
+        self.result_digests: dict[str, str] = {}
 
     @property
     def enabled(self) -> bool:
@@ -241,6 +265,38 @@ class ToolRepeatGuard:
         if self._repeats_tripped:
             note += _TRIPPED_NOTE.format(repeats=self.repeats)
         return note
+
+    def apply(self, name: str, arguments: str, result: str) -> str:
+        """The tool result the model should actually see.
+
+        Wraps :meth:`observe` — which still returns the note, unchanged, for
+        every existing caller — and adds the one thing a note cannot do: stop
+        paying for the payload. When a repeated call comes back byte-identical
+        to last time, the model is handed the note and a pointer instead of a
+        second copy.
+
+        The comparison is on the RESULT, not on the call. An identical re-run
+        still executes, because in the task loop a re-read after a patch was
+        applied must see the new content; when the bytes differ they are served
+        in full and only the note rides along.
+        """
+        signature = f"{name}\x00{normalize_arguments(arguments)}"
+        digest = hashlib.sha256(result.encode("utf-8", "replace")).hexdigest()
+        previous = self.result_digests.get(signature)
+        note = self.observe(name, arguments)
+        self.result_digests[signature] = digest
+        if note is None:
+            return result
+        if previous is not None and previous == digest:
+            pointer = _IDENTICAL_RESULT.format(name=name)
+            # Only when it actually saves. The note rides along either way, so
+            # this comes down to pointer-vs-payload: a `grep` that found five
+            # lines is smaller than the sentence telling the model to scroll up
+            # for it, and collapsing that would make the transcript BIGGER while
+            # sending it hunting for bytes it could simply have been given.
+            if len(pointer) < len(result):
+                return pointer + note
+        return result + note
 
     def _observe_path(self, name: str, arguments: str) -> str | None:
         """Record one path visit; return the nudge when it is a re-open past the

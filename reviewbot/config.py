@@ -101,7 +101,15 @@ class Config:
     # declaring the agent stuck and forcing a final answer. Each repeat is told
     # it is repeating; past this many the loop stops rather than spending the
     # rest of the input-token budget re-running the same search. 0 disables.
-    tool_repeat_limit: int = 6
+    #
+    # 6 -> 3 on 2026-09-16, because the grace between the nudge and the cut-off
+    # was never once used. Across the 25 sessions in the prod job store that
+    # recorded a stop reason, `repeats` is only ever 0, 1, 2 or 6 — never 3, 4
+    # or 5. The nudge fires at 3, and no session has ever recovered after it: a
+    # session either repeats twice and moves on, or runs straight to the cap.
+    # So the three turns after the first nudge are pure waste, and lowering the
+    # cap cannot affect a session that behaves, because those never reach 3.
+    tool_repeat_limit: int = 3
     # The same problem measured a second way. The counter above keys on the
     # exact arguments, so re-reading one file at a different line range each
     # time is invisible to it — and that is the shape that dominates (prod task
