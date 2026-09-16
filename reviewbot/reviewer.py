@@ -28,7 +28,7 @@ from .prompts import (
 from .review_history import build_prior_review_context
 from .tool_repeat import ToolRepeatGuard, normalize_arguments
 from .transcript import elide_old_tool_results
-from .relore_tool import make_relore_env
+from .relore_tool import competing_open_prs, competing_pr_note, make_relore_env
 from .tools import (
     RepoHelperTool,
     ToolEnv,
@@ -869,8 +869,11 @@ def _build_runner_context(
     skipped: list[str],
     chunk_index: int,
     chunk_total: int,
+    competing_note: str = "",
 ) -> Optional[str]:
     notes: list[str] = []
+    if competing_note:
+        notes.append(competing_note)
     if chunk_total > 1:
         notes.append(
             f"This PR diff was split into {chunk_total} chunks because the full diff exceeded "
@@ -2159,6 +2162,29 @@ def prepare_review(
         cfg, helper_tools, repo_full_name=f"{req.owner}/{req.repo}"
     )
 
+    # Does another open PR already claim to close the same issue? serge asks
+    # relore itself rather than leaving it to the model: measured over six runs
+    # the model reached for the history tools 0, 0, 1, 3, 0, 0 times, and a
+    # duplicate-effort check worth having on every review cannot depend on that.
+    # Fail-soft and non-gating — an empty answer just means no note.
+    competing_note = ""
+    if tool_env is not None and tool_env.relore is not None:
+        try:
+            competing = competing_open_prs(
+                tool_env.relore,
+                body=pr.get("body") or "",
+                exclude=req.number,
+            )
+            competing_note = competing_pr_note(competing)
+            if competing:
+                _emit(
+                    "log",
+                    "Another open PR claims the same issue: "
+                    + ", ".join(f"#{c.number}" for c in competing),
+                )
+        except Exception:
+            log.debug("competing-PR lookup failed; continuing", exc_info=True)
+
     llm = ChatCompletionClient(
         cfg.llm_api_base,
         cfg.llm_api_key,
@@ -2204,6 +2230,7 @@ def prepare_review(
             total_metrics.stop_reason = STOP_CHUNK_BUDGET
             break
         runner_context = _build_runner_context(
+            competing_note=competing_note,
             all_files=files,
             skipped=skipped,
             chunk_index=idx,
