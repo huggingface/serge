@@ -407,3 +407,90 @@ class PathVisitRangeTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class ApplyTests(unittest.TestCase):
+    """`apply` is `observe` plus the one thing a note cannot do: stop paying for
+    the payload. A tool result is re-sent with every later turn, so the sixth
+    copy of an 8KB grep is billed for the rest of the session."""
+
+    def setUp(self):
+        self.guard = ToolRepeatGuard(trip_after=6)
+
+    def test_a_first_call_is_served_whole_and_unannotated(self):
+        out = self.guard.apply("grep", GREP_A, "5 hits\nline one\nline two")
+        self.assertEqual(out, "5 hits\nline one\nline two")
+
+    def test_an_identical_repeat_returning_identical_bytes_is_collapsed(self):
+        body = "5 hits\n" + "x" * 4000
+        self.guard.apply("grep", GREP_A, body)
+        out = self.guard.apply("grep", GREP_A, body)
+        # The note is there, the second copy of the payload is not.
+        self.assertIn("already made this exact grep call", out)
+        self.assertIn("scroll up rather than asking again", out)
+        self.assertNotIn("x" * 4000, out)
+        self.assertLess(len(out), len(body))
+
+    def test_a_repeat_whose_RESULT_CHANGED_is_served_in_full(self):
+        # The case the call site has always warned about: in the task loop a
+        # re-read after the normalize gate applied a patch must see the new
+        # content. Collapsing on the call alone would hide the patched file.
+        self.guard.apply("read_file", '{"path": "a.py"}', "before the patch")
+        out = self.guard.apply("read_file", '{"path": "a.py"}', "AFTER the patch")
+        self.assertIn("AFTER the patch", out)
+        self.assertNotIn("scroll up", out)
+
+    def test_a_result_that_changes_then_repeats_collapses_on_the_new_bytes(self):
+        v1, v2 = "a" * 3000, "b" * 3000
+        self.guard.apply("read_file", '{"path": "a.py"}', v1)
+        self.guard.apply("read_file", '{"path": "a.py"}', v2)
+        out = self.guard.apply("read_file", '{"path": "a.py"}', v2)
+        self.assertNotIn(v2, out)
+        self.assertIn("scroll up", out)
+
+    def test_a_payload_smaller_than_the_pointer_is_served_rather_than_collapsed(self):
+        # A grep that found five lines is smaller than the sentence telling the
+        # model to scroll up for it. Collapsing would grow the transcript AND
+        # send it hunting for bytes it could just have been handed.
+        small = "5 hits in 1 file"
+        self.guard.apply("grep", GREP_A, small)
+        out = self.guard.apply("grep", GREP_A, small)
+        self.assertIn(small, out)
+        self.assertNotIn("scroll up", out)
+
+    def test_a_path_revisit_at_a_new_range_keeps_its_payload(self):
+        # Different arguments, so not a byte-identical repeat: the path nudge is
+        # actionable and the bytes are genuinely new.
+        guard = ToolRepeatGuard(trip_after=6, path_revisit_limit=1)
+        guard.apply("read_file", '{"path": "a.py", "start_line": 1}', "first slice")
+        out = guard.apply(
+            "read_file", '{"path": "a.py", "start_line": 90}', "second slice"
+        )
+        self.assertIn("second slice", out)
+        self.assertIn("already read", out)
+
+    def test_collapsing_does_not_change_the_counters(self):
+        body = "same"
+        for _ in range(3):
+            self.guard.apply("grep", GREP_A, body)
+        self.assertEqual(self.guard.repeats, 2)
+
+    def test_apply_still_trips_the_guard(self):
+        guard = ToolRepeatGuard(trip_after=2)
+        guard.apply("grep", GREP_A, "same")
+        self.assertFalse(guard.tripped)
+        guard.apply("grep", GREP_A, "same")
+        guard.apply("grep", GREP_A, "same")
+        self.assertTrue(guard.tripped)
+
+
+class RepeatLimitDefaultTests(unittest.TestCase):
+    def test_the_default_limit_is_three(self):
+        # Lowered 6 -> 3 on 2026-09-16. Across the 25 prod sessions that
+        # recorded a stop reason, `repeats` is only ever 0, 1, 2 or 6 — never
+        # 3, 4 or 5. The nudge fires at 3 and no session has ever recovered
+        # after it, so the grace between nudge and cut-off was pure waste, and
+        # a session that behaves never reaches 3 to begin with.
+        from reviewbot.config import Config
+
+        self.assertEqual(Config.__dataclass_fields__["tool_repeat_limit"].default, 3)

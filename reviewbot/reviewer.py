@@ -1622,10 +1622,12 @@ def _run_agentic_loop(
             result = _execute_tool_call(tool_env, tc)
             # An identical re-run still executes (a re-read after an edit must
             # see the new content) — but the model is told it is repeating, so
-            # it can break out before the repeat budget runs down.
-            repeat_note = repeat_guard.observe(tc.name, tc.arguments)
-            if repeat_note is not None:
-                result = f"{result}{repeat_note}"
+            # it can break out before the repeat budget runs down. When the
+            # re-run also returned the same bytes, `apply` serves a pointer to
+            # the copy already in this conversation instead of a second one.
+            corrected = repeat_guard.apply(tc.name, tc.arguments, result)
+            if corrected != result:
+                result = corrected
                 log.info(
                     "Corrected tool call %s (%s); %s | %s",
                     tc.name,

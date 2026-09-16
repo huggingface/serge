@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The repeat guard stops paying for repeats, and stops waiting three turns to
+  act.** Two changes from reading the prod job store.
+
+  `TOOL_REPEAT_LIMIT` 6 → 3. Across the 25 sessions that recorded a stop reason,
+  `repeats` is only ever 0, 1, 2 or **6** — never 3, 4 or 5. The nudge fires at 3
+  and not one session has ever recovered after it: a session either repeats twice
+  and moves on, or runs straight to the cap. So the grace between nudge and
+  cut-off was pure waste, and lowering the cap cannot affect a session that
+  behaves, because those never reach 3.
+
+  `ToolRepeatGuard.apply` now serves a repeat whose result was **byte-identical**
+  as a pointer to the copy already in the transcript instead of a second copy. A
+  tool result is not paid for once — it is re-sent with every later turn — so the
+  sixth copy of a 6KB read is billed for the rest of the session. Keyed on the
+  RESULT, never the call: an identical re-run still executes and is served in
+  full when the bytes differ, because in the task loop a re-read after the
+  normalize gate applied a patch must see the new content. And only when it
+  saves: a `grep` that found five lines is smaller than the sentence telling the
+  model to scroll up for it, and collapsing that would grow the transcript while
+  sending the model hunting for bytes it could have been handed. On the three
+  repeat shapes measured in today's sessions, 23,160 transcript bytes become
+  11,290.
+
+  Neither change stops the model looping — it ignores an explicit, escalating
+  nudge while receiving correct results — but they make the loop cheaper and
+  shorter. `repeat_guard` was already the most common stop reason before any of
+  this week's prompt work, so the looping is not new.
+
 - **`history_copies`, and a truncation fix that the tool exposed.** `relore copies`
   groups every definition of a symbol by what the body does, largest group first.
   On transformers that is the one question `grep` cannot answer: `rotate_half` has
