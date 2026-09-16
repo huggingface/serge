@@ -34,6 +34,12 @@ _HISTORY_TOOLS_HEADER = """
 reviews — not its code. Use them for "is this intentional", "has
 anyone hit this", "why is this line here".
 
+`history_copies <symbol>` is the exception: it reads code, from the
+DEFAULT BRANCH (not this branch — `grep`/`read_file` are for that). It
+groups every definition of a name by what the body does. Where code is
+duplicated on purpose, the question is which copy diverged, and that is
+a small group at the END of its output, not the big one at the top.
+
 Queries AND every term: pass two or three distinctive ones (an
 exception, a test id, a symbol), never a sentence. A traceback goes in
 `error`, not the query. The `error`/`test`/`file`/`symbol` filters AND

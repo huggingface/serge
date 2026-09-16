@@ -69,10 +69,15 @@ package is missing or a compression call fails, so a review never breaks on it.
 `relore` indexes a repository's issue and pull-request history — issue bodies, PR
 descriptions, reviews and inline review comments — and serves it ranked,
 trust-tiered and aged. When it is configured, **both** the review loop and the
-task (ITF) loop gain four read-only tools: `history_search`, `history_thread`,
-`history_why` and `history_inflight`. They answer the questions a checkout
+task (ITF) loop gain five read-only tools: `history_search`, `history_thread`,
+`history_why`, `history_inflight` and `history_copies`. They answer the questions a checkout
 cannot: *is this intentional*, *has anyone hit this*, *why is this line here*,
 and — before a task writes anything — *is somebody already fixing this*.
+`history_copies` is the odd one out: it reads code rather than history, from
+the repository's **default branch**, grouping every definition of a symbol by
+what the body does. It is for repositories that duplicate code on purpose —
+transformers' per-model `modeling_*.py` files — where the question is never
+where a function is but which copy diverged.
 
 serge shells out to the pinned `relore` client rather than calling its HTTP API,
 because the client carries three things worth not re-implementing: the

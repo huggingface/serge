@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`history_copies`, and a truncation fix that the tool exposed.** `relore copies`
+  groups every definition of a symbol by what the body does, largest group first.
+  On transformers that is the one question `grep` cannot answer: `rotate_half` has
+  180 definitions in 5 shapes, and what matters is the 2-copy shape at the bottom,
+  not the 158-copy one at the top. It reads the **default branch**, not the PR head
+  — said loudly in the description, since `grep`/`read_file` are the tools for the
+  code under review.
+
+  Its output is 11–13KB against an 8KB budget, which exposed a real defect in the
+  existing cap: truncation kept the head and dropped the tail. For `copies` that
+  discards the finding and keeps the boring bulk; for every relore result it also
+  cut off the closing `<<<RELORE-UNTRUSTED-END>>>`, leaving the envelope
+  unterminated so the model could not tell where quoted text stopped. Truncation
+  now drops the **middle** and names how much it dropped, so both ends survive. No
+  parsing of relore's format, so nothing drifts when that format changes.
+
 - **Project-history tools, in both the review loop and the task (ITF) loop**
   (`reviewbot/relore_tool.py`). serge can now ask `relore` — the index over this
   org's issues, PR descriptions, reviews and inline review comments — what the

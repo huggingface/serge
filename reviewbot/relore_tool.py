@@ -377,6 +377,45 @@ RELORE_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "history_copies",
+            "description": (
+                "READS THE REPOSITORY'S DEFAULT BRANCH, not this pull request's "
+                "head — use `grep` and `read_file` for the code under review. "
+                "Given a function or class name, lists every definition of it in "
+                "the repo, GROUPED by what the body does (type annotations, "
+                "docstrings and comments normalized away), largest group first. "
+                "Use it where code is duplicated on purpose — transformers' "
+                "per-model `modeling_*.py` files are the case it was built for. "
+                "There the question is never 'where is it' but 'which one "
+                "diverged', and the answer is a small group at the END of the "
+                "output, not the majority shape at the top. A copy that differs "
+                "from 180 identical siblings is either the bug or the fix that "
+                "everything else is missing."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "A bare function or class name.",
+                    },
+                    "exact": {
+                        "type": "boolean",
+                        "description": (
+                            "Group by the body's exact text instead, annotations "
+                            "and docstrings included. Use to tell a real "
+                            "divergence from a formatting one."
+                        ),
+                    },
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "history_inflight",
             "description": (
                 "Given an ISSUE number, list the open pull requests that "
@@ -540,6 +579,13 @@ def _build_argv(env: ReloreEnv, name: str, args: dict[str, Any]) -> list[str]:
         argv += ["why", f"{path}:{line}", "--repo", env.repo]
         return argv
 
+    if name == "history_copies":
+        argv += ["copies", _text(args.get("symbol"), "symbol", required=True)]
+        if _flag(args.get("exact")):
+            argv.append("--exact")
+        argv += ["--repo", env.repo]
+        return argv
+
     if name == "history_inflight":
         argv += [
             "inflight",
@@ -567,13 +613,35 @@ def _subprocess_env(env: ReloreEnv) -> dict[str, str]:
 
 
 def _truncate(text: str) -> str:
+    """Cap the result by dropping the MIDDLE, not the tail.
+
+    Two reasons, and both are the same mistake in different clothes — cutting
+    off the part that carries the answer:
+
+    * `history_copies` orders its groups largest-first, so on a repository that
+      duplicates code on purpose the interesting shape (the one that diverged)
+      is the last thing printed. `compute_default_rope_parameters` on
+      transformers is 12KB of which the first 114 lines are the majority shape;
+      head-truncation keeps the boring bulk and drops the finding.
+    * relore closes every page with ``<<<RELORE-UNTRUSTED-END>>>``. Cutting the
+      tail leaves the envelope unterminated, so the model cannot tell where
+      quoted text stops — the one thing the envelope exists to mark.
+
+    So keep both ends and say what went missing in between. No parsing of
+    relore's format, so nothing here drifts when that format changes.
+    """
     if len(text) <= MAX_RELORE_OUTPUT_CHARS:
         return text
-    return (
-        text[:MAX_RELORE_OUTPUT_CHARS]
-        + f"\n[... truncated at {MAX_RELORE_OUTPUT_CHARS} chars; narrow the query, "
-        "or use history_thread with outline=true to get the shape first ...]"
+    marker_budget = 200
+    head_chars = (MAX_RELORE_OUTPUT_CHARS - marker_budget) * 3 // 5
+    tail_chars = MAX_RELORE_OUTPUT_CHARS - marker_budget - head_chars
+    dropped = len(text) - head_chars - tail_chars
+    marker = (
+        f"\n\n[... {dropped} chars dropped from the MIDDLE to fit the {MAX_RELORE_OUTPUT_CHARS}-char "
+        "budget; the start and the end are both intact. Narrow the query, or use "
+        "history_thread with outline=true for the shape first ...]\n\n"
     )
+    return text[:head_chars] + marker + text[-tail_chars:]
 
 
 def run_relore_tool(env: ReloreEnv, name: str, arguments: dict[str, Any]) -> str:
