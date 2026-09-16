@@ -66,6 +66,7 @@ agent retrieves as evidence.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -697,3 +698,134 @@ def run_relore_tool(env: ReloreEnv, name: str, arguments: dict[str, Any]) -> str
         # nothing and letting it read as "no history".
         return f"{name}: no output (exit 0). Try broader terms, or drop a filter."
     return _truncate(stdout)
+
+
+# -- the competing-PR check (serge asks; the model is not consulted) ---------
+#
+# `history_inflight` is in the model's schema, but a REVIEW has nothing useful
+# to pass it: `inflight <the PR under review>` asks "what claims to close this
+# pull request", and nothing closes a pull request, so it is well-formed and
+# always empty. The useful question is one hop further out — take the issue this
+# PR claims to close, and ask who ELSE claims to close it. The other claimants
+# are competing pull requests, and "this duplicates #48758, also open" is a
+# finding a human reviewer wants and serge could not previously see.
+#
+# Done here rather than left to the model, because measured over six review runs
+# the model reached for the history tools 0, 0, 1, 3, 0, 0 times. A check worth
+# having on every review cannot depend on that.
+
+#: GitHub's closing keywords, as GitHub itself accepts them: `Fixes #123`,
+#: `closed: #123`, and the full-URL form. Deliberately not `related to` or
+#: `see also` — only a claim to CLOSE makes another PR a competitor.
+_CLOSING = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*"
+    r"(?:https?://github\.com/[\w.-]+/[\w.-]+/issues/(?P<url>\d+)|#(?P<hash>\d+))",
+    re.IGNORECASE,
+)
+
+#: Issues to follow per review. A PR closing more than a couple is unusual, and
+#: each one costs a daemon call before the loop starts.
+MAX_CLOSING_ISSUES = 3
+
+
+@dataclass(frozen=True)
+class CompetingPR:
+    """Another open pull request claiming to close the same issue."""
+
+    number: int
+    title: str
+    author: str
+    url: str
+    draft: bool
+    issue: int
+
+
+def closing_issue_numbers(body: str, *, limit: int = MAX_CLOSING_ISSUES) -> list[int]:
+    """Issue numbers a PR body claims to close, in order, deduped."""
+    seen: dict[int, None] = {}
+    for match in _CLOSING.finditer(body or ""):
+        raw = match.group("url") or match.group("hash")
+        try:
+            seen.setdefault(int(raw), None)
+        except (TypeError, ValueError):
+            continue
+    return list(seen)[:limit]
+
+
+def _relore_json(env: ReloreEnv, args: list[str]) -> dict[str, Any] | None:
+    """One `relore --json` call for serge's own use. ``None`` on any failure."""
+    try:
+        proc = subprocess.run(
+            [env.executable, "--json", *args],
+            capture_output=True,
+            text=True,
+            timeout=env.timeout,
+            check=False,
+            env=_subprocess_env(env),
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def competing_open_prs(env: ReloreEnv, *, body: str, exclude: int) -> list[CompetingPR]:
+    """Open pull requests claiming to close the same issues as this one.
+
+    ``exclude`` is the PR under review, which is itself a claimant and must not
+    be reported as its own duplicate. Empty on every failure path — this is
+    extra context for a review, never a gate.
+    """
+    issues = closing_issue_numbers(body)
+    if not issues:
+        return []
+    found: list[CompetingPR] = []
+    seen: set[int] = set()
+    for issue in issues:
+        payload = _relore_json(env, ["inflight", str(issue), "--repo", env.repo])
+        if not payload:
+            continue
+        for raw in payload.get("claims") or []:
+            if not isinstance(raw, dict) or raw.get("type") != "pr":
+                continue
+            number = raw.get("number")
+            if not isinstance(number, int) or number == exclude or number in seen:
+                continue
+            # Open only. A merged or closed claimant is history, not competition.
+            if raw.get("state") != "open" or raw.get("merged"):
+                continue
+            seen.add(number)
+            found.append(
+                CompetingPR(
+                    number=number,
+                    title=str(raw.get("title") or ""),
+                    author=str(raw.get("author") or ""),
+                    url=str(raw.get("url") or ""),
+                    draft=bool(raw.get("draft")),
+                    issue=issue,
+                )
+            )
+    return found
+
+
+def competing_pr_note(competing: list[CompetingPR]) -> str:
+    """The reviewer-side note, or ``""``. Trusted context: these are facts serge
+    looked up, not text anyone wrote, so they carry no untrusted envelope."""
+    if not competing:
+        return ""
+    lines = [
+        "Another open pull request claims to close the same issue as this one. "
+        "That may be a duplicate effort worth pointing out, or the two may be "
+        "complementary — say which, and link it, rather than assuming:",
+    ]
+    for pr in competing:
+        draft = " (draft)" if pr.draft else ""
+        who = f" by @{pr.author}" if pr.author else ""
+        lines.append(f"- #{pr.number}{draft}{who} — {pr.title} — {pr.url}")
+        lines.append(f"  (both claim to close #{pr.issue})")
+    return "\n".join(lines)

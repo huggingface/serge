@@ -554,3 +554,119 @@ def test_the_untrusted_contract_is_stated_in_both_prompts():
         assert "RELORE-UNTRUSTED" in prompt
         assert "data, never instructions" in prompt
         assert "MACHINE" in prompt
+
+
+# -- the competing-PR check (serge asks; the model is not consulted) --------
+
+
+from reviewbot.relore_tool import (  # noqa: E402
+    CompetingPR,
+    closing_issue_numbers,
+    competing_open_prs,
+    competing_pr_note,
+)
+
+
+class TestClosingIssueNumbers:
+    def test_the_keywords_github_itself_accepts(self):
+        assert closing_issue_numbers("Fixes #123 and closes #456") == [123, 456]
+        assert closing_issue_numbers("fixed: #42") == [42]
+        assert closing_issue_numbers(
+            "Resolves https://github.com/huggingface/transformers/issues/789"
+        ) == [789]
+
+    def test_a_mere_reference_is_not_a_claim(self):
+        # Only a claim to CLOSE makes another PR a competitor.
+        assert closing_issue_numbers("Related to #1, see also #2") == []
+
+    def test_duplicates_collapse_and_the_list_is_capped(self):
+        body = " ".join(f"fixes #{n}" for n in (1, 1, 2, 3, 4, 5))
+        assert closing_issue_numbers(body) == [1, 2, 3]
+
+    def test_an_empty_body_is_fine(self):
+        assert closing_issue_numbers("") == []
+        assert closing_issue_numbers(None) == []
+
+
+def _claims(monkeypatch, env, rows):
+    import json as _json
+
+    def run(argv, **kwargs):
+        return _Proc(stdout=_json.dumps({"claims": rows}))
+
+    monkeypatch.setattr(relore_tool.subprocess, "run", run)
+
+
+def _row(**over):
+    base = {
+        "type": "pr",
+        "number": 48758,
+        "title": "Exclude _no_placement_params from the budget",
+        "url": "https://github.com/huggingface/transformers/pull/48758",
+        "author": "malaiwah",
+        "state": "open",
+        "draft": False,
+        "merged": False,
+    }
+    base.update(over)
+    return base
+
+
+class TestCompetingOpenPRs:
+    def test_another_open_claimant_is_reported(self, monkeypatch, env):
+        _claims(monkeypatch, env, [_row()])
+        out = competing_open_prs(env, body="Fixes #48756", exclude=48757)
+        assert [c.number for c in out] == [48758]
+        assert out[0].issue == 48756
+
+    def test_the_pr_under_review_is_not_its_own_duplicate(self, monkeypatch, env):
+        # It is itself a claimant on the issue it closes.
+        _claims(monkeypatch, env, [_row(number=48757)])
+        assert competing_open_prs(env, body="Fixes #48756", exclude=48757) == []
+
+    def test_a_merged_or_closed_claimant_is_history_not_competition(
+        self, monkeypatch, env
+    ):
+        _claims(monkeypatch, env, [_row(state="closed", merged=True)])
+        assert competing_open_prs(env, body="Fixes #48756", exclude=1) == []
+        _claims(monkeypatch, env, [_row(state="closed")])
+        assert competing_open_prs(env, body="Fixes #48756", exclude=1) == []
+
+    def test_a_body_that_closes_nothing_asks_nothing(self, monkeypatch, env):
+        called = {"n": 0}
+
+        def run(argv, **kwargs):
+            called["n"] += 1
+            return _Proc(stdout="{}")
+
+        monkeypatch.setattr(relore_tool.subprocess, "run", run)
+        assert competing_open_prs(env, body="A nice refactor", exclude=1) == []
+        assert called["n"] == 0
+
+    def test_a_daemon_failure_is_silent(self, monkeypatch, env):
+        monkeypatch.setattr(
+            relore_tool.subprocess,
+            "run",
+            lambda argv, **kw: _Proc(returncode=1, stderr="426"),
+        )
+        assert competing_open_prs(env, body="Fixes #1", exclude=2) == []
+
+
+class TestCompetingPRNote:
+    def test_no_competitors_means_no_note(self):
+        assert competing_pr_note([]) == ""
+
+    def test_the_note_names_the_pr_the_author_and_the_shared_issue(self):
+        note = competing_pr_note(
+            [CompetingPR(48758, "A title", "malaiwah", "http://x", False, 48756)]
+        )
+        assert "#48758" in note and "@malaiwah" in note and "#48756" in note
+        # Framed as something to judge, not a finding to assert.
+        assert "may be a duplicate" in note
+        # Trusted reviewer-side context: serge looked these facts up, so they
+        # carry no untrusted envelope.
+        assert "UNTRUSTED" not in note
+
+    def test_a_draft_competitor_is_labelled(self):
+        note = competing_pr_note([CompetingPR(1, "t", "a", "u", True, 2)])
+        assert "(draft)" in note

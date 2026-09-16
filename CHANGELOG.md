@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A review now knows when another open PR claims the same issue.** Before the
+  loop starts, serge reads the `Fixes #N` / `Closes #N` claims out of the PR body
+  and asks relore who else claims to close those issues; any other OPEN pull
+  request becomes a trusted reviewer-side note. "This duplicates #48758, also
+  open" is a finding a human reviewer wants and serge could not previously see.
+
+  `history_inflight` is already in the model's schema, but a review has nothing
+  useful to pass it: `inflight <the PR under review>` asks what claims to *close*
+  that pull request, and nothing closes a pull request — well-formed and always
+  empty. The useful question is one hop out, on the issue.
+
+  serge asks, rather than leaving it to the model. Measured over six review runs
+  on two PRs, the model reached for the history tools 0, 0, 1, 3, 0, 0 times; a
+  check worth having on every review cannot depend on that. Fail-soft and
+  non-gating: a PR that closes nothing makes no call, and a daemon that is down
+  produces no note and changes nothing else.
+
 - **The repeat guard stops paying for repeats, and stops waiting three turns to
   act.** Two changes from reading the prod job store.
 
