@@ -285,8 +285,18 @@ class Config:
     # (e.g. http://host.docker.internal:8000, or http://localhost:8000 with
     # ``--network host``).
     task_callback_base_url: Optional[str] = None
-    # Wall-clock cap (seconds) on a single runner container/Job.
+    # Wall-clock cap (seconds) on a single runner container/Job. In kubernetes
+    # this is the Job's activeDeadlineSeconds, so it is a hard kill, not a
+    # request: see :mod:`reviewbot.budget`.
     task_runner_timeout: int = 3600
+    # How much of that budget is held back for the tail — the final no-tools
+    # answer, applying the patch, the repo normalizer, and the commit+push that
+    # first makes the work durable. The agent loop stops when less than this is
+    # left (``reviewer.STOP_DEADLINE``) instead of being killed mid-normalize
+    # with a finished patch in hand. 0 (the default) derives it as
+    # ``task_normalize_timeout + budget.WINDDOWN_SECONDS``, which is what the
+    # tail actually has to cover; set it explicitly only to buy extra slack.
+    task_tail_reserve: int = 0
     # docker backend egress firewall: the network the runner attaches to (an
     # ``internal`` net in prod, or "host" for local e2e) and the allowlisting
     # forward proxy egress is routed through (see launcher.DockerLaunchOptions).
@@ -650,6 +660,7 @@ class Config:
             .rstrip("/")
             or None,
             task_runner_timeout=_int_env("TASK_RUNNER_TIMEOUT", 3600),
+            task_tail_reserve=_int_env("TASK_TAIL_RESERVE", 0),
             task_runner_network=(os.environ.get("TASK_RUNNER_NETWORK") or "").strip()
             or None,
             task_runner_proxy=(os.environ.get("TASK_RUNNER_PROXY") or "").strip()

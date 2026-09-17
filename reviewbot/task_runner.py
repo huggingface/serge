@@ -37,7 +37,7 @@ from typing import Any, Optional
 
 import requests
 
-from . import sandbox
+from . import budget, sandbox
 from .clone_cache import Checkout, CloneCache
 from .config import Config
 from .errors import crash_detail, format_github_http_error, format_llm_error
@@ -52,6 +52,7 @@ from .tasks import (
     format_pr_files_diff,
     prepare_and_publish_candidate,
     resolve_existing_pr,
+    round_reserve,
     task_candidate_requests,
 )
 
@@ -263,6 +264,10 @@ def build_runner_config(spec: RunnerSpec) -> Config:
         cfg = dataclasses.replace(cfg, **overrides)
     llm = spec.llm
     clone_dir = (cfg.web_clone_cache_dir or "").strip() or _DEFAULT_CLONE_DIR
+    # Arm the pod's wall-clock budget. This is the only place it is armed, and
+    # both runners come through here — so the legacy in-process worker, whose
+    # process start is serge's own (days ago), stays unbounded as before.
+    budget.arm(cfg.task_runner_timeout)
     return dataclasses.replace(
         cfg,
         llm_api_base=(llm.get("api_base") or cfg.llm_api_base),
@@ -384,6 +389,16 @@ def run(spec: RunnerSpec) -> int:
         last_no_change: Optional[TaskResult] = None
         result: Optional[TaskResult] = None
         for index, candidate_req in enumerate(candidate_reqs, start=1):
+            # Each candidate is a fresh LLM cycle. Starting one the pod cannot
+            # finish burns the budget the *previous* candidate's result needs to
+            # be reported, so stop here and keep what we have.
+            if index > 1 and budget.exhausted(reserve=round_reserve(worker_cfg)):
+                emit(
+                    "log",
+                    f"Not enough runner budget left for candidate "
+                    f"{index}/{len(candidate_reqs)}; stopping with what we have.",
+                )
+                break
             if len(candidate_reqs) > 1:
                 emit(
                     "log",

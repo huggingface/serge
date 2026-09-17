@@ -22,11 +22,10 @@ import logging
 import os
 import re
 import subprocess
-import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from . import __version__, pr_links
+from . import __version__, budget, pr_links
 from .brevity import BrevityResult, condense_patch_comments
 from .clone_cache import Checkout, CloneCache, FileChange
 from .commit_scope import describe_dropped, scope_paths
@@ -478,6 +477,30 @@ def _run_repo_normalizer(
     command = cfg.task_normalize_command
     assert command is not None
     emit("step", "normalize")
+    # Clamped to the budget the pod has left, for the same reason the verify
+    # poll is: an un-clamped normalize outlives the process waiting on it, and
+    # what dies with it is a patch that already applied cleanly. Job `d2c24049`
+    # (2026-09-16) entered this step 5m19s before its Job deadline with a
+    # 30-minute normalize timeout and was killed mid-run; the triage issue
+    # recorded `⚠️ task failed` and the two tests stayed unfixed. 0 means there
+    # is not even room to start, which is the same "could not run" outcome the
+    # NormalizeError branch below already handles — the patch is accepted
+    # un-normalized and CI still catches what the normalizer would have.
+    timeout = budget.clamp(cfg.task_normalize_timeout)
+    if timeout <= 0:
+        log.warning("no budget left to run the normalizer; accepting un-normalized")
+        emit(
+            "log",
+            "Not enough of the runner budget is left to run the normalizer; "
+            "accepting the patch un-normalized so it can still be pushed.",
+        )
+        return None, ""
+    if timeout < cfg.task_normalize_timeout:
+        emit(
+            "log",
+            f"Normalizer timeout cut to {timeout}s by the remaining runner "
+            f"budget (configured {cfg.task_normalize_timeout}s).",
+        )
     emit("log", f"Running the repo normalizer: `{' '.join(command)}`…")
     try:
         return run_normalize(
@@ -487,7 +510,7 @@ def _run_repo_normalizer(
             backend=cfg.task_sandbox_backend,
             image=cfg.task_normalize_image,
             mode=cfg.helper_sandbox,
-            timeout=cfg.task_normalize_timeout,
+            timeout=timeout,
             memory=cfg.task_normalize_memory,
         )
     except NormalizeError as exc:
@@ -1345,35 +1368,39 @@ def _verify_failure_message(outcome: VerifyOutcome) -> str:
     return "\n".join(lines)
 
 
-# When the runner process started, so the verify poll can be bounded by the
-# budget the runner has LEFT rather than an absolute hour. `TASK_RUNNER_TIMEOUT`
-# is enforced from outside — webapp waits on the subprocess and kills it — so a
-# poll that outlives the runner is not a slow poll, it is a lost job: no code in
-# this process gets to run, and the branch is left with no PR and no verdict.
-#
-# Observed 2026-08-31 on job `b228e033`: LLM work finished 78 minutes into a
-# 120-minute budget, verify was dispatched, and the poll believed it had its
-# full 60 minutes when 42 remained. 5 of 79 serge fix branches (6%) are orphaned
-# patches with no PR, which is what this shape leaves behind.
-_PROCESS_START = time.monotonic()
-# Leave the runner room to open the PR and report after the poll gives up.
-_VERIFY_WINDDOWN_SECONDS = 180
+# The least loop time a fresh round is worth starting with, on top of the tail
+# it has to leave behind. Below this the round cannot investigate anything — the
+# wall-clock guard ends it on iteration 1 and the model answers with no tools —
+# while the round already in hand is on a branch and would be replaced by it.
+_MIN_ROUND_LOOP_SECONDS = 600
 
 
-def effective_poll_timeout(
-    configured: int, runner_timeout: Optional[int], *, now: Optional[float] = None
-) -> int:
-    """The verify poll timeout, clamped to the runner's remaining budget.
+def round_reserve(cfg: Config) -> int:
+    """What a *fresh* agent cycle needs before it is worth starting: the tail it
+    must leave behind, plus enough loop time to be worth more than the result it
+    would replace. Used for both a GPU-verify retry round and the next
+    candidate group."""
+    return budget.reserve_for(cfg) + _MIN_ROUND_LOOP_SECONDS
 
-    Returns ``configured`` unchanged when there is no runner deadline (an
-    unbounded or locally-run task). Never returns less than 0; a caller that
-    gets 0 should treat the gate as unavailable rather than poll forever.
+
+def effective_poll_timeout(configured: int, *, now: Optional[float] = None) -> int:
+    """The verify poll timeout, clamped to the budget the runner has LEFT.
+
+    `TASK_RUNNER_TIMEOUT` is enforced from outside — in kubernetes it is the
+    Job's activeDeadlineSeconds — so a poll that outlives the runner is not a
+    slow poll, it is a lost job: no code in this process gets to run, and the
+    branch is left with no PR and no verdict.
+
+    Observed 2026-08-31 on job `b228e033`: LLM work finished 78 minutes into a
+    120-minute budget, verify was dispatched, and the poll believed it had its
+    full 60 minutes when 42 remained. 5 of 79 serge fix branches (6%) are
+    orphaned patches with no PR, which is what this shape leaves behind.
+
+    Returns ``configured`` unchanged when the budget is not armed (an unbounded
+    or locally-run task). Never returns less than 0; a caller that gets 0 should
+    treat the gate as unavailable rather than poll forever.
     """
-    if not runner_timeout:
-        return configured
-    elapsed = (now if now is not None else time.monotonic()) - _PROCESS_START
-    remaining = runner_timeout - elapsed - _VERIFY_WINDDOWN_SECONDS
-    return max(0, int(min(configured, remaining)))
+    return budget.clamp(configured, now=now)
 
 
 def _make_verify_gate(
@@ -1424,9 +1451,7 @@ def _make_verify_gate(
             default_machine_type=cfg.verify_machine_type,
             run_collateral=collateral,
             transformersci_ref=cfg.verify_transformersci_ref,
-            poll_timeout=effective_poll_timeout(
-                cfg.verify_poll_timeout, getattr(cfg, "task_runner_timeout", None)
-            ),
+            poll_timeout=effective_poll_timeout(cfg.verify_poll_timeout),
             poll_interval=cfg.verify_poll_interval,
             emit=emit_fn,
         )
@@ -2181,7 +2206,7 @@ def _maybe_reproduce_first(
         ref=cfg.verify_ref,
         default_machine_type=cfg.verify_machine_type,
         transformersci_ref=cfg.verify_transformersci_ref,
-        poll_timeout=cfg.verify_poll_timeout,
+        poll_timeout=effective_poll_timeout(cfg.verify_poll_timeout),
         poll_interval=cfg.verify_poll_interval,
         emit=emit,
     )
@@ -2322,6 +2347,18 @@ def prepare_and_publish_candidate(
             raise
         result.session = session
         if attempt < rounds and should_retry(result.verify_verdict or ""):
+            # A retry round is a whole fresh agent loop. Starting one with no
+            # budget left does not produce a better patch — the wall-clock guard
+            # would end it on iteration 1 and the model would answer with no
+            # tools — and it throws away the round we already have, which is on
+            # a branch. Keep that one instead.
+            if budget.exhausted(reserve=round_reserve(cfg)):
+                emit(
+                    "log",
+                    f"GPU verify: {result.verify_verdict}, but there is not enough "
+                    "runner budget left for another round; keeping this result.",
+                )
+                return result
             emit(
                 "log",
                 f"GPU verify: {result.verify_verdict}; re-prompting with tracebacks "
