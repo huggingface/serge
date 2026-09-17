@@ -1,6 +1,6 @@
 import types
 
-from reviewbot import tasks, verify
+from reviewbot import budget, tasks, verify
 
 
 def _cfg(on_gpu: bool, rounds: int = 2, reproduce_first: bool = False):
@@ -377,20 +377,26 @@ def test_error_is_a_rejection_not_an_infrastructure_miss(monkeypatch):
 
 def test_effective_poll_timeout_is_clamped_to_the_runner_budget():
     # 78 minutes into a 120-minute budget, the poll believed it had 60.
-    t0 = tasks._PROCESS_START
-    out = tasks.effective_poll_timeout(3600, 7200, now=t0 + 78 * 60)
-    assert out == 7200 - 78 * 60 - tasks._VERIFY_WINDDOWN_SECONDS
+    t0 = budget.PROCESS_START
+    budget.arm(7200, start=t0)
+    out = tasks.effective_poll_timeout(3600, now=t0 + 78 * 60)
+    assert out == 7200 - 78 * 60 - budget.WINDDOWN_SECONDS
     assert out < 3600
 
 
 def test_effective_poll_timeout_passes_through_without_a_deadline():
-    assert tasks.effective_poll_timeout(3600, None) == 3600
-    assert tasks.effective_poll_timeout(3600, 0) == 3600
+    # Unarmed: the in-process worker and any local run are unbounded.
+    assert tasks.effective_poll_timeout(3600) == 3600
+    budget.arm(0)
+    assert tasks.effective_poll_timeout(3600) == 3600
+    budget.arm(None)
+    assert tasks.effective_poll_timeout(3600) == 3600
 
 
 def test_effective_poll_timeout_never_goes_negative():
-    t0 = tasks._PROCESS_START
-    assert tasks.effective_poll_timeout(3600, 7200, now=t0 + 10_000) == 0
+    t0 = budget.PROCESS_START
+    budget.arm(7200, start=t0)
+    assert tasks.effective_poll_timeout(3600, now=t0 + 10_000) == 0
 
 
 def test_the_runner_is_told_its_own_deadline():

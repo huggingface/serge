@@ -180,6 +180,8 @@ before. See [normalize validation](tasks-normalize.md) for the full setup.
 | `TASK_NORMALIZE_MAX_RETRIES` | `2` | How many times a normalizer rejection is fed back to the model for correction. `0` = validate once, no corrective re-prompts. |
 | `TASK_PREFLIGHT_COMMAND` | unset | Argv run on the **pristine** checkout before any LLM work, to prove the gate is passable at all (e.g. `bash -lc 'uv pip install -e . --system --no-deps && python -c "import transformers"'`). A non-zero exit fails the task immediately as a broken gate. Unset disables the probe. Operator/repo config — never request-supplied. |
 | `TASK_PREFLIGHT_TIMEOUT` | `300` | Per-run timeout (seconds) for the preflight probe. |
+| `TASK_RUNNER_TIMEOUT` | `3600` | Wall-clock budget for one task pod. In kubernetes this is the Job's `activeDeadlineSeconds` — a hard kill, not a request. |
+| `TASK_TAIL_RESERVE` | `0` | Seconds of that budget held back so a finished patch can still be normalized and pushed; the agent loop stops when less is left (`stop_reason="deadline"`). `0` derives it as `TASK_NORMALIZE_TIMEOUT + 180`. See [the runner's wall-clock budget](tasks-flow.md). |
 | `TASK_NORMALIZE_GUIDANCE` | unset | Free-text policy injected into the task system prompt and the normalize-failure feedback (e.g. "prefer root-cause fixes over `# noqa`"). For anything the command itself can't express. |
 
 Task fixes also read the repo's own conventions file (`REVIEW_RULES_PATH`,

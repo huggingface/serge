@@ -86,9 +86,11 @@ RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
     "verify_run_collateral",
     "verify_machine_type",
     "verify_poll_timeout",
-    # The runner needs its OWN deadline to bound the verify poll by the budget it
-    # has left; without it the poll outlives the process that is waiting on it.
+    # The runner needs its OWN deadline to bound the verify poll, the normalizer
+    # and the agent loop by the budget it has left; without it each of them
+    # outlives the process that is waiting on it (:mod:`reviewbot.budget`).
     "task_runner_timeout",
+    "task_tail_reserve",
     "verify_poll_interval",
     "verify_max_rounds",
     "classify_max_tokens",

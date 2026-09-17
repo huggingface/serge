@@ -14,6 +14,7 @@ data:
   TASK_EXECUTION: "kubernetes"
   TASK_RUNNER_IMAGE: {{ $t.image | quote }}
   TASK_RUNNER_TIMEOUT: {{ $t.timeout | quote }}
+  TASK_TAIL_RESERVE: {{ $t.tailReserve | default 0 | quote }}
   {{- with $t.memory }}
   TASK_RUNNER_MEMORY: {{ . | quote }}
   {{- end }}

@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import tempfile
 import unittest
 from typing import Any
@@ -13,6 +14,7 @@ from reviewbot.reviewer import (
     _REVIEW_JSON_KEYS,
     STOP_ANSWERED,
     STOP_BLIND_TURN_CAP,
+    STOP_DEADLINE,
     STOP_INPUT_TOKEN_CAP,
     STOP_NO_LLM_TURNS,
     STOP_PATH_REVISIT_GUARD,
@@ -1266,6 +1268,43 @@ class StopReasonTests(unittest.TestCase):
             tool_env=ToolEnv(repo_root="/tmp"),
         )
         self.assertEqual(metrics.stop_reason, STOP_INPUT_TOKEN_CAP)
+
+    def test_wall_clock_deadline_ends_the_loop_with_time_left_to_land_it(
+        self,
+    ) -> None:
+        """The loop must stop itself while the pod can still normalize and push.
+
+        Job `d2c24049` (2026-09-16) is why: 56 turns of work produced a patch, a
+        title and a body, the patch applied cleanly, and then the Job's
+        activeDeadlineSeconds killed the pod 5m19s into normalize. serge saw
+        `exited without reporting (exit code 1)` and the triage issue showed
+        `⚠️ task failed` — a finished fix, thrown away by the clock.
+        """
+        from reviewbot import budget
+
+        budget.arm(60, start=time.monotonic())  # inside the wind-down already
+        chat, metrics = _run_agentic_loop(
+            _FakeLLM([self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=_CfgStub(),  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.stop_reason, STOP_DEADLINE)
+        self.assertIn("summary", chat.content or "")
+
+    def test_no_wall_clock_guard_without_an_armed_budget(self) -> None:
+        """The legacy in-process worker lives in serge's own long-running web
+        process. If the guard fired there it would end every loop on turn 1."""
+        from reviewbot import budget
+
+        self.assertFalse(budget.armed())
+        _, metrics = _run_agentic_loop(
+            _FakeLLM([self._tool_turn(), self._answer()]),  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=_CfgStub(),  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+        )
+        self.assertEqual(metrics.stop_reason, STOP_ANSWERED)
 
     def test_peak_is_the_widest_turn_not_the_sum(self) -> None:
         """The number that made 2M look like a context problem. `prompt_tokens`

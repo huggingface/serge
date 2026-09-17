@@ -6,7 +6,7 @@ from typing import Any, Callable, Optional
 
 import requests
 
-from . import __version__
+from . import __version__, budget
 from .brevity import condense_review_bodies
 from .compression import MessageCompressor
 from .config import Config
@@ -562,6 +562,14 @@ STOP_BLIND_TURN_CAP = "blind_turn_cap"
 STOP_STRICT_TOOL_CAP = "strict_tool_cap"
 STOP_ABSOLUTE_CEILING = "absolute_ceiling"
 STOP_CHUNK_BUDGET = "chunk_input_token_cap"
+# The pod's wall-clock budget ran down to the tail reserve, so the loop stopped
+# while there was still time to answer, normalize and push. Unlike every other
+# cap here this one is not about the model: it means the job was expensive in
+# *time* (GPU verify rounds, a slow provider), and it exists because the
+# alternative is the Job's activeDeadlineSeconds killing the pod at an arbitrary
+# point — which is how job `d2c24049` lost a finished patch. See
+# :mod:`reviewbot.budget`.
+STOP_DEADLINE = "deadline"
 # Not a loop exit: the job finished (or failed) without ever running one. The
 # reproduce-first gate classifying a group ENVIRONMENT is the common case — 3 of
 # the 10 tasks in the measured window — and it has to be countable, otherwise
@@ -1328,6 +1336,10 @@ def _run_agentic_loop(
     input_tokens_cap: Optional[int] = (
         cfg.llm_max_input_tokens if cfg.llm_max_input_tokens > 0 else None
     )
+    # The same idea in wall-clock: stop spinning the loop once the runner pod
+    # has only enough budget left to land what it already has. Inert outside a
+    # runner pod — ``budget`` is armed only there (:mod:`reviewbot.budget`).
+    loop_reserve: int = budget.reserve_for(cfg)
     # How many of the newest tool results to keep verbatim in the transcript;
     # older ones are sent as a stub (:mod:`reviewbot.transcript`). 0 — the
     # default — sends the whole transcript, which is the behaviour every
@@ -1432,6 +1444,21 @@ def _run_agentic_loop(
                     "asking for a final review without tools",
                 )
             metrics.stop_reason = STOP_INPUT_TOKEN_CAP
+            break
+        if budget.exhausted(reserve=loop_reserve):
+            log.warning(
+                "Wall-clock budget hit (under %ss left of the runner deadline); "
+                "bailing out for final answer",
+                loop_reserve,
+            )
+            if emit is not None:
+                emit(
+                    "log",
+                    f"Wall-clock budget hit (under {loop_reserve}s left before the "
+                    "runner deadline); asking for a final answer without tools so "
+                    "the patch can still be normalized and pushed",
+                )
+            metrics.stop_reason = STOP_DEADLINE
             break
         if iter_cap is not None:
             if getattr(cfg, "tool_max_iterations_strict", False):

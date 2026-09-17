@@ -140,6 +140,43 @@ review pages use.
   class as a PR body). The prompt marks them untrusted, the model can only emit a
   patch, and the result is a PR a human reviews before merge.
 
+## The runner's wall-clock budget
+
+`TASK_RUNNER_TIMEOUT` is the task Job's `activeDeadlineSeconds`, so it is a hard
+kill: when it expires Kubernetes stops the pod wherever it happens to be, and
+whatever the runner was holding goes with it. That is not hypothetical — job
+`d2c24049` (2026-09-16, `transformers#48881`) finished its agent loop, produced a
+patch that applied cleanly plus a PR title and body, entered the normalize step
+at 00:06:03, and was killed at 00:11:22 with 5m19s of a 30-minute normalize still
+to run. serge recorded `task runner exited without reporting (exit code 1)`, the
+triage issue showed `⚠️ task failed`, and the two `qwen3_omni_moe` tests stayed
+unfixed. The work was finished; only the clock was not.
+
+So the runner bounds its own steps against the budget it has left rather than
+against its own configured timeouts (`reviewbot/budget.py`):
+
+- **The agent loop stops itself** once less than `TASK_TAIL_RESERVE` is left,
+  recording `stop_reason="deadline"`, and asks for a final answer without tools —
+  the same shape as the input-token cap. It stops *while there is still time to
+  land what it has*, which is the whole point.
+- **The repo normalizer's timeout is cut** to what the budget covers, and with
+  nothing left it is skipped entirely and the patch is accepted un-normalized.
+  That is the outcome an unavailable normalizer already produced, and CI still
+  catches what it would have. A dead pod produces nothing.
+- **The GPU verify and reproduce polls are cut** the same way (they already
+  were, for verify). A poll that outlives the runner is not a slow poll — it is
+  a lost job.
+- **A fresh cycle is not started if it cannot finish.** A GPU-verify retry round
+  or the next candidate group needs the tail reserve plus ten minutes of real
+  loop time; below that the round already in hand is kept instead of being
+  replaced by one whose loop would end on iteration 1.
+
+`TASK_TAIL_RESERVE` defaults to `TASK_NORMALIZE_TIMEOUT + 180`, derived rather
+than written down so raising the normalize timeout cannot silently leave the loop
+running past the point where its own patch can still be normalized and pushed.
+The budget is armed only inside a runner pod, so the legacy in-process worker
+(`TASK_EXECUTION=inprocess`) is unbounded exactly as before.
+
 ## What the PR body says
 
 serge wraps the model's explanation in the evidence a reviewer needs to judge it

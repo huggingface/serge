@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A task no longer loses a finished patch to its own deadline.**
+  `TASK_RUNNER_TIMEOUT` is the task Job's `activeDeadlineSeconds`, so it kills the
+  pod wherever it is. Job `d2c24049` (2026-09-16, `transformers#48881`) had
+  finished 56 turns of work, produced a patch that applied cleanly plus a PR title
+  and body, entered the normalize step at 00:06:03, and was killed at 00:11:22
+  with 5m19s of a 30-minute normalize left. serge recorded `task runner exited
+  without reporting (exit code 1)`, the triage issue showed `⚠️ task failed`, and
+  the two `qwen3_omni_moe` tests stayed unfixed — nothing was published, no branch
+  survived. The runner now bounds every step that can block against the budget it
+  has *left* (`reviewbot/budget.py`) instead of against its own configured
+  timeout: the agent loop stops itself with `stop_reason="deadline"` while
+  `TASK_TAIL_RESERVE` still remains and asks for a final answer without tools; the
+  repo normalizer's timeout is cut to fit, and is skipped rather than started when
+  it cannot finish (the patch is accepted un-normalized — what an unavailable
+  normalizer already produced, and CI still catches the rest); the reproduce poll
+  is clamped like the verify poll already was; and a GPU-verify retry round or a
+  further candidate group is not started unless it has the tail plus ten minutes
+  of real loop time, since the round already in hand is on a branch and the new
+  one's loop would end on iteration 1. `TASK_TAIL_RESERVE` defaults to
+  `TASK_NORMALIZE_TIMEOUT + 180`, derived so raising the normalize timeout cannot
+  silently outgrow it. The budget is armed only inside a runner pod, so the legacy
+  in-process worker stays unbounded.
+
 ### Added
 
 - **A review now knows when another open PR claims the same issue.** Before the

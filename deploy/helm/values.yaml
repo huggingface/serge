@@ -122,8 +122,16 @@ taskExecution:
     # Runner image: reviewbot layered on the repo toolchain
     # (docker/Dockerfile.task-runner). REQUIRED when enabled.
     image: ""
-    # Wall-clock cap (seconds) per task Job.
+    # Wall-clock cap (seconds) per task Job — this becomes the Job's
+    # activeDeadlineSeconds, so it is a hard kill wherever the runner happens to
+    # be. The runner bounds its own steps against it (reviewbot/budget.py).
     timeout: 3600
+    # Seconds of that budget held back for the tail: the final no-tools answer,
+    # applying the patch, the repo normalizer, and the commit+push that first
+    # makes the work durable. The agent loop stops when less than this is left
+    # rather than being killed mid-normalize with a finished patch in hand.
+    # 0 derives it as TASK_NORMALIZE_TIMEOUT + 180.
+    tailReserve: 0
     # Optional per-task pod memory limit (e.g. 4Gi).
     memory: ""
     # Job namespace; "" = the release namespace.
