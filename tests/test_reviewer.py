@@ -1306,6 +1306,66 @@ class StopReasonTests(unittest.TestCase):
         )
         self.assertEqual(metrics.stop_reason, STOP_ANSWERED)
 
+    def test_a_declined_replacement_keeps_the_correction_turn_s_tools(self) -> None:
+        """A validation_retry_messages callback returning None must leave the
+        conversation intact AND the tools attached.
+
+        This is the whole fix for the patch-apply failures of 2026-09-16/17: a
+        task correction previously always ran through the compact retry prompt,
+        which set `force_json_only` and so passed `tools=None` with reasoning
+        forced to "low". The model was told its hunk context did not match the
+        file and given no way to look at the file.
+        """
+        cfg = _CfgStub()
+        llm = _FakeLLM([self._answer()])
+        calls_before = 0
+        _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+            validate=lambda chat: "context did not match" if not calls_before else None,
+            max_validation_retries=1,
+            validation_retry_messages=lambda chat, fb, n: None,
+        )
+        # Turn 1 is the answer, turn 2 is the correction. Both must carry tools.
+        self.assertGreaterEqual(len(llm.calls), 2)
+        correction = llm.calls[-1]
+        self.assertIsNotNone(
+            correction.get("tools"), "the correction turn lost its tools"
+        )
+        # And the conversation was appended to, not replaced.
+        self.assertEqual(correction["messages"][0]["content"], "x")
+        self.assertIn("context did not match", correction["messages"][-1]["content"])
+
+    def test_a_replacement_still_drops_tools(self) -> None:
+        """The compact no-tools prompt is right for a normalizer rejection,
+        which carries its own reason and needs no new look at the repo."""
+        cfg = _CfgStub()
+        llm = _FakeLLM([self._answer()])
+        seen = {"n": 0}
+
+        def validate(chat):
+            seen["n"] += 1
+            return "normalizer said no" if seen["n"] == 1 else None
+
+        _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "x"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=ToolEnv(repo_root="/tmp"),
+            validate=validate,
+            max_validation_retries=1,
+            validation_retry_messages=lambda chat, fb, n: [
+                {"role": "user", "content": "compact"}
+            ],
+        )
+        correction = llm.calls[-1]
+        self.assertIsNone(correction.get("tools"))
+        self.assertEqual(
+            correction["messages"], [{"role": "user", "content": "compact"}]
+        )
+
     def test_peak_is_the_widest_turn_not_the_sum(self) -> None:
         """The number that made 2M look like a context problem. `prompt_tokens`
         sums each turn's whole prompt because the loop re-sends the

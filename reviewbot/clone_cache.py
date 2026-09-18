@@ -582,6 +582,29 @@ class CloneCache:
                         )
                     return
                 last_stderr = proc.stderr.decode("utf-8", errors="replace")
+            # Both attempts failed. Without -v, git apply reports only "patch
+            # failed: <file>:<line>", which names the hunk but not what went
+            # wrong with it — and that terse line is the whole of what the
+            # correction turn used to be told, so the model could only guess at
+            # the context it had got wrong (three prod tasks on 2026-09-16/17
+            # each re-guessed three times and never converged). `-v` adds the
+            # "error: while searching for:" block with the exact lines git
+            # looked for, which is the one thing that identifies the mismatch.
+            # --check so this is a diagnosis, not a fourth apply attempt.
+            verbose = self._git(
+                checkout.path,
+                "apply",
+                "--check",
+                "-v",
+                "--whitespace=fix",
+                "--recount",
+                patch_path,
+                timeout=120,
+                check=False,
+            )
+            detail = verbose.stderr.decode("utf-8", errors="replace")
+            if "while searching for" in detail:
+                last_stderr = detail
             raise subprocess.CalledProcessError(
                 1, ["git", "apply"], stderr=last_stderr.encode()
             )

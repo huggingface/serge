@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A rejected patch now gets a correction turn that can see the file.** Three
+  prod tasks died applying a patch on 2026-09-16/17 (`pvt_v2`,
+  `qwen3_omni_moe`, `zamba`; triage issues transformers#48881 and #48914) —
+  23% of the task rows in the store and 75% of all task errors, 3.58M input
+  tokens for 0 PRs and 0 branches. Each had `rejected_patch: 3` /
+  `patch_apply_error: 3` / `validation_retries: 2`: the same patch failed three
+  times in the loop, the correction budget ran out, and `publish_task` applied a
+  fourth time and reported that. It was not a weak apply fallback — strict,
+  `--recount`, `-C1`, `-C0`, `--3way` and GNU `patch --fuzz=3` all reject all
+  three patches. It was that the correction turn was blind: the compact retry
+  prompt stripped the model's tools and forced reasoning to "low", and the
+  feedback was two lines of stderr naming a line number. So it re-guessed the
+  context — on `zamba` the same line came back `"<s><s> Tell me…"` twice and
+  `"[PAD][PAD]…<s> Tell me…"` once. Now `_validate_patch` sends the real file
+  content around every rejected hunk (numbered as `tools.read_file` numbers it),
+  a `validation_retry_messages` callback may return `None` to keep the live
+  conversation and its tools, and tasks do that for an apply rejection while a
+  normalizer rejection keeps the compact prompt. `apply_patch` also raises
+  `git apply -v`'s "while searching for" block so the stored job error is a
+  diagnosis, but `apply_error_for_model` strips it from what the model sees —
+  that block quotes the model's own wrong context, and handing it back measurably
+  kept the fabrication alive. Measured against the deployed model
+  (`moonshotai/Kimi-K2.6`) replaying both real rejections, 4 runs each, nothing
+  else changed: `pvt_v2` 0/4 → 3/4 applied, `zamba` 0/4 → 1/4.
+
+
 - **A task no longer loses a finished patch to its own deadline.**
   `TASK_RUNNER_TIMEOUT` is the task Job's `activeDeadlineSeconds`, so it kills the
   pod wherever it is. Job `d2c24049` (2026-09-16, `transformers#48881`) had

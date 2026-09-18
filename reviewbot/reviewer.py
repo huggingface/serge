@@ -1273,7 +1273,7 @@ def _run_agentic_loop(
     validate: Optional[Callable[[ChatResult], Optional[str]]] = None,
     max_validation_retries: int = 0,
     validation_retry_messages: Optional[
-        Callable[[ChatResult, str, int], list[dict[str, Any]]]
+        Callable[[ChatResult, str, int], Optional[list[dict[str, Any]]]]
     ] = None,
     parses: Optional[Callable[[str], bool]] = None,
 ) -> tuple[ChatResult, _AggregateMetrics]:
@@ -1393,15 +1393,27 @@ def _run_agentic_loop(
     # force minimal reasoning so the whole output budget goes to the JSON.
     force_json_only = False
 
-    def _add_validation_feedback(chat: ChatResult, feedback: str) -> None:
+    def _add_validation_feedback(chat: ChatResult, feedback: str) -> bool:
+        """Set up the correction turn. Returns True when the conversation was
+        REPLACED by the compact retry prompt (which also means the turn runs
+        without tools), False when the feedback was appended to the existing
+        conversation and the model keeps its tools.
+
+        A ``validation_retry_messages`` callback may return ``None`` to ask for
+        the append path: some rejections cannot be fixed without looking at the
+        repo again, and a compact no-tools prompt makes those unfixable.
+        """
         nonlocal messages
         if validation_retry_messages is not None:
-            messages = validation_retry_messages(chat, feedback, validation_retries)
-            return
+            replacement = validation_retry_messages(chat, feedback, validation_retries)
+            if replacement is not None:
+                messages = replacement
+                return True
         # Continue the SAME conversation: append the rejected answer and the
         # feedback, then loop so the model can browse + correct.
         messages.append({"role": "assistant", "content": chat.content or None})
         messages.append({"role": "user", "content": feedback})
+        return False
 
     while True:
         iteration += 1
@@ -1567,8 +1579,10 @@ def _run_agentic_loop(
                     f"{validation_retries}/{max_validation_retries}); "
                     "asking the model to fix it",
                 )
-            _add_validation_feedback(chat, feedback)
-            force_json_only = validation_retry_messages is not None
+            # Tools stay ON when the feedback was appended to the live
+            # conversation: an apply rejection is a disagreement about what the
+            # file contains, and the model needs a read to settle it.
+            force_json_only = _add_validation_feedback(chat, feedback)
             continue
 
         # A "blind" tool turn is one where the model fired tool calls without

@@ -65,6 +65,12 @@ _NORMALIZE_FEEDBACK_CHARS = 80_000
 _REJECTED_PATCH_EVENT_CHARS = 80_000
 _VALIDATION_RETRY_CONTEXT_CHARS = 120_000
 _VALIDATION_RETRY_OUTPUT_CHARS = 80_000
+# `git apply -v` stderr echoes every context line it searched for, so the old
+# 1200-char clip cut the diagnostic off mid-block on exactly the multi-hunk
+# patches that need it most.
+_APPLY_STDERR_CHARS = 12_000
+# The real file content sent back with an apply rejection.
+_APPLY_WINDOWS_CHARS = 24_000
 
 # The task JSON contract from prompts.py. Passed to `_extract_json` so a stray
 # `{...}` in the reply — notably a leaked tool call's own argument object —
@@ -705,6 +711,7 @@ def _validate_patch(
     baseline_state: Optional[dict] = None,
     llm: Optional[ChatCompletionClient] = None,
     brevity_chats: Optional[list] = None,
+    report: Optional[dict[str, Any]] = None,
 ) -> tuple[Optional[str], bool]:
     """Validate the model's final answer by applying its patch to a clean
     worktree and running the repo normalizer.
@@ -719,6 +726,12 @@ def _validate_patch(
       the normalizer ran cleanly, normalized) result, ready for
       :func:`publish_task` to commit directly.
 
+    ``report``, when given, is stamped with ``rejection``: ``"apply"`` when
+    ``git apply`` refused the patch, ``"normalize"`` when the normalizer did, and
+    ``""`` when the answer is accepted. The caller needs the distinction because
+    the two want different correction turns — a normalizer rejection carries its
+    own reason in the feedback, an apply rejection needs the repo re-read.
+
     Only called when ``cfg.task_normalize_command`` is set."""
     command = cfg.task_normalize_command
     assert command is not None
@@ -728,30 +741,61 @@ def _validate_patch(
     except ValueError:
         # Unparseable — not something the normalizer can speak to. Accept here
         # and let prepare_task's own extraction raise the proper error.
+        if report is not None:
+            report["rejection"] = ""
         return None, False
 
     patch = result.get("patch")
     if not isinstance(patch, str) or not patch.strip():
         # No patch to validate (a "no safe fix" answer); accept as-is.
+        if report is not None:
+            report["rejection"] = ""
         return None, False
 
     clone_cache.reset_worktree(checkout)
     try:
         clone_cache.apply_patch(checkout, patch)
     except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:1200]
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[
+            :_APPLY_STDERR_CHARS
+        ]
         emit("rejected_patch", _bounded_rejected_patch(patch))
         emit(
             "patch_apply_error",
             f"`git apply` rejected the proposed patch:\n{stderr}",
         )
-        return (
+        # The old feedback was the stderr plus "check that the hunk context
+        # lines match the current code exactly" — an instruction the model had
+        # no way to follow, because it was never shown the current code. It
+        # re-guessed instead: on prod job 13387bf45ef6 the same context line
+        # came back as "<s><s> Tell me..." twice and "[PAD][PAD]...<s> Tell
+        # me..." once across three corrections, and the task died having never
+        # applied. So send what the file actually holds around each rejected
+        # hunk, and say plainly that it is authoritative.
+        if report is not None:
+            report["rejection"] = "apply"
+        windows = patch_target_windows(patch, _checkout_reader(checkout))
+        msg = (
             "Your patch was rejected — `git apply` could not apply it to a "
-            f"clean checkout:\n\n{stderr}\n\nReturn a corrected unified diff. "
-            "Check the file paths and that the hunk context lines match the "
-            "current code exactly.",
-            False,
+            f"clean checkout:\n\n{apply_error_for_model(stderr)}\n"
         )
+        if windows:
+            msg += (
+                "\nThis is what the files ACTUALLY contain right now, around "
+                "each hunk you targeted. It is the source of truth — your "
+                "context lines must match it byte for byte, including trailing "
+                "commas and whitespace. Do not reproduce these lines from "
+                "memory; copy them from here (dropping the line-number "
+                "prefix):\n\n"
+                f"{_bounded_apply_windows(windows)}\n"
+            )
+        msg += (
+            "\nReturn a corrected unified diff whose context lines are copied "
+            "from the content above. If what you wanted to change is not there, "
+            "the change itself is wrong — re-read the file before rewriting the "
+            "patch."
+        )
+        return msg, False
 
     # The patch is applied and nothing has reformatted it yet, so the file's
     # line numbers are still the diff's new-side ones: the one point where the
@@ -811,10 +855,89 @@ def _validate_patch(
             )
         if cfg.task_normalize_guidance:
             msg += f"\n\n{cfg.task_normalize_guidance.strip()}"
+        if report is not None:
+            report["rejection"] = "normalize"
         return msg, False
 
     emit("log", "Patch validated; normalizer is clean.")
+    if report is not None:
+        report["rejection"] = ""
     return None, True
+
+
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
+_PATCH_TARGET_RE = re.compile(r"^\+\+\+ b/(.+)$")
+# Lines of real file content to show around a rejected hunk. Wide enough that
+# the hunk's whole old side plus a few lines either side are visible, so the
+# model can read the context off the file instead of recalling it.
+_APPLY_WINDOW_PAD = 8
+_APPLY_WINDOWS_MAX = 6
+
+
+def patch_target_windows(
+    diff_text: str, read_file: Callable[[str], Optional[list[str]]]
+) -> str:
+    """The file's ACTUAL content around each hunk a rejected diff targets.
+
+    A rejected patch means the model's idea of the file disagrees with the file.
+    `git apply -v` says what it searched for; this says what is really there, so
+    the correction turn has both sides and needs to recall neither. Numbered the
+    way ``tools.read_file`` numbers its output, so the two agree.
+
+    ``read_file`` maps a repo-relative path to its lines (without newlines), or
+    ``None`` when it cannot be read — a patch that creates a file has nothing to
+    show, which is not an error.
+
+    Pure apart from ``read_file`` so it is testable without a checkout.
+    """
+    blocks: list[str] = []
+    target: Optional[str] = None
+    cache: dict[str, Optional[list[str]]] = {}
+    for line in diff_text.splitlines():
+        m = _PATCH_TARGET_RE.match(line)
+        if m:
+            target = m.group(1).strip()
+            continue
+        h = _HUNK_HEADER_RE.match(line)
+        if not h or target is None or len(blocks) >= _APPLY_WINDOWS_MAX:
+            continue
+        if target not in cache:
+            cache[target] = read_file(target)
+        lines = cache[target]
+        if lines is None:
+            blocks.append(f"{target}: not in the checkout (a new file?)")
+            continue
+        start = int(h.group(1))
+        span = int(h.group(2) or 1)
+        lo = max(1, start - _APPLY_WINDOW_PAD)
+        hi = min(len(lines), start + span + _APPLY_WINDOW_PAD)
+        if lo > len(lines):
+            blocks.append(
+                f"{target} (hunk @@ -{start} is past the end of the file, "
+                f"which has {len(lines)} lines)"
+            )
+            continue
+        body = "\n".join(f"{i:>6}\t{lines[i - 1]}" for i in range(lo, hi + 1))
+        blocks.append(f"{target} (lines {lo}-{hi}):\n{body}")
+    if not blocks:
+        return ""
+    return "\n\n".join(blocks)
+
+
+def _checkout_reader(checkout: Checkout) -> Callable[[str], Optional[list[str]]]:
+    """A ``patch_target_windows`` reader bound to a worktree."""
+
+    def read(rel: str) -> Optional[list[str]]:
+        full = os.path.join(checkout.path, rel)
+        if not os.path.isfile(full):
+            return None
+        try:
+            with open(full, encoding="utf-8", errors="replace") as fh:
+                return fh.read().splitlines()
+        except OSError:
+            return None
+
+    return read
 
 
 def _bounded_normalize_feedback(output: str) -> str:
@@ -829,6 +952,33 @@ def _bounded_normalize_feedback(output: str) -> str:
         + f"\n\n--- omitted {omitted} chars of normalize output from LLM feedback ---\n\n"
         + output[-tail:].lstrip()
     ).rstrip()
+
+
+_SEARCHING_RE = re.compile(
+    r"^error: while searching for:\n(?:.*\n)*?(?=^error: )", re.MULTILINE
+)
+
+
+def apply_error_for_model(stderr: str) -> str:
+    """The apply failure as the MODEL should see it: locations, not echoes.
+
+    `git apply -v` prints an ``error: while searching for:`` block quoting the
+    context it looked for — which is the model's own wrong context. Sending that
+    back hands the model its fabrication a second time, labelled as output from
+    git, right next to the real file content it is supposed to copy instead.
+    Measured against the deployed model on prod job 13387bf45ef6: the true line
+    appeared 3 times in the prompt and the fabricated one once, and the model
+    still reproduced the fabrication in 3 of 3 runs. So the verbose block stays
+    on the operator event (where it is the whole diagnosis) and is stripped
+    here, leaving the ``error: patch failed: <file>:<line>`` lines that say
+    WHERE to look without saying what to look for.
+    """
+    return _SEARCHING_RE.sub("", stderr).strip()
+
+
+def _bounded_apply_windows(text: str) -> str:
+    """Bound the real-file windows sent back with an apply rejection."""
+    return _bound_middle(text, _APPLY_WINDOWS_CHARS, "chars of file content")
 
 
 def _bounded_rejected_patch(patch: str) -> str:
@@ -1079,6 +1229,7 @@ def prepare_task(
             baseline_state=baseline_state,
             llm=llm,
             brevity_chats=brevity_chats,
+            report=outcome,
         )
         outcome["prepared"] = prepared
         return feedback
@@ -1098,15 +1249,26 @@ def prepare_task(
         validate=_validate if normalize_configured else None,
         max_validation_retries=cfg.task_normalize_max_retries,
         validation_retry_messages=(
-            lambda chat, feedback, retry_number: _task_validation_retry_messages(
-                repo_full_name=req.repo_full_name,
-                base_ref=req.base_ref,
-                instruction=req.instruction,
-                context=req.context,
-                existing_diff=existing_diff,
-                rejected_content=chat.content,
-                feedback=feedback,
-                retry_number=retry_number,
+            lambda chat, feedback, retry_number: (
+                # None asks the loop to APPEND the feedback to the live
+                # conversation and keep the tools. An apply rejection is a
+                # disagreement about what the file contains: the compact
+                # no-tools prompt below cannot settle that, because the model
+                # can neither read the file nor see the read it already did, so
+                # it re-guesses the context it got wrong. Three prod tasks died
+                # that way on 2026-09-16/17, each having re-guessed three times.
+                None
+                if outcome.get("rejection") == "apply"
+                else _task_validation_retry_messages(
+                    repo_full_name=req.repo_full_name,
+                    base_ref=req.base_ref,
+                    instruction=req.instruction,
+                    context=req.context,
+                    existing_diff=existing_diff,
+                    rejected_content=chat.content,
+                    feedback=feedback,
+                    retry_number=retry_number,
+                )
             )
         )
         if normalize_configured
