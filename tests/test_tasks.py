@@ -1432,6 +1432,186 @@ class ValidatePatchTests(unittest.TestCase):
         self.assertFalse(prepared)
 
 
+class AnchoredEditAnswerTests(unittest.TestCase):
+    """An `edits` answer through the real gate (:mod:`reviewbot.anchored_edits`).
+
+    The format stops at prepare_task: the gate applies the edits and has **git**
+    write the diff, so `plan.patch` is git's and everything downstream —
+    publish_task's apply path, `commit_scope`, `classify_patch`, the brevity
+    pass's line numbers — keeps reading a unified diff with correct geometry.
+    These tests pin that boundary, and that a bad anchor is rejected the same
+    way a bad patch is (clean worktree, `rejection == "apply"`, tools kept)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = self._tmp.name
+        src = os.path.join(root, "src")
+        os.makedirs(src)
+        _git(src, "init", "--quiet", "-b", "main")
+        with open(os.path.join(src, "hello.txt"), "w") as f:
+            f.write("alpha\nbeta\ngamma\n")
+        _git(src, "add", "-A")
+        _git(src, "commit", "--quiet", "-m", "main commit")
+        self.cache = CloneCache(os.path.join(root, "cache"))
+        self.co = self.cache.acquire_ref(
+            token="",
+            owner="acme",
+            repo="widget",
+            ref="main",
+            job_id="edit1234",
+            remote_url=src,
+        )
+
+    def _cfg(self, **overrides):
+        base = dict(
+            helper_sandbox="off",
+            task_sandbox_backend="bwrap",
+            task_normalize_command=["true"],
+            task_normalize_timeout=30,
+        )
+        base.update(overrides)
+        return _make_cfg(**base)
+
+    def _content(self, edits, **extra):
+        return json.dumps({"title": "t", "body": "b", "edits": edits, **extra})
+
+    def _validate(self, content, cfg=None, report=None, events=None):
+        return _validate_patch(
+            cfg or self._cfg(),
+            checkout=self.co,
+            clone_cache=self.cache,
+            content=content,
+            emit=(lambda k, t: events.append((k, t)))
+            if events is not None
+            else (lambda *a: None),
+            report=report,
+        )
+
+    def _read(self, name):
+        with open(os.path.join(self.co.path, name)) as fh:
+            return fh.read()
+
+    def test_a_unique_anchor_is_applied_and_git_writes_the_diff(self):
+        report: dict = {}
+        feedback, prepared = self._validate(
+            self._content([{"path": "hello.txt", "old": "beta", "new": "BETA"}]),
+            report=report,
+        )
+        self.assertIsNone(feedback)
+        self.assertTrue(prepared)
+        self.assertEqual(self._read("hello.txt"), "alpha\nBETA\ngamma\n")
+        # git's diff, not the model's: correct headers and geometry, which is
+        # what commit_scope.patch_paths and publish_task's apply path need.
+        patch = report["patch"]
+        self.assertIn("diff --git a/hello.txt b/hello.txt", patch)
+        self.assertIn("@@ -1,3 +1,3 @@", patch)
+        self.assertIn("-beta", patch)
+        self.assertIn("+BETA", patch)
+        # And it is the edited worktree publish_task would commit.
+        self.cache.stage_all(self.co)
+        blobs = {c.path: c.content for c in self.cache.collect_changes(self.co)}
+        self.assertEqual(blobs["hello.txt"], b"alpha\nBETA\ngamma\n")
+
+    def test_a_bad_anchor_is_an_apply_rejection_with_a_clean_worktree(self):
+        report: dict = {}
+        events: list = []
+        feedback, prepared = self._validate(
+            self._content(
+                [
+                    {"path": "hello.txt", "old": "beta", "new": "BETA"},
+                    {"path": "hello.txt", "old": "not in the file", "new": "x"},
+                ]
+            ),
+            report=report,
+            events=events,
+        )
+        self.assertFalse(prepared)
+        self.assertIn("does not occur", feedback)
+        # "apply" is what keeps the correction turn's tools (see
+        # test_patch_apply_feedback): the model has to re-read the file.
+        self.assertEqual(report["rejection"], "apply")
+        self.assertEqual(report["patch"], "")
+        # All or nothing — the first edit was good and must NOT have landed.
+        self.assertEqual(self._read("hello.txt"), "alpha\nbeta\ngamma\n")
+        self.assertEqual(self.cache.collect_changes(self.co), [])
+        # Persisted under the kinds the task page renders and the store keeps,
+        # so a rejected edit set is as diagnosable as a rejected patch.
+        kinds = [k for k, _ in events]
+        self.assertIn("rejected_patch", kinds)
+        self.assertIn("patch_apply_error", kinds)
+        self.assertIn("edit 2", report["edits_error"])
+
+    def test_an_ambiguous_anchor_is_refused_rather_than_guessed(self):
+        with open(os.path.join(self.co.path, "hello.txt"), "w") as fh:
+            fh.write("beta\nbeta\n")
+        _git(self.co.path, "commit", "--quiet", "-am", "two betas")
+        feedback, prepared = self._validate(
+            self._content([{"path": "hello.txt", "old": "beta", "new": "x"}])
+        )
+        self.assertFalse(prepared)
+        self.assertIn("occurs 2 times", feedback)
+
+    def test_an_empty_edit_list_is_the_honest_decline(self):
+        """Not a rejection: "the change I meant is not in the file" is the
+        answer we asked for, and it must cost no correction budget."""
+        report: dict = {}
+        feedback, prepared = self._validate(self._content([]), report=report)
+        self.assertIsNone(feedback)
+        self.assertFalse(prepared)
+        self.assertEqual(report["rejection"], "")
+
+    def test_edits_win_over_a_patch_sent_alongside_them(self):
+        events: list = []
+        feedback, prepared = self._validate(
+            self._content(
+                [{"path": "hello.txt", "old": "gamma", "new": "GAMMA"}],
+                patch=(
+                    "diff --git a/hello.txt b/hello.txt\n--- a/hello.txt\n"
+                    "+++ b/hello.txt\n@@ -1 +1 @@\n-alpha\n+ALPHA\n"
+                ),
+            ),
+            events=events,
+        )
+        self.assertIsNone(feedback)
+        self.assertTrue(prepared)
+        self.assertEqual(self._read("hello.txt"), "alpha\nbeta\nGAMMA\n")
+        self.assertTrue(any("ignoring the diff" in t for _, t in events))
+
+    def test_a_path_outside_the_checkout_is_refused(self):
+        outside = os.path.join(self._tmp.name, "outside.txt")
+        with open(outside, "w") as fh:
+            fh.write("secret\n")
+        feedback, prepared = self._validate(
+            self._content([{"path": "../../outside.txt", "old": "secret", "new": "x"}])
+        )
+        self.assertFalse(prepared)
+        self.assertIn("repository-relative", feedback)
+        with open(outside) as fh:
+            self.assertEqual(fh.read(), "secret\n")
+
+    def test_a_normalizer_rejection_still_resets_the_worktree(self):
+        cfg = self._cfg(
+            task_normalize_command=[
+                "sh",
+                "-c",
+                "grep -q BETA hello.txt && { echo boom >&2; exit 3; }; exit 0",
+            ]
+        )
+        report: dict = {}
+        feedback, prepared = self._validate(
+            self._content([{"path": "hello.txt", "old": "beta", "new": "BETA"}]),
+            cfg=cfg,
+            report=report,
+        )
+        self.assertFalse(prepared)
+        self.assertIn("boom", feedback)
+        # A normalizer rejection is NOT an apply rejection: it keeps the compact
+        # correction prompt, and it carries its own reason.
+        self.assertEqual(report["rejection"], "normalize")
+        self.assertEqual(self._read("hello.txt"), "alpha\nbeta\ngamma\n")
+
+
 class TaskPreflightTests(unittest.TestCase):
     """check_task_preflight — the cheap "can this gate be passed at all" probe
     that runs before any LLM work. Same real-worktree fixture as

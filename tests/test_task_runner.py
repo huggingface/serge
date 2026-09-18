@@ -54,6 +54,7 @@ class _FakeGH:
     def __init__(self):
         self.created_pr = None
         self.marked_ready = None
+        self.blobs: list[bytes] = []
 
     def get_ref_sha(self, owner, repo, ref):
         return f"parent-of-{ref}"
@@ -62,6 +63,7 @@ class _FakeGH:
         return f"tree-of-{commit_sha}"
 
     def create_blob(self, owner, repo, content):
+        self.blobs.append(content)
         return "blob1"
 
     def create_tree(self, owner, repo, base_tree, entries):
@@ -196,6 +198,71 @@ class TaskRunnerE2ETests(unittest.TestCase):
         self.assertIsNotNone(sink.terminal)
         self.assertEqual(sink.terminal["status"], "published")
         self.assertEqual(sink.terminal["result"]["pr_number"], 99)
+
+    def test_an_edits_answer_reaches_the_commit_as_the_edited_file(self):
+        """The anchored-edit format (:mod:`reviewbot.anchored_edits`) end to end,
+        on the path with NO normalizer — which is the path where nothing else
+        would have applied the edits. What is committed is the edited file, and
+        `plan.patch` is the diff git wrote from it, so publish_task never learns
+        the answer was not a diff."""
+        answer = json.dumps(
+            {
+                "title": "Say hello",
+                "body": "Fixes the greeting.",
+                "edits": [{"path": "hello.txt", "old": "hi", "new": "hello"}],
+            }
+        )
+        fake_gh = _FakeGH()
+        env = {"DEV_NO_AUTH": "1", "WEB_CLONE_CACHE_DIR": os.path.join(self.tmp, "cl3")}
+
+        with _CallbackSink() as sink:
+            spec = self._spec(sink.url)
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch(
+                    "reviewbot.tasks._run_agentic_loop",
+                    return_value=(_FakeChat(answer), _AggregateMetrics(turns=1)),
+                ),
+                patch.object(task_runner, "GitHubClient", return_value=fake_gh),
+            ):
+                rc = task_runner.run(spec)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(sink.terminal["status"], "published")
+        self.assertEqual(sink.terminal["result"]["pr_number"], 99)
+        self.assertEqual(fake_gh.blobs, [b"hello\n"])
+
+    def test_edits_that_never_applied_fail_the_run(self):
+        """A dead answer must stay a failure. If this became "no fix proposed",
+        the failure mode that cost 3.58M tokens on 2026-09-16/17 would vanish
+        from the error counts that made it visible."""
+        answer = json.dumps(
+            {
+                "title": "Say hello",
+                "body": "Fixes the greeting.",
+                "edits": [{"path": "hello.txt", "old": "not in the file", "new": "x"}],
+            }
+        )
+        fake_gh = _FakeGH()
+        env = {"DEV_NO_AUTH": "1", "WEB_CLONE_CACHE_DIR": os.path.join(self.tmp, "cl4")}
+
+        with _CallbackSink() as sink:
+            spec = self._spec(sink.url)
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch(
+                    "reviewbot.tasks._run_agentic_loop",
+                    return_value=(_FakeChat(answer), _AggregateMetrics(turns=1)),
+                ),
+                patch.object(task_runner, "GitHubClient", return_value=fake_gh),
+            ):
+                task_runner.run(spec)
+
+        self.assertIsNone(fake_gh.created_pr)
+        self.assertEqual(sink.terminal["status"], "error")
+        self.assertIn("did not apply", sink.terminal["error"])
+        # And it says WHICH anchor, where "patch did not apply cleanly" could not.
+        self.assertIn("does not occur", sink.terminal["error"])
 
     def test_no_patch_reports_no_fix(self):
         answer = json.dumps({"title": "No fix", "body": "No safe fix.", "patch": ""})

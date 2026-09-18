@@ -18,6 +18,7 @@ See ``TASKS_FLOW_PLAN.md`` for the full design.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import os
 import re
@@ -25,7 +26,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from . import __version__, budget, pr_links
+from . import __version__, anchored_edits, budget, pr_links
 from .brevity import BrevityResult, condense_patch_comments
 from .clone_cache import Checkout, CloneCache, FileChange
 from .commit_scope import describe_dropped, scope_paths
@@ -65,16 +66,39 @@ _NORMALIZE_FEEDBACK_CHARS = 80_000
 _REJECTED_PATCH_EVENT_CHARS = 80_000
 _VALIDATION_RETRY_CONTEXT_CHARS = 120_000
 _VALIDATION_RETRY_OUTPUT_CHARS = 80_000
+# `git apply -v` stderr echoes every context line it searched for, so the old
+# 1200-char clip cut the diagnostic off mid-block on exactly the multi-hunk
+# patches that need it most.
+_APPLY_STDERR_CHARS = 12_000
+# The real file content sent back with an apply rejection.
+_APPLY_WINDOWS_CHARS = 24_000
 
 # The task JSON contract from prompts.py. Passed to `_extract_json` so a stray
 # `{...}` in the reply — notably a leaked tool call's own argument object —
 # can't be mistaken for the task result.
-_TASK_JSON_KEYS = ("title", "body", "patch")
+#
+# "edits" is the anchored-edit answer (:mod:`reviewbot.anchored_edits`), which a
+# task may send INSTEAD of "patch". It never reaches publish_task: the gate
+# applies the edits and has git write the diff, so everything downstream still
+# sees a unified diff.
+_TASK_JSON_KEYS = ("title", "body", "patch", "edits")
 
 # Serge only ever writes inside its own branch namespace. ``existing_pr``
 # mode is rejected for any head branch outside it, so the OIDC
 # ``repository`` claim cannot be leveraged to push to an arbitrary PR.
 SERGE_BRANCH_NAMESPACE = "serge/"
+
+# The anchored-edit contract, restated wherever the schema is re-asserted
+# outside the system prompt. Kept in one place so the three copies cannot drift:
+# the rule that does the work is "copy it from the file, exactly once", and a
+# retry prompt that quietly dropped it would be asking for the format without
+# the reason it applies.
+_EDIT_SCHEMA_LINE = (
+    '  - "edits": a list of {"path", "old", "new"} objects. "old" must be '
+    "copied character-for-character from the file (never from memory, never "
+    "from an anchor that was just rejected) and must occur EXACTLY ONCE in it. "
+    "Use an empty list if no safe fix is possible\n"
+)
 
 _TASK_FORCE_FINAL_MESSAGE = (
     "You have used the available investigation budget. Based only on the "
@@ -83,19 +107,23 @@ _TASK_FORCE_FINAL_MESSAGE = (
     "single compact JSON object that starts with `{` and has EXACTLY these keys:\n"
     '  - "title": a concise PR title\n'
     '  - "body": a markdown PR description in at most 12 lines explaining the '
-    "failure, root cause, and patch; if no safe fix is possible, explain why\n"
-    '  - "patch": a valid unified diff, or an empty string if no safe fix is '
-    "possible\n"
+    "failure, root cause, and fix; if no safe fix is possible, explain why\n"
+    + _EDIT_SCHEMA_LINE
+    + 'Send a unified diff as "patch" instead of "edits" only for a new, '
+    "deleted or renamed file.\n"
     "Return JSON only: no surrounding prose, no code fences, no extra commentary, "
     "and no tool requests."
 )
 
 _TASK_VALIDATION_RETRY_SYSTEM_MESSAGE = (
-    "You are fixing a previously rejected task patch. Reply with a single "
+    "You are fixing a previously rejected task change. Reply with a single "
     "compact JSON object that starts with `{` and has EXACTLY these keys: "
-    '"title", "body", and "patch". The patch must be a valid unified diff '
-    "against the current checkout, or an empty string if no safe fix is "
-    "possible. Return JSON only: no prose, no code fences, no tool requests."
+    '"title", "body", and "edits".\n' + _EDIT_SCHEMA_LINE + "Send a unified "
+    'diff as "patch" instead of "edits" only for a new, deleted or renamed '
+    "file. This turn has no tools, so you cannot re-read the repository: an "
+    "anchor from your rejected output that the validator did NOT complain "
+    "about is still good and can be reused verbatim. Return JSON only: no "
+    "prose, no code fences, no tool requests."
 )
 _BRANCH_PREFIX_RE = re.compile(r"^serge/[A-Za-z0-9._/-]+$")
 _CANDIDATE_HEADING_RE = re.compile(
@@ -705,6 +733,7 @@ def _validate_patch(
     baseline_state: Optional[dict] = None,
     llm: Optional[ChatCompletionClient] = None,
     brevity_chats: Optional[list] = None,
+    report: Optional[dict[str, Any]] = None,
 ) -> tuple[Optional[str], bool]:
     """Validate the model's final answer by applying its patch to a clean
     worktree and running the repo normalizer.
@@ -719,39 +748,114 @@ def _validate_patch(
       the normalizer ran cleanly, normalized) result, ready for
       :func:`publish_task` to commit directly.
 
+    ``report``, when given, is stamped with ``rejection``: ``"apply"`` when
+    ``git apply`` refused the patch, ``"normalize"`` when the normalizer did, and
+    ``""`` when the answer is accepted. The caller needs the distinction because
+    the two want different correction turns — a normalizer rejection carries its
+    own reason in the feedback, an apply rejection needs the repo re-read.
+
     Only called when ``cfg.task_normalize_command`` is set."""
     command = cfg.task_normalize_command
     assert command is not None
+
+    if report is not None:
+        # Cleared per attempt: a patch synthesized from an accepted answer must
+        # never outlive the answer it came from.
+        report["patch"] = ""
 
     try:
         result = _extract_json(content, _TASK_JSON_KEYS)
     except ValueError:
         # Unparseable — not something the normalizer can speak to. Accept here
         # and let prepare_task's own extraction raise the proper error.
+        if report is not None:
+            report["rejection"] = ""
         return None, False
 
-    patch = result.get("patch")
-    if not isinstance(patch, str) or not patch.strip():
-        # No patch to validate (a "no safe fix" answer); accept as-is.
-        return None, False
+    raw_edits = result.get("edits")
+    if isinstance(raw_edits, list) and raw_edits:
+        # The anchored-edit answer (:mod:`reviewbot.anchored_edits`). We apply
+        # it and let git write the diff, so from the next line on this is the
+        # unified-diff path it has always been — the brevity pass, the
+        # normalizer, `commit_scope`, `classify_patch` and publish_task all keep
+        # reading a diff, and one with correct geometry by construction.
+        if isinstance(result.get("patch"), str) and result["patch"].strip():
+            emit(
+                "log",
+                "Answer carried both `edits` and `patch`; applying the edits "
+                "and ignoring the diff.",
+            )
+        patch, edit_feedback = _apply_anchored_edits(
+            checkout=checkout,
+            clone_cache=clone_cache,
+            raw_edits=raw_edits,
+            emit=emit,
+            report=report,
+        )
+        if edit_feedback is not None:
+            # Same rejection class as a failed `git apply`: the model and the
+            # file disagree about what the file says, and only a re-read
+            # settles it. The stamp is what keeps the correction turn's tools.
+            if report is not None:
+                report["rejection"] = "apply"
+            return edit_feedback, False
+        if report is not None:
+            report["patch"] = patch
+    else:
+        patch = result.get("patch")
+        if not isinstance(patch, str) or not patch.strip():
+            # Nothing to validate (a "no safe fix" answer); accept as-is.
+            if report is not None:
+                report["rejection"] = ""
+            return None, False
 
-    clone_cache.reset_worktree(checkout)
-    try:
-        clone_cache.apply_patch(checkout, patch)
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:1200]
-        emit("rejected_patch", _bounded_rejected_patch(patch))
-        emit(
-            "patch_apply_error",
-            f"`git apply` rejected the proposed patch:\n{stderr}",
-        )
-        return (
-            "Your patch was rejected — `git apply` could not apply it to a "
-            f"clean checkout:\n\n{stderr}\n\nReturn a corrected unified diff. "
-            "Check the file paths and that the hunk context lines match the "
-            "current code exactly.",
-            False,
-        )
+        clone_cache.reset_worktree(checkout)
+        try:
+            clone_cache.apply_patch(checkout, patch)
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[
+                :_APPLY_STDERR_CHARS
+            ]
+            emit("rejected_patch", _bounded_rejected_patch(patch))
+            emit(
+                "patch_apply_error",
+                f"`git apply` rejected the proposed patch:\n{stderr}",
+            )
+            # The old feedback was the stderr plus "check that the hunk context
+            # lines match the current code exactly" — an instruction the model had
+            # no way to follow, because it was never shown the current code. It
+            # re-guessed instead: on prod job 13387bf45ef6 the same context line
+            # came back as "<s><s> Tell me..." twice and "[PAD][PAD]...<s> Tell
+            # me..." once across three corrections, and the task died having never
+            # applied. So send what the file actually holds around each rejected
+            # hunk, and say plainly that it is authoritative.
+            if report is not None:
+                report["rejection"] = "apply"
+            windows = patch_target_windows(patch, _checkout_reader(checkout))
+            msg = (
+                "Your patch was rejected — `git apply` could not apply it to a "
+                f"clean checkout:\n\n{apply_error_for_model(stderr)}\n"
+            )
+            if windows:
+                msg += (
+                    "\nThis is what the files ACTUALLY contain right now, around "
+                    "each hunk you targeted. It is the source of truth — your "
+                    "context lines must match it byte for byte, including trailing "
+                    "commas and whitespace. Do not reproduce these lines from "
+                    "memory; copy them from here (dropping the line-number "
+                    "prefix):\n\n"
+                    f"{_bounded_apply_windows(windows)}\n"
+                )
+            msg += (
+                "\nReturn the corrected change as `edits`: for each change, the "
+                "`old` text copied from the content above (occurring exactly once) "
+                "and the `new` text to put in its place. That format has no hunk "
+                "headers and no line numbers, so the only thing that has to be "
+                "right is the text itself. If what you wanted to change is not in "
+                "the content above, the change itself is wrong — say so in `body` "
+                "and return an empty `edits` list rather than guessing at it."
+            )
+            return msg, False
 
     # The patch is applied and nothing has reformatted it yet, so the file's
     # line numbers are still the diff's new-side ones: the one point where the
@@ -811,10 +915,219 @@ def _validate_patch(
             )
         if cfg.task_normalize_guidance:
             msg += f"\n\n{cfg.task_normalize_guidance.strip()}"
+        if report is not None:
+            report["rejection"] = "normalize"
         return msg, False
 
     emit("log", "Patch validated; normalizer is clean.")
+    if report is not None:
+        report["rejection"] = ""
     return None, True
+
+
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
+_PATCH_TARGET_RE = re.compile(r"^\+\+\+ b/(.+)$")
+# Lines of real file content to show around a rejected hunk. Wide enough that
+# the hunk's whole old side plus a few lines either side are visible, so the
+# model can read the context off the file instead of recalling it.
+_APPLY_WINDOW_PAD = 8
+_APPLY_WINDOWS_MAX = 6
+
+
+def patch_target_windows(
+    diff_text: str, read_file: Callable[[str], Optional[list[str]]]
+) -> str:
+    """The file's ACTUAL content around each hunk a rejected diff targets.
+
+    A rejected patch means the model's idea of the file disagrees with the file.
+    `git apply -v` says what it searched for; this says what is really there, so
+    the correction turn has both sides and needs to recall neither. Numbered the
+    way ``tools.read_file`` numbers its output, so the two agree.
+
+    ``read_file`` maps a repo-relative path to its lines (without newlines), or
+    ``None`` when it cannot be read — a patch that creates a file has nothing to
+    show, which is not an error.
+
+    Pure apart from ``read_file`` so it is testable without a checkout.
+    """
+    blocks: list[str] = []
+    target: Optional[str] = None
+    cache: dict[str, Optional[list[str]]] = {}
+    for line in diff_text.splitlines():
+        m = _PATCH_TARGET_RE.match(line)
+        if m:
+            target = m.group(1).strip()
+            continue
+        h = _HUNK_HEADER_RE.match(line)
+        if not h or target is None or len(blocks) >= _APPLY_WINDOWS_MAX:
+            continue
+        if target not in cache:
+            cache[target] = read_file(target)
+        lines = cache[target]
+        if lines is None:
+            blocks.append(f"{target}: not in the checkout (a new file?)")
+            continue
+        start = int(h.group(1))
+        span = int(h.group(2) or 1)
+        lo = max(1, start - _APPLY_WINDOW_PAD)
+        hi = min(len(lines), start + span + _APPLY_WINDOW_PAD)
+        if lo > len(lines):
+            blocks.append(
+                f"{target} (hunk @@ -{start} is past the end of the file, "
+                f"which has {len(lines)} lines)"
+            )
+            continue
+        body = "\n".join(f"{i:>6}\t{lines[i - 1]}" for i in range(lo, hi + 1))
+        blocks.append(f"{target} (lines {lo}-{hi}):\n{body}")
+    if not blocks:
+        return ""
+    return "\n\n".join(blocks)
+
+
+def _apply_anchored_edits(
+    *,
+    checkout: Checkout,
+    clone_cache: CloneCache,
+    raw_edits: Any,
+    emit: Callable[[str, str], None],
+    report: Optional[dict[str, Any]] = None,
+) -> tuple[str, Optional[str]]:
+    """Apply an anchored-edit answer to a pristine worktree.
+
+    Returns ``(patch, feedback)``, exactly one of which is truthy. ``patch`` is
+    the unified diff **git** produced from the edited worktree — the point of
+    the format is that the model never writes a diff, so nothing downstream has
+    to trust one it wrote. On feedback the worktree is left clean, exactly as a
+    rejected ``git apply`` leaves it.
+
+    The rejection is deliberately specific ("`old` does not occur", "occurs 3
+    times at lines …") where `git apply`'s is not, and carries the real lines
+    when the anchor is a near-miss — but it never echoes the anchor back. See
+    :func:`apply_error_for_model` for why quoting the model's own wrong text is
+    what kept the fabrication alive.
+    """
+    parsed = anchored_edits.parse_edits(raw_edits)
+    if parsed.problems:
+        feedback = (
+            "Your `edits` were rejected before anything was applied — they do "
+            "not match the edit schema:\n\n"
+            + "\n".join(parsed.problems)
+            + '\n\nEach edit is {"path": "<repo-relative path>", "old": "<text '
+            'copied from the file, occurring exactly once>", "new": '
+            '"<replacement>"}.'
+        )
+        _emit_edit_rejection(emit, raw_edits, feedback, parsed.problems, report)
+        return "", feedback
+
+    clone_cache.reset_worktree(checkout)
+    contents, problems = anchored_edits.apply_edits(
+        parsed.edits, read=_checkout_text_reader(checkout)
+    )
+    if problems:
+        feedback = anchored_edits.rejection_feedback(problems)
+        _emit_edit_rejection(emit, raw_edits, feedback, problems, report)
+        return "", feedback
+    if not contents:
+        problems = ["the edits left every file exactly as it was"]
+        feedback = (
+            "Your edits applied but left every file exactly as it was, so there "
+            "is no change to commit. Either make the edit that fixes the "
+            "failure, or return an empty `edits` list and say in `body` why no "
+            "safe fix is possible."
+        )
+        _emit_edit_rejection(emit, raw_edits, feedback, problems, report)
+        return "", feedback
+
+    for rel, text in contents.items():
+        full = _resolve_in_checkout(checkout, rel)
+        # apply_edits only returns paths its reader accepted, so this cannot be
+        # None; the assert states the boundary rather than trusting the chain.
+        assert full is not None, rel
+        with open(full, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    paths = sorted(contents)
+    clone_cache.stage_paths(checkout, paths)
+    patch = clone_cache.staged_diff(checkout)
+    emit(
+        "log", f"Applied {len(parsed.edits)} anchored edit(s) to {len(paths)} file(s)."
+    )
+    return patch, None
+
+
+def _emit_edit_rejection(
+    emit: Callable[[str, str], None],
+    raw_edits: Any,
+    feedback: str,
+    problems: list[str],
+    report: Optional[dict[str, Any]],
+) -> None:
+    """Persist a rejected edit set for the operator, and record why.
+
+    ``report["edits_error"]`` is the one-line reason, which is what a caller
+    turns into a job error when the correction budget runs out on an edit that
+    never applied — the anchored-edit counterpart of "patch did not apply
+    cleanly", and just as much a failure the triage issue must show.
+
+    Reuses the ``rejected_patch`` / ``patch_apply_error`` event kinds the diff
+    path uses: they are the two kinds ``store.PERSIST_EVENT_KINDS`` keeps and
+    the task page renders, and they are the only reason the 2026-09-16/17
+    failures were diagnosable at all (``raw_llm_output`` was null on all three).
+    A second pair of kinds would have split that history in half.
+    """
+    if report is not None:
+        report["edits_error"] = anchored_edits.summarize(problems)
+    try:
+        rendered = json.dumps(raw_edits, indent=1)[:_REJECTED_PATCH_EVENT_CHARS]
+    except (TypeError, ValueError):
+        rendered = repr(raw_edits)[:_REJECTED_PATCH_EVENT_CHARS]
+    emit("rejected_patch", rendered)
+    emit("patch_apply_error", f"The anchored edits were rejected:\n{feedback}")
+
+
+def _resolve_in_checkout(checkout: Checkout, rel: str) -> Optional[str]:
+    """``rel`` as an absolute path inside the worktree, or ``None``.
+
+    The model chooses the path and the applier writes to it, so the containment
+    check is real: ``realpath`` resolves symlinks, which is the one escape a
+    purely textual path check (``anchored_edits._safe_path``) cannot see.
+    """
+    root = os.path.realpath(checkout.path)
+    full = os.path.realpath(os.path.join(root, rel))
+    if full != root and not full.startswith(root + os.sep):
+        return None
+    return full
+
+
+def _checkout_text_reader(checkout: Checkout) -> Callable[[str], Optional[str]]:
+    """An :func:`anchored_edits.apply_edits` reader bound to a worktree."""
+
+    def read(rel: str) -> Optional[str]:
+        full = _resolve_in_checkout(checkout, rel)
+        if full is None or not os.path.isfile(full):
+            return None
+        try:
+            with open(full, encoding="utf-8") as fh:
+                return fh.read()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    return read
+
+
+def _checkout_reader(checkout: Checkout) -> Callable[[str], Optional[list[str]]]:
+    """A ``patch_target_windows`` reader bound to a worktree."""
+
+    def read(rel: str) -> Optional[list[str]]:
+        full = os.path.join(checkout.path, rel)
+        if not os.path.isfile(full):
+            return None
+        try:
+            with open(full, encoding="utf-8", errors="replace") as fh:
+                return fh.read().splitlines()
+        except OSError:
+            return None
+
+    return read
 
 
 def _bounded_normalize_feedback(output: str) -> str:
@@ -829,6 +1142,33 @@ def _bounded_normalize_feedback(output: str) -> str:
         + f"\n\n--- omitted {omitted} chars of normalize output from LLM feedback ---\n\n"
         + output[-tail:].lstrip()
     ).rstrip()
+
+
+_SEARCHING_RE = re.compile(
+    r"^error: while searching for:\n(?:.*\n)*?(?=^error: )", re.MULTILINE
+)
+
+
+def apply_error_for_model(stderr: str) -> str:
+    """The apply failure as the MODEL should see it: locations, not echoes.
+
+    `git apply -v` prints an ``error: while searching for:`` block quoting the
+    context it looked for — which is the model's own wrong context. Sending that
+    back hands the model its fabrication a second time, labelled as output from
+    git, right next to the real file content it is supposed to copy instead.
+    Measured against the deployed model on prod job 13387bf45ef6: the true line
+    appeared 3 times in the prompt and the fabricated one once, and the model
+    still reproduced the fabrication in 3 of 3 runs. So the verbose block stays
+    on the operator event (where it is the whole diagnosis) and is stripped
+    here, leaving the ``error: patch failed: <file>:<line>`` lines that say
+    WHERE to look without saying what to look for.
+    """
+    return _SEARCHING_RE.sub("", stderr).strip()
+
+
+def _bounded_apply_windows(text: str) -> str:
+    """Bound the real-file windows sent back with an apply rejection."""
+    return _bound_middle(text, _APPLY_WINDOWS_CHARS, "chars of file content")
 
 
 def _bounded_rejected_patch(patch: str) -> str:
@@ -1079,6 +1419,7 @@ def prepare_task(
             baseline_state=baseline_state,
             llm=llm,
             brevity_chats=brevity_chats,
+            report=outcome,
         )
         outcome["prepared"] = prepared
         return feedback
@@ -1098,15 +1439,26 @@ def prepare_task(
         validate=_validate if normalize_configured else None,
         max_validation_retries=cfg.task_normalize_max_retries,
         validation_retry_messages=(
-            lambda chat, feedback, retry_number: _task_validation_retry_messages(
-                repo_full_name=req.repo_full_name,
-                base_ref=req.base_ref,
-                instruction=req.instruction,
-                context=req.context,
-                existing_diff=existing_diff,
-                rejected_content=chat.content,
-                feedback=feedback,
-                retry_number=retry_number,
+            lambda chat, feedback, retry_number: (
+                # None asks the loop to APPEND the feedback to the live
+                # conversation and keep the tools. An apply rejection is a
+                # disagreement about what the file contains: the compact
+                # no-tools prompt below cannot settle that, because the model
+                # can neither read the file nor see the read it already did, so
+                # it re-guesses the context it got wrong. Three prod tasks died
+                # that way on 2026-09-16/17, each having re-guessed three times.
+                None
+                if outcome.get("rejection") == "apply"
+                else _task_validation_retry_messages(
+                    repo_full_name=req.repo_full_name,
+                    base_ref=req.base_ref,
+                    instruction=req.instruction,
+                    context=req.context,
+                    existing_diff=existing_diff,
+                    rejected_content=chat.content,
+                    feedback=feedback,
+                    retry_number=retry_number,
+                )
             )
         )
         if normalize_configured
@@ -1136,6 +1488,38 @@ def prepare_task(
     patch = result.get("patch")
     if not isinstance(patch, str):
         patch = ""
+
+    raw_edits = result.get("edits")
+    if isinstance(raw_edits, list) and raw_edits:
+        # An anchored-edit answer leaves this function as a unified diff like
+        # every other: the gate already applied the edits and had git write the
+        # diff, so `plan.patch` is git's, not the model's. Nothing past here —
+        # publish_task, commit_scope, the verify gate — knows the format exists.
+        patch = outcome.get("patch") or ""
+        if not patch and not normalize_configured:
+            # No gate ran (no normalizer configured), so nobody has applied the
+            # edits yet. Do it here: without this the answer would silently
+            # become "no patch proposed".
+            patch, edit_feedback = _apply_anchored_edits(
+                checkout=checkout,
+                clone_cache=clone_cache,
+                raw_edits=raw_edits,
+                emit=_emit,
+                report=outcome,
+            )
+            outcome["prepared"] = edit_feedback is None
+        if not patch:
+            # The correction budget ran out on edits that never applied. Fail
+            # loudly, the way an unappliable patch does — a silent "no fix was
+            # proposed" would take this whole failure mode out of the error
+            # counts that made it visible in the first place.
+            error = TaskError(
+                "the proposed edits did not apply: "
+                f"{outcome.get('edits_error') or 'no anchor matched'}",
+                status_code=422,
+            )
+            error.session = session_record(metrics)
+            raise error
 
     # If validation never accepted a prepared worktree (retries exhausted, or
     # normalize not configured), make sure the worktree is clean so

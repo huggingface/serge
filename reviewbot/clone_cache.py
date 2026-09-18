@@ -582,11 +582,76 @@ class CloneCache:
                         )
                     return
                 last_stderr = proc.stderr.decode("utf-8", errors="replace")
+            # Both attempts failed. Without -v, git apply reports only "patch
+            # failed: <file>:<line>", which names the hunk but not what went
+            # wrong with it — and that terse line is the whole of what the
+            # correction turn used to be told, so the model could only guess at
+            # the context it had got wrong (three prod tasks on 2026-09-16/17
+            # each re-guessed three times and never converged). `-v` adds the
+            # "error: while searching for:" block with the exact lines git
+            # looked for, which is the one thing that identifies the mismatch.
+            # --check so this is a diagnosis, not a fourth apply attempt.
+            verbose = self._git(
+                checkout.path,
+                "apply",
+                "--check",
+                "-v",
+                "--whitespace=fix",
+                "--recount",
+                patch_path,
+                timeout=120,
+                check=False,
+            )
+            detail = verbose.stderr.decode("utf-8", errors="replace")
+            if "while searching for" in detail:
+                last_stderr = detail
             raise subprocess.CalledProcessError(
                 1, ["git", "apply"], stderr=last_stderr.encode()
             )
         finally:
             os.unlink(patch_path)
+
+    def stage_paths(self, checkout: Checkout, paths: list[str]) -> None:
+        """Stage exactly ``paths`` (``git add -- <paths>``).
+
+        :meth:`apply_patch` stages what it applies (``--index``); the anchored-edit
+        applier (``tasks._apply_anchored_edits``) writes files directly, so it
+        stages them here to leave the index in the same state either format would
+        have left it."""
+        if not paths:
+            return
+        self._git(checkout.path, "add", "--", *paths, timeout=120)
+
+    def staged_diff(self, checkout: Checkout) -> str:
+        """The staged worktree as a unified diff against HEAD.
+
+        Used to turn a set of anchored edits into the ``patch`` everything
+        downstream already speaks — ``commit_scope.patch_paths``,
+        ``expectation_guard.classify_patch``, the brevity pass's line numbers,
+        and ``publish_task``'s own apply path. Git writes it, so its geometry is
+        correct by construction: the format the model answers in stops at
+        :func:`tasks.prepare_task`."""
+        # This diff is re-applied (`publish_task`) and re-parsed
+        # (`commit_scope.patch_paths`, `expectation_guard.classify_patch`), so
+        # it has to be plain git output. `GIT_CONFIG_NOSYSTEM` does not cover
+        # `~/.gitconfig`, where a `diff.noprefix`, `diff.mnemonicPrefix`,
+        # external-diff or textconv setting would silently change the shape of
+        # every diff this produces.
+        proc = self._git(
+            checkout.path,
+            "-c",
+            "diff.noprefix=false",
+            "-c",
+            "diff.mnemonicPrefix=false",
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "HEAD",
+            timeout=120,
+        )
+        return proc.stdout.decode("utf-8", errors="replace")
 
     def reset_worktree(self, checkout: Checkout) -> None:
         """Discard all worktree changes, restoring it to its HEAD commit.
