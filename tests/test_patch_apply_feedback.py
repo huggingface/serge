@@ -156,6 +156,34 @@ def test_an_apply_rejection_is_reported_as_such(monkeypatch, tmp_path):
     assert "     1\treal" in feedback, "the real file content must be in the feedback"
 
 
+def test_a_rejected_diff_is_asked_to_come_back_as_edits(tmp_path):
+    """The correction turn asks for the format that does not have to be
+    transcribed. A diff's geometry is what it just got wrong, and the windows
+    above it are exactly the anchors an edit needs."""
+    (tmp_path / "f.py").write_text("real\n")
+
+    class _CC:
+        def reset_worktree(self, checkout):
+            pass
+
+        def apply_patch(self, checkout, patch):
+            raise subprocess.CalledProcessError(
+                1, ["git", "apply"], stderr=b"error: patch failed: f.py:1"
+            )
+
+    feedback, _ = tasks._validate_patch(
+        _cfg(),
+        checkout=types.SimpleNamespace(path=str(tmp_path)),
+        clone_cache=_CC(),
+        content='{"title": "t", "body": "b", "patch": "diff --git a/f.py b/f.py\\n'
+        '--- a/f.py\\n+++ b/f.py\\n@@ -1,1 +1,1 @@\\n-wrong\\n+fixed\\n"}',
+        emit=lambda *a: None,
+    )
+    assert "as `edits`" in feedback
+    assert "occurring exactly once" in feedback
+    assert "empty `edits` list" in feedback
+
+
 def test_no_patch_to_validate_reports_no_rejection():
     report: dict = {}
     feedback, prepared = tasks._validate_patch(

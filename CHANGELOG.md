@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A task can answer with anchored edits instead of a unified diff.** A diff
+  asks the model for three things at once — what to change, the surrounding
+  context byte for byte, and the `@@` geometry that has to agree with it — and
+  two of the three are bookkeeping it got wrong: `zamba` lost on one trailing
+  comma inside a 40-element tensor it had to re-type, `qwen3_omni_moe` on a hunk
+  count that did not match its own hunk body. An anchored edit is
+  `{"path", "old", "new"}`, where `old` must occur **exactly once**. Measured on
+  the same two real rejections through the prod router, asking for edits instead
+  of a diff got 3 of 4 `zamba` edits and 2 of 2 `pvt_v2` edits exactly right, and
+  on one run the model correctly returned an EMPTY list rather than invent an
+  anchor for a line it could not find. serge applies the edits itself and has
+  **git** write the diff, so `plan.patch` is git's and nothing downstream —
+  `publish_task`, `commit_scope`, `classify_patch`, the brevity pass, the GPU
+  verify gate — learns that the format exists. `patch` stays for what anchors
+  cannot express (a new file, a deletion, a rename). Exactly-once or refuse:
+  there is no fuzz and no nearest-match, so an ambiguous anchor is a rejection
+  and never a silent edit in the wrong place — and the rejection says which
+  ("`old` does not occur", "occurs 3 times at lines …"), quoting the line that is
+  really there when the anchor is a near-miss, where `git apply`'s "patch does
+  not apply" could say none of that. Edits that never applied still fail the
+  task, rather than becoming a quiet "no fix proposed" that would take this whole
+  failure mode out of the error counts.
+
 ### Fixed
 
 - **A rejected patch now gets a correction turn that can see the file.** Three

@@ -27,6 +27,22 @@ class TaskSystemPromptTests(unittest.TestCase):
         self.assertIn("ROOT CAUSE", prompt)
         self.assertIn("LAST RESORT", prompt)
 
+    def test_asks_for_anchored_edits_and_says_where_old_comes_from(self) -> None:
+        """The rule that does the work is not the schema, it is where `old`
+        comes from. Measured on the real rejections, the wording that produced a
+        correct anchor (and, once, an honest empty list) was "copy it from the
+        file, never from memory" plus "occurs exactly once"."""
+        prompt = build_task_system_prompt("", None, tools_enabled=True)
+        self.assertIn('"edits"', prompt)
+        self.assertIn("character-for-character", prompt)
+        self.assertIn("NEVER from memory", prompt)
+        self.assertIn("EXACTLY ONCE", prompt)
+        # The decline has to be spelled out, or the model invents an anchor
+        # rather than admit the line it wants is not there.
+        self.assertIn("rather than inventing an anchor", prompt)
+        # `patch` stays, for what anchored edits cannot express.
+        self.assertIn("a new file, a deleted file, a rename", prompt)
+
     def test_handles_missing_conventions(self) -> None:
         prompt = build_task_system_prompt("", None, tools_enabled=True)
         self.assertIn("no repository conventions file was found", prompt)
