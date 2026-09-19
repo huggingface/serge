@@ -116,6 +116,10 @@ PERSIST_EVENT_KINDS = frozenset(
         "normalize_error",
         "patch_apply_error",
         "rejected_patch",
+        # The GPU gates' per-node-id outcomes (verify.verdict_summary). Small,
+        # bounded by the failure group's test count, and the only record of
+        # which individual tests went red->green once the run URL ages out.
+        "verify_result",
     }
 )
 

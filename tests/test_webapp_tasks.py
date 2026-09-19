@@ -6,6 +6,7 @@ queued."""
 
 import contextlib
 import importlib
+import json
 import os
 import shutil
 import sys
@@ -1495,6 +1496,76 @@ class TaskLauncherTests(unittest.TestCase):
                 ("normalize_error", "Normalizer failed:\nactual error"),
             ],
         )
+
+    def test_a_real_instruction_is_stored_whole(self):
+        """A dispatched brief is ~7,200 chars and used to be cut at 4,000.
+
+        The model still got the whole thing — only the job row, and therefore
+        the task page, showed a little over half of it, ending mid-sentence with
+        nothing to say it had been cut.
+        """
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        instruction = "Fix the failing tests. " * 320  # ~7,360 chars
+        self.assertGreater(len(instruction), 4000)
+        self.assertEqual(webapp._stored_instruction(instruction), instruction)
+
+    def test_an_oversized_instruction_says_it_was_cut(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        stored = webapp._stored_instruction("x" * 50_000)
+        self.assertTrue(stored.startswith("x" * 100))
+        self.assertIn("instruction truncated", stored)
+
+    def test_task_info_carries_the_derived_report(self):
+        """/info ships the steps/tools/sections the page renders.
+
+        The page must not have to re-derive them in a <script> block: these are
+        parsers over serge's own event vocabulary, and one that lives in the
+        HTML is one nothing tests.
+        """
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        job = self._make_job(webapp, status="published")
+        job.trigger_comment = (
+            "Fix the failing tests.\n"
+            "\u2500\u2500 This group's failure mode: `output_mismatch` \u2500\u2500\n"
+            "The assertion failed."
+        )
+        job.session = {"turns": 3, "stop_reason": "repeat_guard"}
+        webapp._push_event(job, "step", "llm")
+        webapp._push_event(
+            job, "chat", json.dumps({"role": "tool", "name": "grep", "content": "hit"})
+        )
+        webapp._push_event(
+            job, "metrics", json.dumps({"in": 1200, "out": 34, "turns": 3, "tools": 1})
+        )
+        client = TestClient(webapp.app)
+
+        data = client.get("/tasks/acme/widgets/job123abc456/info").json()
+
+        self.assertEqual([s["key"] for s in data["steps"]], ["llm"])
+        self.assertEqual(data["steps"][0]["tokens_in"], 1200)
+        self.assertEqual(
+            data["tools"],
+            [
+                {
+                    "name": "grep",
+                    "calls": 0,
+                    "chars_in": 0,
+                    "chars_out": 3,
+                    "est_tokens_in": 0,
+                    "est_tokens_out": 0,
+                }
+            ],
+        )
+        self.assertEqual(
+            [s["primary"] for s in data["instruction_sections"]], [False, True]
+        )
+        self.assertEqual(data["session"]["stop_reason"], "repeat_guard")
 
     def test_ingest_terminal_records_outcome(self):
         if TestClient is None:

@@ -476,12 +476,48 @@ def _dispatch_poll_fetch(
             run_url=run_url,
             detail="no verify-result artifact before fetch deadline",
         )
-    return VerifyOutcome(
+    outcome = VerifyOutcome(
         verdict=result.get("verdict", NO_RESULT),
         run_url=run_url,
         result=result,
         tracebacks=result.get("tracebacks") or {},
     )
+    if emit is not None:
+        emit("verify_result", json.dumps(verdict_summary(outcome)))
+    return outcome
+
+
+def verdict_summary(outcome: VerifyOutcome) -> dict[str, Any]:
+    """The per-test half of a verdict artifact, small enough to keep in the job
+    row for ever.
+
+    The artifact already says, node-id by node-id, what each targeted test did
+    on the baseline tree and on the candidate — the one thing anyone reading a
+    task afterwards actually wants — and until this was emitted it was thrown
+    away the moment the gate returned, leaving the history with a single
+    group-level "fixed ✓". Tracebacks are deliberately NOT included: they are
+    already fed to the model and can run to tens of kilobytes each, and the job
+    store keeps this row for the life of the job.
+    """
+    result = outcome.result or {}
+    targeted = [
+        {
+            "nodeid": entry.get("nodeid"),
+            "baseline": entry.get("baseline"),
+            "patched": entry.get("patched"),
+        }
+        for entry in (result.get("targeted") or [])
+        if isinstance(entry, dict)
+    ]
+    return {
+        "mode": result.get("mode") or "",
+        "verdict": outcome.verdict,
+        "runs": result.get("runs"),
+        "machine_type": result.get("machine_type") or "",
+        "run_url": outcome.run_url,
+        "targeted": targeted,
+        "collateral_new_failures": result.get("collateral_new_failures") or [],
+    }
 
 
 def _fetch_verdict(

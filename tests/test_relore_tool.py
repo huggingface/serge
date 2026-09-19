@@ -16,8 +16,10 @@ Three things are worth a test here and the rest is plumbing:
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -670,3 +672,156 @@ class TestCompetingPRNote:
     def test_a_draft_competitor_is_labelled(self):
         note = competing_pr_note([CompetingPR(1, "t", "a", "u", True, 2)])
         assert "(draft)" in note
+
+
+# -- deterministic prior-art lookup ----------------------------------------
+
+
+class TestFailureSearchQueries:
+    """`<model> <test function>` — the shape, chosen by measurement.
+
+    Against the production index on task 824a0f5c's real nemotron failure,
+    `--test <node-id>` returned 0 hits and `--error AssertionError` returned
+    three copies of one unrelated PR, while this shape returned #37665,
+    "[tests] fix `test_nemotron_8b_generation_sdpa`" — the previous fix for the
+    same test. If this ever stops being the shape, that measurement is the thing
+    to redo.
+    """
+
+    def test_model_and_test_function(self):
+        assert relore_tool.failure_search_queries(
+            [
+                "tests/models/nemotron/test_modeling_nemotron.py"
+                "::NemotronIntegrationTest::test_model_8b_generation"
+            ]
+        ) == ["nemotron test_model_8b_generation"]
+
+    def test_parametrisation_is_dropped(self):
+        # `[fp16-cuda]` is a run axis, not a word anyone writes in an issue.
+        assert relore_tool.failure_search_queries(
+            ["tests/models/gemma/test_modeling_gemma.py::T::test_generate[fp16-cuda]"]
+        ) == ["gemma test_generate"]
+
+    def test_a_test_outside_tests_models_still_gets_a_query(self):
+        assert relore_tool.failure_search_queries(
+            ["tests/generation/test_utils.py::GenerationIntegrationTests::test_beam"]
+        ) == ["test_beam"]
+
+    def test_duplicates_and_junk_are_dropped_and_the_list_is_capped(self):
+        node_ids = ["", "not-a-node-id"] + [
+            f"tests/models/whisper/test_modeling_whisper.py::T::test_{i}"
+            for i in range(10)
+        ]
+        # Same-group tests are near-duplicates of each other past the first few.
+        queries = relore_tool.failure_search_queries(node_ids)
+        assert len(queries) == relore_tool.MAX_PRIOR_ART_QUERIES
+        assert queries[0] == "whisper test_0"
+
+
+class _FakeRun:
+    """Captures argv and replays canned `relore --json` payloads in order."""
+
+    def __init__(self, payloads):
+        self.payloads = list(payloads)
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(argv)
+        payload = self.payloads.pop(0) if self.payloads else {}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+
+def _hit(number, **kw):
+    base = {
+        "number": number,
+        "type": "pr",
+        "title": f"fix thing {number}",
+        "url": f"https://github.com/huggingface/transformers/pull/{number}",
+        "author": "someone",
+        "trust": "reported",
+        "age": "16mo",
+        "snippet": "a GitHub user wrote this",
+    }
+    base.update(kw)
+    return base
+
+
+class TestPriorArt:
+    ENV = relore_tool.ReloreEnv(repo="huggingface/transformers", api="https://x")
+    NODE_ID = "tests/models/nemotron/test_modeling_nemotron.py::T::test_model_8b"
+
+    def test_it_searches_the_failure_slice_scoped_to_the_repo(self, monkeypatch):
+        run = _FakeRun([{"hits": [_hit(37665)]}])
+        monkeypatch.setattr(relore_tool.subprocess, "run", run)
+
+        threads, queries = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+
+        assert queries == ["nemotron test_model_8b"]
+        assert [t.number for t in threads] == [37665]
+        argv = run.calls[0]
+        assert argv[argv.index("--kind") + 1] == "failure"
+        # --repo is serge's own fact, never the model's: a daemon serving
+        # several repositories must not be left to guess.
+        assert argv[argv.index("--repo") + 1] == "huggingface/transformers"
+
+    def test_the_same_thread_found_twice_is_listed_once(self, monkeypatch):
+        monkeypatch.setattr(
+            relore_tool.subprocess,
+            "run",
+            _FakeRun([{"hits": [_hit(37665)]}, {"hits": [_hit(37665), _hit(40000)]}]),
+        )
+        threads, _ = relore_tool.prior_art(
+            self.ENV,
+            node_ids=[
+                self.NODE_ID,
+                "tests/models/gemma/test_modeling_gemma.py::T::test_other",
+            ],
+        )
+        assert [t.number for t in threads] == [37665, 40000]
+
+    def test_a_relore_that_is_down_costs_the_task_nothing(self, monkeypatch):
+        def boom(*a, **kw):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(relore_tool.subprocess, "run", boom)
+        threads, queries = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        # The queries are still reported: "serge looked and found nothing" and
+        # "serge never looked" have to stay distinguishable in the prompt.
+        assert threads == []
+        assert queries == ["nemotron test_model_8b"]
+
+    def test_no_node_ids_means_no_search(self, monkeypatch):
+        monkeypatch.setattr(relore_tool.subprocess, "run", _FakeRun([]))
+        assert relore_tool.prior_art(self.ENV, node_ids=[]) == ([], [])
+
+
+class TestPriorArtNote:
+    def test_no_search_ran_produces_no_block(self):
+        assert relore_tool.prior_art_note([], queries=[]) == ""
+
+    def test_a_search_that_found_nothing_still_says_so(self):
+        # Otherwise the model spends a turn re-running the search serge just ran.
+        note = relore_tool.prior_art_note([], queries=["nemotron test_x"])
+        assert "found nothing" in note
+        assert "nemotron test_x" in note
+        assert "re-running" in note
+
+    def test_the_note_carries_metadata_only(self, monkeypatch):
+        """No snippet, by design.
+
+        A snippet is text a GitHub user wrote, and relore wraps those in an
+        untrusted-content envelope that serge must relay verbatim. Quoting one
+        into a trusted prompt block is precisely what that rule forbids, so the
+        note points at `history_thread` and lets the model fetch it intact.
+        """
+        monkeypatch.setattr(
+            relore_tool.subprocess, "run", _FakeRun([{"hits": [_hit(37665)]}])
+        )
+        threads, queries = relore_tool.prior_art(
+            relore_tool.ReloreEnv(repo="huggingface/transformers", api="https://x"),
+            node_ids=["tests/models/nemotron/test_modeling_nemotron.py::T::test_a"],
+        )
+        note = relore_tool.prior_art_note(threads, queries=queries)
+        assert "#37665" in note
+        assert "history_thread" in note
+        assert "a GitHub user wrote this" not in note

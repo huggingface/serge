@@ -669,3 +669,78 @@ ol.help-steps > li h3 { margin: 0 0 8px; font-size: 1rem; }
 ol.help-steps > li p { margin: 6px 0; }
 ol.help-steps > li ul { margin: 6px 0 6px 18px; padding: 0; }
 ol.help-steps > li ul li { margin-bottom: 4px; }
+
+/* ── task page: steps, tool use, task text ─────────────────────────────
+   The task page used to be an instruction paragraph and a console. These
+   three blocks are what let a run be read without scrolling the console:
+   the phases it went through, what the tools cost, and the task text with
+   its generated structure intact. */
+
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.chip {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: 2px 10px; font-size: 0.8rem; background: var(--bg);
+}
+.chip-k { color: var(--muted); }
+.chip-v { font-variant-numeric: tabular-nums; }
+.chip.chip-ok { border-color: #34d399; }
+.chip.chip-warn { border-color: #fbbf24; }
+
+ol.steps { list-style: none; margin: 0; padding: 0; }
+li.step { display: flex; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); }
+li.step:first-child { border-top: none; }
+.step-mark {
+  flex: 0 0 1.4rem; height: 1.4rem; line-height: 1.4rem; text-align: center;
+  border-radius: 50%; font-size: 0.8rem; font-weight: 700;
+  background: var(--border); color: var(--muted);
+}
+.step-ok .step-mark { background: #34d399; color: #064e3b; }
+.step-failed .step-mark { background: var(--danger); color: white; }
+.step-warn .step-mark { background: #fbbf24; color: #78350f; }
+.step-running .step-mark { background: #93c5fd; color: #1e3a8a; }
+.step-body { flex: 1 1 auto; min-width: 0; }
+.step-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.step-meta { color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+ul.step-lines {
+  margin: 4px 0 0; padding-left: 18px;
+  font-size: 0.85rem; color: var(--muted);
+}
+ul.step-lines li { margin: 2px 0; overflow-wrap: anywhere; }
+ul.step-lines code {
+  /* A normalize command is a whole shell script; keep it to one line here and
+     let the Live stream serve the full text. */
+  display: inline-block; max-width: 100%; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
+}
+
+table.test-table, table.tool-table {
+  width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.85rem;
+}
+table.test-table th, table.tool-table th {
+  text-align: left; color: var(--muted); font-weight: 500;
+  border-bottom: 1px solid var(--border); padding: 4px 8px 4px 0;
+}
+table.test-table td, table.tool-table td {
+  padding: 4px 8px 4px 0; border-bottom: 1px solid var(--border);
+}
+table.tool-table .n { text-align: right; font-variant-numeric: tabular-nums; }
+table.tool-table th.n { text-align: right; }
+table.tool-table tr.total td { font-weight: 600; border-bottom: none; }
+table.test-table td.nodeid { overflow-wrap: anywhere; }
+table.test-table td.outcome.ok { color: #059669; }
+table.test-table td.outcome.bad { color: var(--danger); }
+.muted { color: var(--muted); }
+
+.instruction { font-size: 0.9rem; }
+.instruction h3 { font-size: 0.9rem; margin: 16px 0 4px; }
+.instruction p { margin: 6px 0; }
+.instruction ul { margin: 6px 0; padding-left: 20px; }
+.instruction code {
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 3px; padding: 0 3px; font-size: 0.85em;
+}
+.instruction details.standing { margin-top: 16px; }
+.instruction details.standing > summary {
+  cursor: pointer; color: var(--muted); font-size: 0.85rem;
+}

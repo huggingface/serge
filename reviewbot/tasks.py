@@ -37,6 +37,8 @@ from .github_client import SERGE_GIT_EMAIL, GitHubClient
 from .llm_client import ChatCompletionClient
 from .normalize import NormalizeError, run_normalize
 from .prompts import build_task_system_prompt, build_task_user_prompt
+from .relore_tool import prior_art, prior_art_note
+from .tools import ToolEnv
 from .reviewer import (
     _extract_json,
     _format_aggregated_metrics,
@@ -1297,6 +1299,65 @@ def prompt_prefix_summary(
     )
 
 
+def _failing_node_ids(req: TaskRequest) -> list[str]:
+    """The node-ids this task is about, best source first.
+
+    ``test_links`` is the dispatcher's own structured list and needs no parsing;
+    the failure report is the fallback for a task dispatched without one.
+    """
+    from_links = [n for n in (req.test_links or {}) if n and "::" in n]
+    if from_links:
+        return from_links
+    node_ids, _model, _machine = extract_verify_targets(
+        (req.context or "").splitlines(), ""
+    )
+    return node_ids
+
+
+def _prior_art_note(
+    req: TaskRequest,
+    tool_env: Optional[ToolEnv],
+    emit: Callable[[str, str], None],
+) -> str:
+    """Search the project history for the failing tests BEFORE the first turn.
+
+    The agent is told to do this itself and, measured over the whole store,
+    does not — see the note above :func:`relore_tool.prior_art`. A lookup worth
+    having on every task cannot depend on the model choosing to make it, and
+    "before diagnosing" is precisely the ordering an instruction cannot buy.
+
+    Fail-soft and non-gating throughout: a relore that is down, slow or
+    unindexed costs this task nothing but the empty string.
+    """
+    if tool_env is None or tool_env.relore is None:
+        return ""
+    node_ids = _failing_node_ids(req)
+    if not node_ids:
+        return ""
+    try:
+        threads, queries = prior_art(tool_env.relore, node_ids=node_ids)
+    except Exception:
+        log.debug("prior-art lookup failed; continuing", exc_info=True)
+        return ""
+    if not queries:
+        return ""
+    if threads:
+        emit(
+            "log",
+            "Project history: "
+            + ", ".join(f"#{t.number}" for t in threads)
+            + f" already discuss these tests (searched {len(queries)} query/ies)",
+        )
+    else:
+        emit(
+            "log",
+            f"Project history: no earlier thread matched "
+            f"({', '.join(queries)}); the model is told so, so it does not "
+            "re-run the search.",
+        )
+    return prior_art_note(threads, queries=queries)
+
+
 def prepare_task(
     cfg: Config,
     req: TaskRequest,
@@ -1342,12 +1403,14 @@ def prepare_task(
         tools_enabled=tool_env is not None,
         history_tools=tool_env is not None and tool_env.relore is not None,
     )
+    history_note = _prior_art_note(req, tool_env, _emit)
     user_prompt = build_task_user_prompt(
         repo_full_name=req.repo_full_name,
         base_ref=req.base_ref,
         instruction=req.instruction,
         context=req.context,
         existing_diff=existing_diff,
+        history_note=history_note,
     )
 
     # This prefix is resent on EVERY turn, so log its breakdown once per task —

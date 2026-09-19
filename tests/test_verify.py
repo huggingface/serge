@@ -499,3 +499,78 @@ def test_the_gate_passes_the_computed_collateral_flag_not_the_config_one():
     assert "patch_needs_collateral(" in src
     assert "run_collateral=collateral" in src
     assert "run_collateral=cfg.verify_run_collateral" not in src
+
+
+def test_verdict_summary_is_emitted_with_the_per_test_outcomes():
+    """The gate's node-id-by-node-id result reaches the job history.
+
+    Until this event existed the artifact was read, used to decide the verdict,
+    and then dropped — so a task page could say "GPU verify: fixed ✓" and had no
+    way to say which tests that covered or what they did before the patch. The
+    run URL answers it for a fortnight; the job row has to answer it for ever.
+    """
+    events = []
+    gh = FakeGH(
+        runs=[
+            {
+                "id": 5,
+                "name": "serge verify whisper [corr-123]",
+                "status": "completed",
+                "html_url": "u",
+            }
+        ],
+        artifacts=[{"id": 9, "name": "serge-verify-result-aws-g5-12xlarge-cache"}],
+        zip_bytes=_zip_with(
+            {
+                "mode": "verify",
+                "verdict": "fixed",
+                "runs": 5,
+                "machine_type": "aws-g5-12xlarge-cache",
+                "targeted": [
+                    {
+                        "nodeid": "tests/a.py::t",
+                        "baseline": "failed",
+                        "patched": "green",
+                    }
+                ],
+                "collateral_new_failures": [],
+                # Big, already in the prompt, and not worth keeping for ever.
+                "tracebacks": {"tests/a.py::t": "E   AssertionError\n" * 500},
+            }
+        ),
+    )
+    out = _run(gh, emit=lambda kind, text: events.append((kind, text)))
+
+    assert out.is_fixed
+    (kind, text) = next(e for e in events if e[0] == "verify_result")
+    payload = json.loads(text)
+    assert payload["verdict"] == "fixed"
+    assert payload["runs"] == 5
+    assert payload["run_url"] == "u"
+    assert payload["targeted"] == [
+        {"nodeid": "tests/a.py::t", "baseline": "failed", "patched": "green"}
+    ]
+    assert "tracebacks" not in payload
+
+
+def test_verdict_summary_not_emitted_when_no_artifact_came_back():
+    """A gate that never adjudicated must publish no per-test table.
+
+    An empty `targeted` list rendered as a table reads as "no tests ran and that
+    was fine", which is the opposite of what no_result means.
+    """
+    events = []
+    gh = FakeGH(
+        runs=[
+            {"id": 5, "name": "serge verify whisper [corr-123]", "status": "completed"}
+        ],
+        artifacts=[],
+        zip_bytes=b"",
+    )
+    out = _run(
+        gh,
+        emit=lambda kind, text: events.append((kind, text)),
+        monotonic=Clock([0, 0, 0, 10_000]),
+    )
+    assert out.verdict == verify.NO_RESULT
+    assert not [e for e in events if e[0] == "verify_result"]
