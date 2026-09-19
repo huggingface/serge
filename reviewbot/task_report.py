@@ -52,6 +52,9 @@ _STEP_PHASES: dict[str, tuple[str, str]] = {
     "launch": ("launch", "Launch runner"),
     "clone": ("clone", "Checkout"),
     "preflight": ("preflight", "Preflight"),
+    # Emitted by tasks._prior_art_note: serge's own history lookup, which runs
+    # between the reproduce gate and the first turn.
+    "history": ("history", "Project history"),
     "llm": ("llm", "Agent loop"),
     "apply": ("apply", "Apply patch"),
     "normalize": ("normalize", "Normalize"),
@@ -63,10 +66,6 @@ _STEP_PHASES: dict[str, tuple[str, str]] = {
 _LOG_PHASES: tuple[tuple[str, str, str], ...] = (
     ("GPU reproduce: dispatching", "gpu_reproduce", "GPU reproduce"),
     ("GPU verify: dispatching", "gpu_verify", "GPU verify"),
-    # Prompt assembly is emitted before the `llm` step event, so without this
-    # the two lines that say what the model was actually sent land under
-    # whichever gate happened to run before it.
-    ("Preparing task for", "llm", "Agent loop"),
     ("Opened PR", "pr", "Pull request"),
 )
 
@@ -115,6 +114,13 @@ _PHASE_RULES: dict[str, tuple[tuple[str, str], ...]] = {
         (_OK, "LLM done:"),
     ),
     "apply": ((_FAILED, "patch did not apply"),),
+    "history": (
+        (_WARN, "lookup failed"),
+        (_WARN, "relore did not answer"),
+        (_OK, "already discuss these tests"),
+        # A search that ran and matched nothing is a real answer, not a miss.
+        (_OK, "no earlier thread matched"),
+    ),
     "pr": ((_OK, "Opened PR"),),
     "done": ((_OK, "Opened PR"),),
 }
