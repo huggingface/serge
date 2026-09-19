@@ -73,7 +73,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 log = logging.getLogger(__name__)
 
@@ -829,3 +829,180 @@ def competing_pr_note(competing: list[CompetingPR]) -> str:
         lines.append(f"- #{pr.number}{draft}{who} — {pr.title} — {pr.url}")
         lines.append(f"  (both claim to close #{pr.issue})")
     return "\n".join(lines)
+
+
+# -- deterministic prior-art lookup ----------------------------------------
+#
+# Why serge runs these searches itself instead of telling the model to.
+#
+# The task system prompt already says, in order: `history_inflight` BEFORE
+# diagnosing, then `history_search` the failure. Measured over the 20 jobs in
+# the store that ran on a relore-indexed repository (2026-09-16..18), 6 called a
+# history tool at all, and the earliest any of them did was the **14th** tool
+# call — median 22nd, worst 38th. The two tasks that ended in a published PR
+# called none. 29 history calls against 877 `grep`/`read_file` calls, 3.2%.
+#
+# So the model does reach for history — but only once it is already lost, which
+# is after it has committed to a reading of the failure. "Before diagnosing" is
+# the one thing the instruction cannot buy, because by the time the model is
+# choosing tools it is already diagnosing. The review path reached the same
+# conclusion for competing PRs (see :func:`competing_open_prs`); this is the
+# same move for the failure a task is asked to fix.
+#
+# It is deliberately a small, fixed set of queries, and it does NOT replace the
+# tools: the note it produces names the searches that ran so the model does not
+# repeat them, and points at `history_thread` for anything it wants to read.
+
+# Node-ids to derive queries from. A failure group is usually 1-3 tests and they
+# are near-duplicates of each other; past that the queries stop being distinct.
+MAX_PRIOR_ART_QUERIES = 3
+# Hits kept across all queries. The block is a pointer list in a prompt that is
+# re-sent every turn, so it is capped hard.
+MAX_PRIOR_ART = 6
+PRIOR_ART_SEARCH_LIMIT = 4
+
+# `tests/models/<model>/test_modeling_x.py::Class::test_name[param]`
+_TEST_MODEL_RE = re.compile(r"tests/models/([^/]+)/")
+_PARAM_RE = re.compile(r"\[.*\]$")
+
+
+@dataclass(frozen=True)
+class PriorThread:
+    number: int
+    kind: str
+    title: str
+    url: str
+    author: str
+    trust: str
+    age: str
+    query: str
+
+
+def failure_search_queries(node_ids: Iterable[str]) -> list[str]:
+    """Search queries for a failure group's node-ids, best-first, deduped.
+
+    The shape is `<model> <test function>` and it was chosen by measuring, not
+    by taste. On the real nemotron failure of task 824a0f5c, against the
+    production index:
+
+    * `--test <exact node-id>`      -> 0 hits (the extraction indexes what
+      threads mention, and nobody quotes a full node-id)
+    * `--error AssertionError`      -> 3 hits, all the same unrelated PR
+    * `nemotron test_model_8b_generation` -> #37665 "[tests] fix
+      `test_nemotron_8b_generation_sdpa`" — the previous fix for that very test
+
+    which is also what relore's own tool description asks for: two or three
+    distinctive terms, never a sentence.
+    """
+    queries: list[str] = []
+    for node_id in node_ids:
+        if not node_id or "::" not in node_id:
+            continue
+        func = _PARAM_RE.sub("", node_id.rsplit("::", 1)[1]).strip()
+        if not func:
+            continue
+        model = _TEST_MODEL_RE.search(node_id)
+        query = f"{model.group(1)} {func}" if model else func
+        if query not in queries:
+            queries.append(query)
+        if len(queries) >= MAX_PRIOR_ART_QUERIES:
+            break
+    return queries
+
+
+def prior_art(
+    env: ReloreEnv, *, node_ids: Iterable[str]
+) -> tuple[list[PriorThread], list[str]]:
+    """Threads this repository already has about the failing tests.
+
+    Returns the hits and the queries that were run — the caller reports both,
+    because "serge looked and found nothing" and "serge never looked" have to
+    be distinguishable in the prompt or the model will just search again.
+
+    ``kind="failure"`` throughout: §6.2's failure slice is the one the benchmark
+    scores 1.000 on, and a task is by definition asking about a failure. Empty
+    on every error path; this is context for a task, never a gate.
+    """
+    queries = failure_search_queries(node_ids)
+    found: list[PriorThread] = []
+    seen: set[int] = set()
+    for query in queries:
+        payload = _relore_json(
+            env,
+            [
+                "search",
+                query,
+                "--kind",
+                "failure",
+                "--limit",
+                str(PRIOR_ART_SEARCH_LIMIT),
+                "--repo",
+                env.repo,
+            ],
+        )
+        if not payload:
+            continue
+        for raw in payload.get("hits") or []:
+            if not isinstance(raw, dict):
+                continue
+            number = raw.get("number")
+            if not isinstance(number, int) or number in seen:
+                continue
+            seen.add(number)
+            found.append(
+                PriorThread(
+                    number=number,
+                    kind=str(raw.get("type") or "thread"),
+                    title=str(raw.get("title") or ""),
+                    url=str(raw.get("url") or ""),
+                    author=str(raw.get("author") or ""),
+                    trust=str(raw.get("trust") or ""),
+                    age=str(raw.get("age") or ""),
+                    query=query,
+                )
+            )
+            if len(found) >= MAX_PRIOR_ART:
+                return found, queries
+    return found, queries
+
+
+def prior_art_note(threads: list[PriorThread], *, queries: list[str]) -> str:
+    """The task-side note, or ``""`` when no search ran at all.
+
+    Carries thread *metadata* only — number, kind, title, author, age, url — and
+    no snippet. That is what keeps this block trusted context like
+    :func:`competing_pr_note`: a snippet is text a GitHub user wrote, and relore
+    wraps those in an untrusted-content envelope that must be relayed verbatim
+    (see :func:`run_relore_tool`). Re-wrapping it here to fit a prompt block is
+    exactly what that rule forbids, so the note points at `history_thread`
+    instead and lets the model fetch the envelope intact.
+    """
+    if not queries:
+        return ""
+    ran = "; ".join(f"`{q}`" for q in queries)
+    if not threads:
+        return (
+            "\n── PROJECT HISTORY (serge already searched — trusted) ──\n"
+            f"relore was asked what this repository has said about these failing "
+            f"tests ({ran}, kind=failure) and found nothing. Do not spend a turn "
+            "re-running those searches. `history_search` on different terms — the "
+            "exception text, a symbol from the traceback — may still pay off.\n"
+        )
+    lines = [
+        "\n── PROJECT HISTORY (serge already searched — trusted) ──",
+        f"relore searched this repository's issue and pull-request history for "
+        f"these failing tests ({ran}, kind=failure) before you were asked "
+        f"anything. {len(threads)} earlier thread(s) matched:",
+    ]
+    for t in threads:
+        who = f" by @{t.author}" if t.author else ""
+        meta = ", ".join(x for x in (t.trust, t.age) if x)
+        lines.append(f"- #{t.number} {t.kind}{who} ({meta}) — {t.title}")
+        lines.append(f"  {t.url}")
+    lines.append(
+        "These are pointers, not evidence: a title is not a decision. Read one "
+        "with `history_thread <number>` before you rely on it, and cite it in "
+        "`body` if it settles anything. Those searches have already run — spend "
+        "your `history_search` calls on different terms."
+    )
+    return "\n".join(lines) + "\n"

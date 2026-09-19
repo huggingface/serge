@@ -7,8 +7,11 @@ import os
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from reviewbot import relore_tool
+from reviewbot import tasks as tasks_module
 from reviewbot.clone_cache import Checkout, CloneCache
 from reviewbot.config import Config
 from reviewbot.github_client import SERGE_GIT_EMAIL
@@ -1897,3 +1900,90 @@ class PromptPrefixSummaryTests(unittest.TestCase):
     def test_total_is_system_plus_user(self) -> None:
         line = prompt_prefix_summary(system_prompt="a" * 10, user_prompt="b" * 5)
         self.assertIn("Prompt prefix 15 chars", line)
+
+
+class PriorArtStepTests(unittest.TestCase):
+    """The pre-loop project-history lookup.
+
+    Why it exists at all: across the 20 jobs in the production store that ran on
+    a relore-indexed repository (2026-09-16..18), 6 called a history tool, and
+    the earliest any of them did was the 14th tool call — median 22nd. The two
+    tasks that ended in a published PR called none. The system prompt has said
+    "BEFORE diagnosing" throughout. An instruction cannot buy that ordering,
+    because by the time the model is picking tools it is already diagnosing.
+    """
+
+    NODE_ID = "tests/models/nemotron/test_modeling_nemotron.py::T::test_model_8b"
+
+    def _req(self, **kw):
+        base = dict(
+            owner="huggingface",
+            repo="transformers",
+            base_ref="main",
+            instruction="fix it",
+            context="",
+        )
+        base.update(kw)
+        return TaskRequest(**base)
+
+    def test_node_ids_come_from_the_dispatcher_when_it_sent_them(self):
+        req = self._req(test_links={self.NODE_ID: [{"label": "run", "url": "u"}]})
+        self.assertEqual(tasks_module._failing_node_ids(req), [self.NODE_ID])
+
+    def test_otherwise_they_are_parsed_out_of_the_failure_report(self):
+        req = self._req(context=f"- `{self.NODE_ID}` [multi-gpu] (output_mismatch)")
+        self.assertEqual(tasks_module._failing_node_ids(req), [self.NODE_ID])
+
+    def test_no_relore_means_no_block_and_no_subprocess(self):
+        # Every repo relore does not index, and every deployment without
+        # RELORE_API. The task must be byte-for-byte what it was before.
+        req = self._req(test_links={self.NODE_ID: []})
+        self.assertEqual(tasks_module._prior_art_note(req, None, lambda *a: None), "")
+
+    def test_a_task_with_no_identifiable_tests_skips_the_lookup(self):
+        # A hand-dispatched task ("bump the pinned torch version") has no node
+        # ids, so there is nothing to search for and no note to add.
+        env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
+        with patch.object(tasks_module, "prior_art") as searched:
+            note = tasks_module._prior_art_note(self._req(), env, lambda *a: None)
+        self.assertEqual(note, "")
+        searched.assert_not_called()
+
+    def test_hits_reach_the_note_and_the_job_log(self):
+        env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
+        thread = relore_tool.PriorThread(
+            number=37665,
+            kind="pr",
+            title="[tests] fix test_nemotron_8b_generation_sdpa",
+            url="https://github.com/huggingface/transformers/pull/37665",
+            author="someone",
+            trust="reported",
+            age="16mo",
+            query="nemotron test_model_8b",
+        )
+        events = []
+        with patch.object(
+            tasks_module, "prior_art", return_value=([thread], ["nemotron test_x"])
+        ):
+            note = tasks_module._prior_art_note(
+                self._req(test_links={self.NODE_ID: []}),
+                env,
+                lambda kind, text: events.append((kind, text)),
+            )
+        self.assertIn("#37665", note)
+        self.assertIn(
+            (
+                "log",
+                "Project history: #37665 already discuss these tests "
+                "(searched 1 query/ies)",
+            ),
+            events,
+        )
+
+    def test_a_relore_failure_costs_the_task_nothing(self):
+        env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
+        with patch.object(tasks_module, "prior_art", side_effect=OSError("down")):
+            note = tasks_module._prior_art_note(
+                self._req(test_links={self.NODE_ID: []}), env, lambda *a: None
+            )
+        self.assertEqual(note, "")

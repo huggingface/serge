@@ -294,3 +294,64 @@ class InstructionBudgetTests(unittest.TestCase):
         prompt = self._instruction_in("x" * (MAX_INSTRUCTION_CHARS + 10) + "LOST")
         self.assertNotIn("LOST", prompt)
         self.assertIn("truncated", prompt)
+
+
+class TaskHistoryBlockTests(unittest.TestCase):
+    """The deterministic prior-art block, and where it sits in the prompt."""
+
+    def _prompt(self, history_note: str = "") -> str:
+        return build_task_user_prompt(
+            repo_full_name="huggingface/transformers",
+            base_ref="main",
+            instruction="fix it",
+            context="--- report ---",
+            history_note=history_note,
+        )
+
+    def test_absent_by_default(self) -> None:
+        # Every task on a repo relore does not index, and every deployment
+        # without RELORE_API, must get byte-for-byte the prompt it got before.
+        self.assertNotIn("PROJECT HISTORY", self._prompt())
+
+    def test_the_block_is_trusted_and_sits_outside_the_untrusted_context(self) -> None:
+        """It is thread metadata serge fetched, not text a GitHub user wrote.
+
+        Inside the UNTRUSTED CONTEXT fence the model is told to treat it as
+        data it must not act on, which is the opposite of the point: the whole
+        reason for looking these up is that the model should act on them.
+        """
+        note = "\n── PROJECT HISTORY (serge already searched — trusted) ──\n#37665\n"
+        prompt = self._prompt(note)
+        self.assertIn("PROJECT HISTORY", prompt)
+        self.assertLess(
+            prompt.index("PROJECT HISTORY"),
+            prompt.index("BEGIN UNTRUSTED CONTEXT"),
+        )
+
+    def test_the_note_is_not_scrubbed(self) -> None:
+        # _scrub_delimiters mangles the box-drawing rules the note is built
+        # from; it applies to text serge did not write, and this is serge's.
+        note = "── PROJECT HISTORY ──\n- #37665 pr (reported, 16mo) — fix the test"
+        self.assertIn("- #37665 pr (reported, 16mo) — fix the test", self._prompt(note))
+
+
+class TaskHistoryToolsSectionTests(unittest.TestCase):
+    def test_the_prompt_stops_asking_for_a_search_serge_already_ran(self) -> None:
+        """The section has to track what the code actually does.
+
+        A prompt that describes a tool the model was not given spends turns on
+        refused calls; one that asks for work already done spends them on
+        duplicates. serge now searches the failing tests itself, so step 2 is
+        "read what it found", not "go and search".
+        """
+        section = build_task_system_prompt("rules", history_tools=True)
+        self.assertIn("ALREADY been searched for you", section)
+        self.assertIn("history_thread", section)
+        # `inflight` stays the model's job: an ITF group has no issue number,
+        # so serge cannot run it on the task's behalf.
+        self.assertIn("history_inflight", section)
+
+    def test_nothing_changes_when_the_tools_are_not_offered(self) -> None:
+        section = build_task_system_prompt("rules", history_tools=False)
+        self.assertNotIn("PROJECT HISTORY", section)
+        self.assertNotIn("history_search", section)
