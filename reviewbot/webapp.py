@@ -87,6 +87,7 @@ from .reviewer import (
 from .metrics import render_job_metrics
 from .slack_tool import post_task_finished_notification
 from .store import JobStore, decode_draft
+from .task_report import build_steps, build_tool_usage, split_instruction
 from .tasks import (
     TaskError,
     TaskResult,
@@ -128,6 +129,27 @@ _STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 # encoded slashes, empty strings) can't leak through into API calls.
 _GH_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _MAX_TRIGGER_COMMENT_CHARS = 4000
+# A dispatched task's instruction is not a comment somebody typed: the nightly
+# sends a generated brief of a fixed trunk plus a per-category addendum, and the
+# real ones run to ~7,200 characters. Storing them under the comment cap cut
+# every one of them off mid-sentence and — because the task page renders this
+# field — showed the operator 55% of what the model was actually told, with
+# nothing saying so. The instruction the model receives was never affected; only
+# the record of it was. The cap stays (this is a row in the job store, not a
+# blob) but it is now clear of a real brief, and truncation announces itself.
+_MAX_TASK_INSTRUCTION_CHARS = 20000
+_TRUNCATION_NOTE = "\n\n… [instruction truncated at {cap:,} chars for display]"
+
+
+def _stored_instruction(instruction: str) -> str:
+    """The task instruction as the job row keeps it, truncation made visible."""
+    if len(instruction) <= _MAX_TASK_INSTRUCTION_CHARS:
+        return instruction
+    return instruction[:_MAX_TASK_INSTRUCTION_CHARS] + _TRUNCATION_NOTE.format(
+        cap=_MAX_TASK_INSTRUCTION_CHARS
+    )
+
+
 _LLM_PROVIDER_HF = "hf"
 _LLM_PROVIDER_OPENAI = "openai"
 _LLM_PROVIDER_ANTHROPIC = "anthropic"
@@ -3153,7 +3175,7 @@ async def submit_task(request: Request) -> JSONResponse:
         target_owner=owner,
         target_repo=repo,
         target_number=req.pr_number or 0,
-        trigger_comment=req.instruction[:_MAX_TRIGGER_COMMENT_CHARS],
+        trigger_comment=_stored_instruction(req.instruction),
         llm_provider=provider,
         llm_api_base=llm_api_base,
         llm_model=llm_model,
@@ -3912,11 +3934,15 @@ def task_page(request: Request, owner: str, repo: str, job_id: str) -> Response:
 def task_info(request: Request, owner: str, repo: str, job_id: str) -> JSONResponse:
     job = _get_task_job(request, owner, repo, job_id)
     with job.history_lock:
-        trace = [
-            {"kind": e.get("kind"), "text": e.get("text"), "ts": e.get("ts")}
-            for e in job.history
-            if e.get("kind") not in _NOISY_KINDS
-        ]
+        history = list(job.history)
+    trace = [
+        {"kind": e.get("kind"), "text": e.get("text"), "ts": e.get("ts")}
+        for e in history
+        if e.get("kind") not in _NOISY_KINDS
+    ]
+    # Derived server-side rather than in the page: these are parsers over an
+    # event vocabulary this repo owns, and a parser that lives in a <script>
+    # block is one nothing tests. See reviewbot.task_report.
     return JSONResponse(
         {
             "id": job.id,
@@ -3924,12 +3950,16 @@ def task_info(request: Request, owner: str, repo: str, job_id: str) -> JSONRespo
             "target": f"{job.target_owner}/{job.target_repo}",
             "kind": job.kind,
             "instruction": job.trigger_comment,
+            "instruction_sections": split_instruction(job.trigger_comment),
             "spec": job.task_spec,
             "result": job.task_result,
             "llm_provider": job.llm_provider,
             "llm_base_url": job.llm_api_base,
             "llm_model": job.llm_model or "",
             "error": job.error,
+            "session": job.session or None,
+            "steps": build_steps(history),
+            "tools": build_tool_usage(history),
             "trace": trace,
         }
     )

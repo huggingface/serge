@@ -31,9 +31,27 @@
     </section>
 
     <section class="card">
-      <h2 style="margin-top:0;">Task</h2>
-      <p class="hint" id="instruction"></p>
+      <h2 style="margin-top:0;">Outcome</h2>
+      <div class="chips" id="spec-chips"></div>
       <div id="result" style="display:none;"></div>
+    </section>
+
+    <section class="card">
+      <details id="task-details" open>
+        <summary><h2 style="display:inline-block; margin:0;">Task text</h2></summary>
+        <div class="instruction" id="instruction"></div>
+      </details>
+    </section>
+
+    <section class="card" id="steps-card" hidden>
+      <h2 style="margin-top:0;">Steps</h2>
+      <ol class="steps" id="steps"></ol>
+    </section>
+
+    <section class="card" id="tools-card" hidden>
+      <h2 style="margin-top:0;">Tool use</h2>
+      <table class="tool-table" id="tools"></table>
+      <p class="hint" id="tools-note"></p>
     </section>
 
     <section class="card">
@@ -53,6 +71,7 @@
     const statusEl = document.getElementById("status");
     const targetEl = document.getElementById("target");
     let renderedErrorText = null;
+    let streamCollapsed = false;
     targetEl.textContent = `${owner}/${repo}`;
 
     function append(line) {
@@ -64,6 +83,18 @@
       const value = String(status || "running");
       statusEl.textContent = value;
       statusEl.className = `status-badge ${value.replace(/[^a-z0-9_-]/gi, "-").toLowerCase()}`;
+    }
+
+    const esc = (s) => String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+    const num = (n) => Number(n || 0).toLocaleString();
+
+    function secs(s) {
+      const v = Number(s || 0);
+      if (v < 90) return `${v.toFixed(1)}s`;
+      if (v < 5400) return `${Math.round(v / 60)}m`;
+      return `${(v / 3600).toFixed(1)}h`;
     }
 
     function displayText(text) {
@@ -174,14 +205,238 @@
       panel.hidden = false;
     }
 
+    // -- task text -----------------------------------------------------------
+    // The instruction is generated prose with `backticks`, **bold** and dashed
+    // bullets. Rendering it as one paragraph (what this page used to do) makes
+    // 4,000 characters unreadable; this is the smallest renderer that restores
+    // the structure the generator put there. Everything is escaped first, so
+    // the task text — which is external input — can never inject markup.
+    function inline(text) {
+      return esc(text)
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/(https?:\/\/[^\s)]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+    }
+
+    function renderProse(text) {
+      const out = [];
+      let list = null;
+      let para = [];
+      const flushPara = () => {
+        if (para.length) out.push(`<p>${inline(para.join(" "))}</p>`);
+        para = [];
+      };
+      const flushList = () => {
+        if (list) out.push(`<ul>${list.join("")}</ul>`);
+        list = null;
+      };
+      for (const raw of String(text || "").split("\n")) {
+        const line = raw.replace(/\s+$/, "");
+        const bullet = line.match(/^\s*[-*]\s+(.*)$/);
+        if (bullet) {
+          flushPara();
+          if (!list) list = [];
+          list.push(`<li>${inline(bullet[1])}</li>`);
+          continue;
+        }
+        if (!line.trim()) { flushPara(); flushList(); continue; }
+        // A continuation line indented under a bullet belongs to that bullet.
+        if (list && /^\s{2,}/.test(raw)) {
+          list[list.length - 1] = list[list.length - 1].replace(
+            /<\/li>$/, ` ${inline(line.trim())}</li>`);
+          continue;
+        }
+        flushList();
+        para.push(line.trim());
+      }
+      flushPara();
+      flushList();
+      return out.join("");
+    }
+
+    function renderInstruction(info) {
+      const host = document.getElementById("instruction");
+      const sections = Array.isArray(info.instruction_sections) ? info.instruction_sections : [];
+      if (!sections.length) {
+        host.innerHTML = renderProse(info.instruction || "");
+        return;
+      }
+      const standing = sections.filter((s) => !s.primary);
+      const primary = sections.filter((s) => s.primary);
+      const html = [];
+      for (const s of primary) {
+        if (s.title) html.push(`<h3>${esc(s.title)}</h3>`);
+        html.push(renderProse(s.body));
+      }
+      if (standing.length) {
+        const inner = standing.map((s) =>
+          (s.title ? `<h3>${esc(s.title)}</h3>` : "") + renderProse(s.body)).join("");
+        const chars = standing.reduce((n, s) => n + (s.body || "").length, 0);
+        html.push(
+          `<details class="standing"><summary>Standing instructions — ` +
+          `identical on every task (${num(chars)} chars)</summary>${inner}</details>`);
+      }
+      host.innerHTML = html.join("");
+    }
+
+    // -- steps ---------------------------------------------------------------
+    function renderTests(tests) {
+      if (!Array.isArray(tests) || !tests.length) return "";
+      const rows = tests.map((t) => {
+        const cells = [`<td class="nodeid"><code>${esc(t.nodeid)}</code></td>`];
+        for (const key of ["baseline", "patched"]) {
+          const v = t[key];
+          if (v == null) { cells.push('<td class="muted">—</td>'); continue; }
+          const ok = v === "green";
+          cells.push(`<td class="outcome ${ok ? "ok" : "bad"}">${ok ? "✓" : "✗"} ${esc(v)}</td>`);
+        }
+        return `<tr>${cells.join("")}</tr>`;
+      });
+      return `<table class="test-table">
+        <tr><th>test</th><th>before</th><th>after</th></tr>${rows.join("")}</table>`;
+    }
+
+    const STATUS_MARK = { ok: "✓", failed: "✗", warn: "!", running: "…", info: "·" };
+
+    function renderSteps(info) {
+      const steps = Array.isArray(info.steps) ? info.steps : [];
+      const card = document.getElementById("steps-card");
+      if (!steps.length) { card.hidden = true; return; }
+      card.hidden = false;
+      const host = document.getElementById("steps");
+      host.innerHTML = steps.map((s) => {
+        const meta = [];
+        if (s.seconds != null) meta.push(secs(s.seconds));
+        if (s.turns) meta.push(`${num(s.turns)} turns`);
+        if (s.tool_calls) meta.push(`${num(s.tool_calls)} tool calls`);
+        if (s.tokens_in || s.tokens_out) {
+          meta.push(`${num(s.tokens_in)} in / ${num(s.tokens_out)} out tokens`);
+        }
+        const lines = (s.lines || []).map((l) => {
+          const first = String(l).split("\n")[0];
+          const short = first.length > 240 ? first.slice(0, 240) + "…" : first;
+          const clipped = short !== String(l);
+          return `<li${clipped ? ` title="${esc(l)}"` : ""}>${inline(short)}` +
+                 `${clipped ? '<span class="muted"> …</span>' : ""}</li>`;
+        }).join("");
+        const body = lines ? `<ul class="step-lines">${lines}</ul>` : "";
+        const link = s.run_url
+          ? ` <a href="${esc(s.run_url)}" target="_blank" rel="noopener">run ↗</a>` : "";
+        return `<li class="step step-${esc(s.status)}">
+          <span class="step-mark">${STATUS_MARK[s.status] || "·"}</span>
+          <div class="step-body">
+            <div class="step-head"><strong>${esc(s.label)}</strong>
+              <span class="step-meta">${esc(meta.join(" · "))}</span>${link}</div>
+            ${body}${renderTests(s.tests)}
+          </div></li>`;
+      }).join("");
+    }
+
+    // -- tools ---------------------------------------------------------------
+    function renderTools(info) {
+      const tools = Array.isArray(info.tools) ? info.tools : [];
+      const card = document.getElementById("tools-card");
+      if (!tools.length) { card.hidden = true; return; }
+      card.hidden = false;
+      const rows = tools.map((t) => `<tr>
+        <td><code>${esc(t.name)}</code></td>
+        <td class="n">${num(t.calls)}</td>
+        <td class="n">${num(t.est_tokens_in)}</td>
+        <td class="n">${num(t.est_tokens_out)}</td>
+        <td class="n muted">${num(t.chars_out)}</td></tr>`).join("");
+      const total = tools.reduce((a, t) => ({
+        calls: a.calls + t.calls,
+        tin: a.tin + t.est_tokens_in,
+        tout: a.tout + t.est_tokens_out,
+        chars: a.chars + t.chars_out,
+      }), { calls: 0, tin: 0, tout: 0, chars: 0 });
+      document.getElementById("tools").innerHTML = `
+        <tr><th>tool</th><th class="n">calls</th><th class="n">tokens in</th>
+            <th class="n">tokens out</th><th class="n">chars out</th></tr>
+        ${rows}
+        <tr class="total"><td>total</td><td class="n">${num(total.calls)}</td>
+          <td class="n">${num(total.tin)}</td><td class="n">${num(total.tout)}</td>
+          <td class="n muted">${num(total.chars)}</td></tr>`;
+
+      const s = info.session || {};
+      const note = [
+        "Per-tool token figures are estimated at 4 chars/token — serge does not " +
+        "ship the tokenizer of the model it is pointed at, so only the provider's " +
+        "own totals below are exact.",
+      ];
+      if (s.prompt_tokens != null) {
+        note.push(`Provider totals for the whole job: ${num(s.prompt_tokens)} in ` +
+          `(${num(s.cached_tokens)} served from cache) / ${num(s.completion_tokens)} out, ` +
+          `peak single request ${num(s.peak_prompt_tokens)}.`);
+      }
+      document.getElementById("tools-note").textContent = note.join(" ");
+    }
+
+    // -- summary chips -------------------------------------------------------
+    function renderChips(info) {
+      const s = info.session || {};
+      const spec = info.spec || {};
+      const chips = [];
+      const add = (label, value, cls) => {
+        if (value == null || value === "") return;
+        chips.push(`<span class="chip ${cls || ""}"><span class="chip-k">${esc(label)}</span>` +
+          `<span class="chip-v">${esc(value)}</span></span>`);
+      };
+      add("model", info.llm_model);
+      add("mode", spec.mode);
+      add("base", spec.base_ref);
+      if (s.stop_reason) {
+        // "answered" is the only value meaning the model finished on its own
+        // terms; every other one is a guard cutting the loop off.
+        add("stop", s.stop_reason, s.stop_reason === "answered" ? "chip-ok" : "chip-warn");
+      }
+      if (s.turns != null) add("turns", num(s.turns));
+      if (s.tool_calls != null) add("tool calls", num(s.tool_calls));
+      if (s.prompt_tokens != null) {
+        add("tokens", `${num(s.prompt_tokens)} in / ${num(s.completion_tokens)} out`);
+      }
+      if (s.seconds != null) add("llm time", secs(s.seconds));
+      document.getElementById("spec-chips").innerHTML = chips.join("");
+    }
+
+    function renderResult(info) {
+      if (!info.result) return;
+      const res = info.result;
+      const el = document.getElementById("result");
+      el.style.display = "block";
+      let html = `<p>${inline(res.message || "")}</p>`;
+      if (res.url) html += `<p><a href="${esc(res.url)}" target="_blank" rel="noopener">${esc(res.url)}</a></p>`;
+      if (res.changed_files && res.changed_files.length) {
+        html += "<p><strong>Changed files</strong></p><ul>" +
+          res.changed_files.map(f => `<li><code>${esc(f)}</code></li>`).join("") + "</ul>";
+      }
+      el.innerHTML = html;
+    }
+
+    let infoTimer = null;
+    function scheduleInfo() {
+      if (infoTimer !== null) return;
+      infoTimer = setTimeout(() => { infoTimer = null; loadInfo(); }, 1000);
+    }
+
     async function loadInfo() {
       try {
         const r = await fetch(`${apiBase}/info`);
         if (!r.ok) return;
         const info = await r.json();
         setStatus(info.status);
-        document.getElementById("instruction").textContent = info.instruction || "";
+        renderInstruction(info);
+        renderChips(info);
+        renderSteps(info);
+        renderTools(info);
         renderNormalizeSummary(info);
+        // A finished job has nothing left to tail, and its steps table says
+        // everything the console does — so fold the console away once, leaving
+        // the reader free to reopen it.
+        if (!streamCollapsed && info.status && info.status !== "running") {
+          streamCollapsed = true;
+          document.getElementById("stream-details").open = false;
+        }
         if (info.error) {
           const shown = displayText(info.error);
           const b = document.getElementById("error-banner");
@@ -193,18 +448,7 @@
             append(`[error] ${shown}`);
           }
         }
-        if (info.result) {
-          const res = info.result;
-          const el = document.getElementById("result");
-          el.style.display = "block";
-          let html = `<p>${res.message || ""}</p>`;
-          if (res.url) html += `<p><a href="${res.url}" target="_blank" rel="noopener">${res.url}</a></p>`;
-          if (res.changed_files && res.changed_files.length) {
-            html += "<p><strong>Changed files</strong></p><ul>" +
-              res.changed_files.map(f => `<li><code>${f}</code></li>`).join("") + "</ul>";
-          }
-          el.innerHTML = html;
-        }
+        renderResult(info);
       } catch (e) { /* ignore */ }
     }
 
@@ -258,7 +502,7 @@
       if (!body && !calls) return `assistant: (thinking…)${metaStr}`;
       return `assistant:${body ? " " + body : ""}${calls}${metaStr}`;
     }
-    ["step", "tool", "error", "log", "chat", "normalize_error", "patch_apply_error", "rejected_patch"].forEach(kind => {
+    ["step", "tool", "error", "log", "chat", "normalize_error", "patch_apply_error", "rejected_patch", "verify_result"].forEach(kind => {
       es.addEventListener(kind, (e) => {
         // The browser also fires a native "error" event (no .data) on a
         // dropped connection; ignore those here — es.onerror handles them.
@@ -276,6 +520,13 @@
           renderedErrorText = txt;
         }
         if (kind === "chat") { append(`💬 ${fmtMessage(txt)}`); return; }
+        // A phase boundary is when the steps table gains a row, so refresh it
+        // live. Debounced, and deliberately NOT on `llm:3/80` turn markers —
+        // those fire once per turn and would put a /info fetch (which re-derives
+        // the whole report) on every one of them.
+        if ((kind === "step" && !String(txt).includes(":")) || kind === "verify_result") {
+          scheduleInfo();
+        }
         append(kind === "log" ? txt : `[${kind}] ${txt}`);
       });
     });

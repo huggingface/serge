@@ -1905,13 +1905,25 @@ def _emit_chat_message(
             else content[:_LOG_MSG_MAX_CHARS]
             + f"… [+{len(content) - _LOG_MSG_MAX_CHARS} chars truncated]"
         )
+        # Pre-truncation size, so the task page's per-tool table reports what a
+        # tool result actually cost the conversation rather than the 2,000-char
+        # cap. Recoverable from the truncation marker for older jobs, but only
+        # while that marker's wording stays exactly as written above.
+        payload["content_chars"] = len(content)
     if reasoning_chars:
         payload["reasoning_chars"] = reasoning_chars
     if finish_reason is not None:
         payload["finish_reason"] = finish_reason
     if tool_calls:
         payload["tool_calls"] = [
-            {"name": tc.name, "arguments": _summarize_args_str(tc.arguments)}
+            {
+                "name": tc.name,
+                "arguments": _summarize_args_str(tc.arguments),
+                # `_summarize_args_str` truncates at 200 chars without recording
+                # how many it dropped, so unlike `content` the true size is not
+                # recoverable from the stored string.
+                "argument_chars": len(tc.arguments or ""),
+            }
             for tc in tool_calls
         ]
     if tool_name:
