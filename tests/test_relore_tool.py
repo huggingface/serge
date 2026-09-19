@@ -728,6 +728,8 @@ class _FakeRun:
     def __call__(self, argv, **kw):
         self.calls.append(argv)
         payload = self.payloads.pop(0) if self.payloads else {}
+        if payload is None:  # relore ran and failed
+            return SimpleNamespace(returncode=1, stdout="", stderr="boom")
         return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
 
 
@@ -749,15 +751,17 @@ def _hit(number, **kw):
 class TestPriorArt:
     ENV = relore_tool.ReloreEnv(repo="huggingface/transformers", api="https://x")
     NODE_ID = "tests/models/nemotron/test_modeling_nemotron.py::T::test_model_8b"
+    OTHER = "tests/models/gemma/test_modeling_gemma.py::T::test_other"
+    THIRD = "tests/models/whisper/test_modeling_whisper.py::T::test_third"
 
     def test_it_searches_the_failure_slice_scoped_to_the_repo(self, monkeypatch):
         run = _FakeRun([{"hits": [_hit(37665)]}])
         monkeypatch.setattr(relore_tool.subprocess, "run", run)
 
-        threads, queries = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
 
-        assert queries == ["nemotron test_model_8b"]
-        assert [t.number for t in threads] == [37665]
+        assert result.ran == ["nemotron test_model_8b"]
+        assert [t.number for t in result.threads] == [37665]
         argv = run.calls[0]
         assert argv[argv.index("--kind") + 1] == "failure"
         # --repo is serge's own fact, never the model's: a daemon serving
@@ -770,43 +774,108 @@ class TestPriorArt:
             "run",
             _FakeRun([{"hits": [_hit(37665)]}, {"hits": [_hit(37665), _hit(40000)]}]),
         )
-        threads, _ = relore_tool.prior_art(
-            self.ENV,
-            node_ids=[
-                self.NODE_ID,
-                "tests/models/gemma/test_modeling_gemma.py::T::test_other",
-            ],
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID, self.OTHER])
+        assert [t.number for t in result.threads] == [37665, 40000]
+
+    def test_a_query_relore_did_not_answer_is_not_a_query_that_found_nothing(
+        self, monkeypatch
+    ):
+        """The distinction the note is built on.
+
+        `ran` means relore answered, so an empty answer is real evidence and the
+        model should not re-ask. A call that failed leaves the history unread —
+        reporting it as "already searched" would steer the model away from a
+        search nobody made.
+        """
+        monkeypatch.setattr(
+            relore_tool.subprocess,
+            "run",
+            _FakeRun([{"hits": []}, None]),  # second call returns rc != 0
         )
-        assert [t.number for t in threads] == [37665, 40000]
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID, self.OTHER])
+        assert result.ran == ["nemotron test_model_8b"]
+        assert result.failed == ["gemma test_other"]
+        assert result.skipped == []
+
+    def test_queries_the_hit_budget_cut_off_are_reported_as_never_sent(
+        self, monkeypatch
+    ):
+        # The budget fills on query 1, so queries 2 and 3 are never sent. Listing
+        # them as searched tells the model not to run a search that never ran.
+        monkeypatch.setattr(
+            relore_tool.relore_tool if False else relore_tool,
+            "MAX_PRIOR_ART",
+            1,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            relore_tool.subprocess, "run", _FakeRun([{"hits": [_hit(1), _hit(2)]}])
+        )
+        result = relore_tool.prior_art(
+            self.ENV, node_ids=[self.NODE_ID, self.OTHER, self.THIRD]
+        )
+        assert [t.number for t in result.threads] == [1]
+        assert result.ran == ["nemotron test_model_8b"]
+        assert result.skipped == ["gemma test_other", "whisper test_third"]
 
     def test_a_relore_that_is_down_costs_the_task_nothing(self, monkeypatch):
         def boom(*a, **kw):
             raise OSError("connection refused")
 
         monkeypatch.setattr(relore_tool.subprocess, "run", boom)
-        threads, queries = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
-        # The queries are still reported: "serge looked and found nothing" and
-        # "serge never looked" have to stay distinguishable in the prompt.
-        assert threads == []
-        assert queries == ["nemotron test_model_8b"]
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        assert result.threads == []
+        assert result.ran == []
+        assert result.failed == ["nemotron test_model_8b"]
 
     def test_no_node_ids_means_no_search(self, monkeypatch):
         monkeypatch.setattr(relore_tool.subprocess, "run", _FakeRun([]))
-        assert relore_tool.prior_art(self.ENV, node_ids=[]) == ([], [])
+        result = relore_tool.prior_art(self.ENV, node_ids=[])
+        assert not result.searched_anything
+
+
+def _result(threads=(), ran=(), failed=(), skipped=()):
+    return relore_tool.PriorArtResult(
+        list(threads), list(ran), list(failed), list(skipped)
+    )
 
 
 class TestPriorArtNote:
+    THREAD = relore_tool.PriorThread(
+        number=37665,
+        kind="pr",
+        title="[tests] fix test_nemotron_8b_generation_sdpa",
+        url="https://github.com/huggingface/transformers/pull/37665",
+        author="faaany",
+        trust="reported",
+        age="16mo",
+        query="nemotron test_model_8b",
+    )
+
     def test_no_search_ran_produces_no_block(self):
-        assert relore_tool.prior_art_note([], queries=[]) == ""
+        assert relore_tool.prior_art_note(_result()) == ""
 
     def test_a_search_that_found_nothing_still_says_so(self):
         # Otherwise the model spends a turn re-running the search serge just ran.
-        note = relore_tool.prior_art_note([], queries=["nemotron test_x"])
+        note = relore_tool.prior_art_note(_result(ran=["nemotron test_x"]))
         assert "found nothing" in note
+        assert "do NOT repeat" in note
         assert "nemotron test_x" in note
-        assert "re-running" in note
 
-    def test_the_note_carries_metadata_only(self, monkeypatch):
+    def test_an_unanswered_query_is_offered_back_to_the_model(self):
+        note = relore_tool.prior_art_note(_result(failed=["nemotron test_x"]))
+        # It must not read as "already searched": the history is unread.
+        assert "UNANSWERED" in note
+        assert "do NOT repeat" not in note
+
+    def test_a_query_that_was_never_sent_says_so(self):
+        note = relore_tool.prior_art_note(
+            _result(threads=[self.THREAD], ran=["a"], skipped=["b"])
+        )
+        assert "Not run" in note
+        assert "`b`" in note
+
+    def test_the_note_carries_metadata_only(self):
         """No snippet, by design.
 
         A snippet is text a GitHub user wrote, and relore wraps those in an
@@ -814,14 +883,14 @@ class TestPriorArtNote:
         into a trusted prompt block is precisely what that rule forbids, so the
         note points at `history_thread` and lets the model fetch it intact.
         """
-        monkeypatch.setattr(
-            relore_tool.subprocess, "run", _FakeRun([{"hits": [_hit(37665)]}])
+        note = relore_tool.prior_art_note(
+            _result(threads=[self.THREAD], ran=["nemotron test_model_8b"])
         )
-        threads, queries = relore_tool.prior_art(
-            relore_tool.ReloreEnv(repo="huggingface/transformers", api="https://x"),
-            node_ids=["tests/models/nemotron/test_modeling_nemotron.py::T::test_a"],
-        )
-        note = relore_tool.prior_art_note(threads, queries=queries)
         assert "#37665" in note
         assert "history_thread" in note
-        assert "a GitHub user wrote this" not in note
+        assert "by @faaany" in note
+        assert "reported, 16mo" in note
+
+    def test_one_thread_is_not_pluralised(self):
+        note = relore_tool.prior_art_note(_result(threads=[self.THREAD], ran=["a"]))
+        assert "1 earlier thread matched" in note

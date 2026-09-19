@@ -1949,7 +1949,7 @@ class PriorArtStepTests(unittest.TestCase):
         self.assertEqual(note, "")
         searched.assert_not_called()
 
-    def test_hits_reach_the_note_and_the_job_log(self):
+    def test_hits_reach_the_note_the_job_log_and_a_step(self):
         env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
         thread = relore_tool.PriorThread(
             number=37665,
@@ -1961,29 +1961,50 @@ class PriorArtStepTests(unittest.TestCase):
             age="16mo",
             query="nemotron test_model_8b",
         )
+        result = relore_tool.PriorArtResult([thread], ["nemotron test_x"], [], [])
         events = []
-        with patch.object(
-            tasks_module, "prior_art", return_value=([thread], ["nemotron test_x"])
-        ):
+        with patch.object(tasks_module, "prior_art", return_value=result):
             note = tasks_module._prior_art_note(
                 self._req(test_links={self.NODE_ID: []}),
                 env,
                 lambda kind, text: events.append((kind, text)),
             )
         self.assertIn("#37665", note)
+        # Its own step, so the task page lists it as something serge did
+        # between the reproduce gate and the first turn — not a log line
+        # buried in whichever phase happened to be open.
+        self.assertIn(("step", "history"), events)
         self.assertIn(
-            (
-                "log",
-                "Project history: #37665 already discuss these tests "
-                "(searched 1 query/ies)",
-            ),
-            events,
+            ("log", "Project history: #37665 already discuss these tests"), events
         )
+
+    def test_an_unanswered_query_is_logged_as_unanswered_not_as_empty(self):
+        # "relore did not answer" and "there is nothing there" are different
+        # facts, and the note tells the model to retry only the first.
+        env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
+        result = relore_tool.PriorArtResult([], [], ["nemotron test_x"], [])
+        events = []
+        with patch.object(tasks_module, "prior_art", return_value=result):
+            note = tasks_module._prior_art_note(
+                self._req(test_links={self.NODE_ID: []}),
+                env,
+                lambda kind, text: events.append((kind, text)),
+            )
+        logs = [t for k, t in events if k == "log"]
+        self.assertTrue(any("did not answer" in t for t in logs), logs)
+        self.assertFalse(any("no earlier thread matched" in t for t in logs), logs)
+        self.assertIn("UNANSWERED", note)
 
     def test_a_relore_failure_costs_the_task_nothing(self):
         env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
+        events = []
         with patch.object(tasks_module, "prior_art", side_effect=OSError("down")):
             note = tasks_module._prior_art_note(
-                self._req(test_links={self.NODE_ID: []}), env, lambda *a: None
+                self._req(test_links={self.NODE_ID: []}),
+                env,
+                lambda kind, text: events.append((kind, text)),
             )
         self.assertEqual(note, "")
+        # The step still opened, so the page shows the attempt rather than
+        # silently skipping a stage that did run.
+        self.assertIn(("step", "history"), events)

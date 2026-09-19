@@ -162,6 +162,40 @@ class TestBuildSteps:
         assert steps["gpu_reproduce"]["seconds"] == pytest.approx(253.0)
         assert steps["gpu_verify"]["run_url"].endswith("/35406012561")
 
+    def test_the_history_lookup_is_its_own_phase(self):
+        """It is a stage serge runs, with an outcome, before the first turn.
+
+        As a bare log line it landed in whichever phase happened to be open —
+        usually the GPU gate before it — which reads as the gate having done it.
+        """
+        history = [
+            ev("log", "GPU reproduce: reproduced \u2713 (url)", 1.0),
+            ev("step", "history", 2.0),
+            ev("log", "Project history: #48750 already discuss these tests", 2.4),
+            ev("step", "llm", 3.0),
+            ev("log", "Calling LLM to produce a patch\u2026", 3.1),
+        ]
+        steps = build_steps(history)
+        assert [s["key"] for s in steps] == ["start", "history", "llm"]
+        hist = by_key(steps)["history"]
+        assert hist["status"] == "ok"
+        assert hist["lines"] == ["Project history: #48750 already discuss these tests"]
+
+    def test_a_search_that_matched_nothing_is_a_pass_not_a_miss(self):
+        # relore answered; an empty answer is evidence, not a failure.
+        history = [
+            ev("step", "history", 1.0),
+            ev("log", "Project history: no earlier thread matched `x`", 1.2),
+        ]
+        assert build_steps(history)[0]["status"] == "ok"
+
+    def test_a_relore_that_did_not_answer_warns(self):
+        history = [
+            ev("step", "history", 1.0),
+            ev("log", "Project history: relore did not answer `x` \u2014 left", 1.2),
+        ]
+        assert build_steps(history)[0]["status"] == "warn"
+
     def test_a_guard_cutting_the_loop_off_is_a_warning_not_a_pass(self):
         llm = by_key(build_steps(REAL_HISTORY))["llm"]
         assert llm["status"] == "warn"

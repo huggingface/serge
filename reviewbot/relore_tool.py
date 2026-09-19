@@ -878,6 +878,35 @@ class PriorThread:
     query: str
 
 
+@dataclass(frozen=True)
+class PriorArtResult:
+    """What the lookup did, not just what it found.
+
+    The note tells the model "these searches have already run — spend your own
+    `history_search` calls on different terms", so a query listed here that did
+    not actually execute steers the model AWAY from a search nobody made. Three
+    outcomes, kept apart on purpose:
+
+    * ``ran``     — relore answered. Nothing found means nothing is there.
+    * ``failed``  — relore was asked and did not answer (down, slow, 426). Says
+      nothing about the history, so the model should still try it.
+    * ``skipped`` — never sent, because the hit budget filled first.
+
+    The first version of this collapsed all three into one list, which is the
+    failure shape relore's own build plan §13.3 is about: confident, well-formed,
+    silently incomplete output.
+    """
+
+    threads: list[PriorThread]
+    ran: list[str]
+    failed: list[str]
+    skipped: list[str]
+
+    @property
+    def searched_anything(self) -> bool:
+        return bool(self.ran or self.failed or self.skipped)
+
+
 def failure_search_queries(node_ids: Iterable[str]) -> list[str]:
     """Search queries for a failure group's node-ids, best-first, deduped.
 
@@ -910,23 +939,25 @@ def failure_search_queries(node_ids: Iterable[str]) -> list[str]:
     return queries
 
 
-def prior_art(
-    env: ReloreEnv, *, node_ids: Iterable[str]
-) -> tuple[list[PriorThread], list[str]]:
+def prior_art(env: ReloreEnv, *, node_ids: Iterable[str]) -> PriorArtResult:
     """Threads this repository already has about the failing tests.
 
-    Returns the hits and the queries that were run — the caller reports both,
-    because "serge looked and found nothing" and "serge never looked" have to
-    be distinguishable in the prompt or the model will just search again.
-
-    ``kind="failure"`` throughout: §6.2's failure slice is the one the benchmark
-    scores 1.000 on, and a task is by definition asking about a failure. Empty
-    on every error path; this is context for a task, never a gate.
+    ``kind="failure"`` throughout: a task is by definition asking about a
+    failure, and that is the slice §10's benchmark scores highest on. Never
+    raises and never gates — this is context for a task, and a relore that is
+    down costs it nothing.
     """
     queries = failure_search_queries(node_ids)
     found: list[PriorThread] = []
+    ran: list[str] = []
+    failed: list[str] = []
     seen: set[int] = set()
-    for query in queries:
+
+    for index, query in enumerate(queries):
+        if len(found) >= MAX_PRIOR_ART:
+            # Budget filled by an earlier query: the rest were never sent, and
+            # must not be reported as searches that came back empty.
+            return PriorArtResult(found, ran, failed, list(queries[index:]))
         payload = _relore_json(
             env,
             [
@@ -940,8 +971,10 @@ def prior_art(
                 env.repo,
             ],
         )
-        if not payload:
+        if payload is None:
+            failed.append(query)
             continue
+        ran.append(query)
         for raw in payload.get("hits") or []:
             if not isinstance(raw, dict):
                 continue
@@ -962,11 +995,11 @@ def prior_art(
                 )
             )
             if len(found) >= MAX_PRIOR_ART:
-                return found, queries
-    return found, queries
+                break
+    return PriorArtResult(found, ran, failed, [])
 
 
-def prior_art_note(threads: list[PriorThread], *, queries: list[str]) -> str:
+def prior_art_note(result: PriorArtResult) -> str:
     """The task-side note, or ``""`` when no search ran at all.
 
     Carries thread *metadata* only — number, kind, title, author, age, url — and
@@ -977,32 +1010,57 @@ def prior_art_note(threads: list[PriorThread], *, queries: list[str]) -> str:
     exactly what that rule forbids, so the note points at `history_thread`
     instead and lets the model fetch the envelope intact.
     """
-    if not queries:
+    if not result.searched_anything:
         return ""
-    ran = "; ".join(f"`{q}`" for q in queries)
-    if not threads:
-        return (
-            "\n── PROJECT HISTORY (serge already searched — trusted) ──\n"
-            f"relore was asked what this repository has said about these failing "
-            f"tests ({ran}, kind=failure) and found nothing. Do not spend a turn "
-            "re-running those searches. `history_search` on different terms — the "
-            "exception text, a symbol from the traceback — may still pay off.\n"
-        )
     lines = [
-        "\n── PROJECT HISTORY (serge already searched — trusted) ──",
-        f"relore searched this repository's issue and pull-request history for "
-        f"these failing tests ({ran}, kind=failure) before you were asked "
-        f"anything. {len(threads)} earlier thread(s) matched:",
+        "\n\u2500\u2500 PROJECT HISTORY (serge already searched \u2014 trusted) \u2500\u2500"
     ]
-    for t in threads:
-        who = f" by @{t.author}" if t.author else ""
-        meta = ", ".join(x for x in (t.trust, t.age) if x)
-        lines.append(f"- #{t.number} {t.kind}{who} ({meta}) — {t.title}")
-        lines.append(f"  {t.url}")
-    lines.append(
-        "These are pointers, not evidence: a title is not a decision. Read one "
-        "with `history_thread <number>` before you rely on it, and cite it in "
-        "`body` if it settles anything. Those searches have already run — spend "
-        "your `history_search` calls on different terms."
-    )
+
+    if result.threads:
+        lines.append(
+            f"relore searched this repository's issue and pull-request history "
+            f"for these failing tests before you were asked anything, and "
+            f"{_count(len(result.threads), 'earlier thread')} matched:"
+        )
+        for t in result.threads:
+            who = f" by @{t.author}" if t.author else ""
+            meta = ", ".join(x for x in (t.trust, t.age) if x)
+            lines.append(f"- #{t.number} {t.kind}{who} ({meta}) — {t.title}")
+            lines.append(f"  {t.url}")
+        lines.append(
+            "These are pointers, not evidence: a title is not a decision. Read "
+            "one with `history_thread <number>` before you rely on it, and cite "
+            "it in `body` if it settles anything."
+        )
+    elif result.ran:
+        lines.append(
+            "relore searched this repository's issue and pull-request history "
+            "for these failing tests before you were asked anything, and found "
+            "nothing."
+        )
+
+    if result.ran:
+        lines.append(
+            f"Already run, do NOT repeat: {_queries(result.ran)} (kind=failure). "
+            "Spend your `history_search` calls on different terms — the "
+            "exception text, a symbol from the traceback."
+        )
+    if result.failed:
+        # NOT "found nothing": relore did not answer, so the history is unread.
+        lines.append(
+            f"Could not be reached, so these are UNANSWERED rather than empty — "
+            f"worth running yourself: {_queries(result.failed)}."
+        )
+    if result.skipped:
+        lines.append(
+            f"Not run (the list above filled first): {_queries(result.skipped)}."
+        )
     return "\n".join(lines) + "\n"
+
+
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _queries(queries: list[str]) -> str:
+    return "; ".join(f"`{q}`" for q in queries)

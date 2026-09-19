@@ -1326,6 +1326,11 @@ def _prior_art_note(
     having on every task cannot depend on the model choosing to make it, and
     "before diagnosing" is precisely the ordering an instruction cannot buy.
 
+    Emits its own ``history`` step so it is a row in the task page's step list
+    rather than a log line buried in whichever phase happened to be open: it is
+    a thing serge does, with an outcome, between the reproduce gate and the
+    agent loop.
+
     Fail-soft and non-gating throughout: a relore that is down, slow or
     unindexed costs this task nothing but the empty string.
     """
@@ -1334,28 +1339,39 @@ def _prior_art_note(
     node_ids = _failing_node_ids(req)
     if not node_ids:
         return ""
+    emit("step", "history")
     try:
-        threads, queries = prior_art(tool_env.relore, node_ids=node_ids)
+        result = prior_art(tool_env.relore, node_ids=node_ids)
     except Exception:
         log.debug("prior-art lookup failed; continuing", exc_info=True)
+        emit("log", "Project history: lookup failed; continuing without it.")
         return ""
-    if not queries:
+    if not result.searched_anything:
         return ""
-    if threads:
+
+    if result.threads:
         emit(
             "log",
             "Project history: "
-            + ", ".join(f"#{t.number}" for t in threads)
-            + f" already discuss these tests (searched {len(queries)} query/ies)",
+            + ", ".join(f"#{t.number}" for t in result.threads)
+            + " already discuss these tests",
         )
-    else:
+    elif result.ran:
         emit(
             "log",
-            f"Project history: no earlier thread matched "
-            f"({', '.join(queries)}); the model is told so, so it does not "
+            "Project history: no earlier thread matched "
+            f"{'; '.join(result.ran)} — the model is told so, so it does not "
             "re-run the search.",
         )
-    return prior_art_note(threads, queries=queries)
+    # Reported separately and never as "found nothing": a query relore did not
+    # answer leaves the history unread, and the note tells the model to try it.
+    if result.failed:
+        emit(
+            "log",
+            "Project history: relore did not answer "
+            f"{'; '.join(result.failed)} — left for the model to retry.",
+        )
+    return prior_art_note(result)
 
 
 def prepare_task(
@@ -1387,6 +1403,8 @@ def prepare_task(
 
     _emit("log", f"Preparing task for {req.repo_full_name} (base={req.base_ref})")
     tool_env = _make_tool_env(cfg, helper_tools=[], repo_full_name=req.repo_full_name)
+    # Before the prompt is built and before the first turn — the whole point.
+    history_note = _prior_art_note(req, tool_env, _emit)
 
     llm = ChatCompletionClient(
         cfg.llm_api_base,
@@ -1403,7 +1421,6 @@ def prepare_task(
         tools_enabled=tool_env is not None,
         history_tools=tool_env is not None and tool_env.relore is not None,
     )
-    history_note = _prior_art_note(req, tool_env, _emit)
     user_prompt = build_task_user_prompt(
         repo_full_name=req.repo_full_name,
         base_ref=req.base_ref,
