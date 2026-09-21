@@ -1938,14 +1938,16 @@ class PriorArtStepTests(unittest.TestCase):
         # Every repo relore does not index, and every deployment without
         # RELORE_API. The task must be byte-for-byte what it was before.
         req = self._req(test_links={self.NODE_ID: []})
-        self.assertEqual(tasks_module._prior_art_note(req, None, lambda *a: None), "")
+        self.assertEqual(
+            tasks_module._history_notes(req, None, lambda *a: None), ("", "")
+        )
 
     def test_a_task_with_no_identifiable_tests_skips_the_lookup(self):
         # A hand-dispatched task ("bump the pinned torch version") has no node
         # ids, so there is nothing to search for and no note to add.
         env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
         with patch.object(tasks_module, "prior_art") as searched:
-            note = tasks_module._prior_art_note(self._req(), env, lambda *a: None)
+            note, _ = tasks_module._history_notes(self._req(), env, lambda *a: None)
         self.assertEqual(note, "")
         searched.assert_not_called()
 
@@ -1964,7 +1966,7 @@ class PriorArtStepTests(unittest.TestCase):
         result = relore_tool.PriorArtResult([thread], ["nemotron test_x"], [], [])
         events = []
         with patch.object(tasks_module, "prior_art", return_value=result):
-            note = tasks_module._prior_art_note(
+            note, _ = tasks_module._history_notes(
                 self._req(test_links={self.NODE_ID: []}),
                 env,
                 lambda kind, text: events.append((kind, text)),
@@ -1985,7 +1987,7 @@ class PriorArtStepTests(unittest.TestCase):
         result = relore_tool.PriorArtResult([], [], ["nemotron test_x"], [])
         events = []
         with patch.object(tasks_module, "prior_art", return_value=result):
-            note = tasks_module._prior_art_note(
+            note, _ = tasks_module._history_notes(
                 self._req(test_links={self.NODE_ID: []}),
                 env,
                 lambda kind, text: events.append((kind, text)),
@@ -1999,7 +2001,7 @@ class PriorArtStepTests(unittest.TestCase):
         env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
         events = []
         with patch.object(tasks_module, "prior_art", side_effect=OSError("down")):
-            note = tasks_module._prior_art_note(
+            note, _ = tasks_module._history_notes(
                 self._req(test_links={self.NODE_ID: []}),
                 env,
                 lambda kind, text: events.append((kind, text)),
@@ -2007,4 +2009,120 @@ class PriorArtStepTests(unittest.TestCase):
         self.assertEqual(note, "")
         # The step still opened, so the page shows the attempt rather than
         # silently skipping a stage that did run.
+        self.assertIn(("step", "history"), events)
+
+
+class CulpritThreadStepTests(unittest.TestCase):
+    """The pre-loop lookup of the pull request CI's bisect blamed.
+
+    Only regression clusters carry one. Before this, the triage prompt spent a
+    paragraph asking the model to reconstruct what that PR was for by grepping
+    what it left in the tree — and getting that wrong is the failure the cluster
+    addendum is most afraid of: transformers #48535 re-guarded #47988's call
+    with a condition the base class already applied, making it dead code, and
+    OLMo started appending EOS to every prompt again.
+    """
+
+    CONTEXT = (
+        "Attribution (from CI `git bisect`):\n"
+        "- bad commit: ce5c8f5e4352\n"
+        "- introduced by PR #47988 (https://github.com/huggingface/transformers/pull/47988)\n"
+    )
+
+    def _req(self, **kw):
+        base = dict(
+            owner="huggingface",
+            repo="transformers",
+            base_ref="main",
+            instruction="fix it",
+            context=self.CONTEXT,
+        )
+        base.update(kw)
+        return TaskRequest(**base)
+
+    def _env(self):
+        return SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
+
+    def test_a_cluster_with_no_node_ids_still_gets_the_lookup(self):
+        """The two lookups are independent.
+
+        A group serge cannot pull node-ids out of used to return before the step
+        was even opened; the culprit is knowable from the attribution line
+        alone, so it must not be gated on the other lookup finding something.
+        """
+        events = []
+        thread = relore_tool.CulpritThread(47988, page="<<<RELORE-UNTRUSTED>>>x")
+        with patch.object(tasks_module, "culprit_thread", return_value=thread) as got:
+            history, culprit = tasks_module._history_notes(
+                self._req(),
+                self._env(),
+                lambda kind, text: events.append((kind, text)),
+            )
+        self.assertEqual(history, "")
+        self.assertIn("#47988", culprit)
+        got.assert_called_once()
+        self.assertIn(("step", "history"), events)
+
+    def test_one_step_covers_both_lookups(self):
+        # Two `history` steps would render two rows for one thing serge does.
+        events = []
+        thread = relore_tool.CulpritThread(47988, page="<<<RELORE-UNTRUSTED>>>x")
+        result = relore_tool.PriorArtResult([], ["nemotron test_x"], [], [])
+        with (
+            patch.object(tasks_module, "culprit_thread", return_value=thread),
+            patch.object(tasks_module, "prior_art", return_value=result),
+        ):
+            tasks_module._history_notes(
+                self._req(test_links={"tests/models/nemotron/t.py::T::test_x": []}),
+                self._env(),
+                lambda kind, text: events.append((kind, text)),
+            )
+        self.assertEqual([e for e in events if e[0] == "step"], [("step", "history")])
+
+    def test_a_group_that_is_not_a_cluster_makes_no_call(self):
+        # Most groups. No attribution line, so nothing to fetch and no block.
+        with patch.object(tasks_module, "culprit_thread") as got:
+            _history, culprit = tasks_module._history_notes(
+                self._req(context="Failure group: whisper flakes."),
+                self._env(),
+                lambda *a: None,
+            )
+        self.assertEqual(culprit, "")
+        got.assert_not_called()
+
+    def test_no_relore_means_no_block_and_no_subprocess(self):
+        self.assertEqual(
+            tasks_module._history_notes(self._req(), None, lambda *a: None), ("", "")
+        )
+
+    def test_a_fetched_thread_is_reported_on_the_task_page(self):
+        events = []
+        thread = relore_tool.CulpritThread(47988, page="<<<RELORE-UNTRUSTED>>>x")
+        with patch.object(tasks_module, "culprit_thread", return_value=thread):
+            tasks_module._history_notes(
+                self._req(), self._env(), lambda k, t: events.append((k, t))
+            )
+        logs = [t for k, t in events if k == "log"]
+        self.assertTrue(any("culprit PR #47988" in t for t in logs), logs)
+
+    def test_a_thread_relore_would_not_serve_is_logged_as_unanswered(self):
+        # Same wording as the prior-art path, so task_report's `history` rules
+        # score the step a warning rather than an ok.
+        events = []
+        thread = relore_tool.CulpritThread(47988, error="returned 404")
+        with patch.object(tasks_module, "culprit_thread", return_value=thread):
+            _history, culprit = tasks_module._history_notes(
+                self._req(), self._env(), lambda k, t: events.append((k, t))
+            )
+        logs = [t for k, t in events if k == "log"]
+        self.assertTrue(any("relore did not answer" in t for t in logs), logs)
+        self.assertIn("UNREAD", culprit)
+
+    def test_a_crash_costs_the_task_nothing(self):
+        events = []
+        with patch.object(tasks_module, "culprit_thread", side_effect=OSError("down")):
+            _history, culprit = tasks_module._history_notes(
+                self._req(), self._env(), lambda k, t: events.append((k, t))
+            )
+        self.assertEqual(culprit, "")
         self.assertIn(("step", "history"), events)

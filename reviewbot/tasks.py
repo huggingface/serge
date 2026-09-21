@@ -37,7 +37,13 @@ from .github_client import SERGE_GIT_EMAIL, GitHubClient
 from .llm_client import ChatCompletionClient
 from .normalize import NormalizeError, run_normalize
 from .prompts import build_task_system_prompt, build_task_user_prompt
-from .relore_tool import prior_art, prior_art_note
+from .relore_tool import (
+    culprit_pr_number,
+    culprit_thread,
+    culprit_thread_note,
+    prior_art,
+    prior_art_note,
+)
 from .tools import ToolEnv
 from .reviewer import (
     _extract_json,
@@ -1314,32 +1320,55 @@ def _failing_node_ids(req: TaskRequest) -> list[str]:
     return node_ids
 
 
-def _prior_art_note(
+def _history_notes(
     req: TaskRequest,
     tool_env: Optional[ToolEnv],
     emit: Callable[[str, str], None],
-) -> str:
-    """Search the project history for the failing tests BEFORE the first turn.
+) -> tuple[str, str]:
+    """Everything serge looks up in the project history BEFORE the first turn.
 
     The agent is told to do this itself and, measured over the whole store,
     does not — see the note above :func:`relore_tool.prior_art`. A lookup worth
     having on every task cannot depend on the model choosing to make it, and
     "before diagnosing" is precisely the ordering an instruction cannot buy.
 
-    Emits its own ``history`` step so it is a row in the task page's step list
-    rather than a log line buried in whichever phase happened to be open: it is
-    a thing serge does, with an outcome, between the reproduce gate and the
-    agent loop.
+    Two lookups, returned as two blocks because they carry different things and
+    must not be merged: the prior-art note is thread *metadata* serge fetched,
+    trusted; the culprit block is a page of text GitHub users wrote, inside
+    relore's envelope. Putting the second under the first's "serge already
+    searched — trusted" header is exactly the mistake that header exists to
+    prevent.
+
+    Emits one ``history`` step covering both, so the task page gets a single
+    row with an outcome rather than a log line buried in whichever phase
+    happened to be open — it is a thing serge does between the reproduce gate
+    and the agent loop.
 
     Fail-soft and non-gating throughout: a relore that is down, slow or
     unindexed costs this task nothing but the empty string.
     """
     if tool_env is None or tool_env.relore is None:
-        return ""
+        return "", ""
     node_ids = _failing_node_ids(req)
+    culprit = culprit_pr_number(req.context or "")
+    if not node_ids and culprit is None:
+        return "", ""
+    emit("step", "history")
+    return (
+        _prior_art_note(tool_env, emit, node_ids=node_ids),
+        _culprit_thread_note(tool_env, emit, number=culprit),
+    )
+
+
+def _prior_art_note(
+    tool_env: ToolEnv,
+    emit: Callable[[str, str], None],
+    *,
+    node_ids: list[str],
+) -> str:
+    """The failing tests' earlier threads. Step already emitted by the caller."""
     if not node_ids:
         return ""
-    emit("step", "history")
     try:
         result = prior_art(tool_env.relore, node_ids=node_ids)
     except Exception:
@@ -1374,6 +1403,45 @@ def _prior_art_note(
     return prior_art_note(result)
 
 
+def _culprit_thread_note(
+    tool_env: ToolEnv,
+    emit: Callable[[str, str], None],
+    *,
+    number: Optional[int],
+) -> str:
+    """The blamed pull request's discussion, on regression clusters only.
+
+    ``number`` is ``None`` on every other group shape, which is most of them —
+    only a bisect-attributed cluster knows which change broke the tests. See
+    the note above :func:`relore_tool.culprit_thread` for why this is serge's
+    call and not the model's.
+    """
+    if number is None:
+        return ""
+    try:
+        result = culprit_thread(tool_env.relore, number=number)
+    except Exception:
+        log.debug("culprit-thread lookup failed; continuing", exc_info=True)
+        emit("log", f"Project history: lookup failed for culprit PR #{number}.")
+        return ""
+    if result.page:
+        emit(
+            "log",
+            f"Project history: culprit PR #{number} — its discussion is in the "
+            "prompt, so the model does not reconstruct it from the tree.",
+        )
+    else:
+        # Same distinction the prior-art note draws, and the same wording so the
+        # task page's `history` rules read it as a warning: a thread relore
+        # could not serve is unread, not absent.
+        emit(
+            "log",
+            f"Project history: relore did not answer for culprit PR #{number} "
+            f"({result.error}) — left for the model to retry.",
+        )
+    return culprit_thread_note(result)
+
+
 def prepare_task(
     cfg: Config,
     req: TaskRequest,
@@ -1404,7 +1472,7 @@ def prepare_task(
     _emit("log", f"Preparing task for {req.repo_full_name} (base={req.base_ref})")
     tool_env = _make_tool_env(cfg, helper_tools=[], repo_full_name=req.repo_full_name)
     # Before the prompt is built and before the first turn — the whole point.
-    history_note = _prior_art_note(req, tool_env, _emit)
+    history_note, culprit_note = _history_notes(req, tool_env, _emit)
 
     llm = ChatCompletionClient(
         cfg.llm_api_base,
@@ -1428,6 +1496,7 @@ def prepare_task(
         context=req.context,
         existing_diff=existing_diff,
         history_note=history_note,
+        culprit_note=culprit_note,
     )
 
     # This prefix is resent on EVERY turn, so log its breakdown once per task —

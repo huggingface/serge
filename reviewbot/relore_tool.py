@@ -613,7 +613,7 @@ def _subprocess_env(env: ReloreEnv) -> dict[str, str]:
     return out
 
 
-def _truncate(text: str) -> str:
+def _truncate(text: str, budget: int = MAX_RELORE_OUTPUT_CHARS) -> str:
     """Cap the result by dropping the MIDDLE, not the tail.
 
     Two reasons, and both are the same mistake in different clothes — cutting
@@ -630,15 +630,19 @@ def _truncate(text: str) -> str:
 
     So keep both ends and say what went missing in between. No parsing of
     relore's format, so nothing here drifts when that format changes.
+
+    ``budget`` defaults to the tool-result cap. :func:`culprit_thread` passes a
+    smaller one: its page goes in the prompt PREFIX, which is re-sent on every
+    turn, so it is billed per turn rather than once.
     """
-    if len(text) <= MAX_RELORE_OUTPUT_CHARS:
+    if len(text) <= budget:
         return text
     marker_budget = 200
-    head_chars = (MAX_RELORE_OUTPUT_CHARS - marker_budget) * 3 // 5
-    tail_chars = MAX_RELORE_OUTPUT_CHARS - marker_budget - head_chars
+    head_chars = (budget - marker_budget) * 3 // 5
+    tail_chars = budget - marker_budget - head_chars
     dropped = len(text) - head_chars - tail_chars
     marker = (
-        f"\n\n[... {dropped} chars dropped from the MIDDLE to fit the {MAX_RELORE_OUTPUT_CHARS}-char "
+        f"\n\n[... {dropped} chars dropped from the MIDDLE to fit the {budget}-char "
         "budget; the start and the end are both intact. Narrow the query, or use "
         "history_thread with outline=true for the shape first ...]\n\n"
     )
@@ -1064,3 +1068,156 @@ def _count(n: int, noun: str) -> str:
 
 def _queries(queries: list[str]) -> str:
     return "; ".join(f"`{q}`" for q in queries)
+
+
+# -- the culprit PR's thread (regression clusters) --------------------------
+#
+# A regression cluster is the one group shape where CI already knows which
+# change broke the tests: its context carries `- introduced by PR #48714` from
+# the dispatcher's bisect, and the commit's own diff with it. What it does not
+# carry is what that pull request was FOR, and that is the thing the agent has
+# to know before it touches the code — a culprit is almost always a fix, still
+# load-bearing, and undoing it trades one set of failures for another that no
+# daily run attributes to anyone. transformers #48535 is the worked example:
+# serge re-guarded the `update_post_processor()` call from #47988 with a
+# condition the base class already applies, i.e. made it dead code, and OLMo
+# started appending EOS to every prompt again.
+#
+# Until now the triage prompt asked the model to reconstruct that intent from
+# what the commit left in the tree — grep the PR number, read the comment block
+# above the changed code, hope it cites itself. relore answers it directly, and
+# the answer is a maintainer's sentence: on #48535 the thread carries @itazap
+# explaining what the checkpoint's tokenizer config actually is. So serge
+# fetches it, for the same reason it runs :func:`prior_art` — the model is told
+# to ask and does not, and "before you touch it" is an ordering an instruction
+# cannot buy.
+#
+# One call, on cluster groups only, and empty on every failure path.
+
+#: The dispatcher's own line, from `_render_serge_target` in transformers-ci's
+#: ``integration_failure_triage.py``. Anchored to the bullet and the exact
+#: phrase because the same context also lists `- PR #N (...) — closed unmerged`
+#: for earlier rejected attempts, and those are not the culprit.
+#:
+#: This parses the UNTRUSTED context block, which is worth a moment's thought
+#: and then no more: the number is only ever used as ``thread <n> --repo
+#: <serge's own repo>``, so the worst a forged line can do is quote a different
+#: thread of the same repository back to the model, inside relore's envelope,
+#: labelled as the culprit. No escalation is reachable from here.
+_CULPRIT_PR_RE = re.compile(r"^[-*]\s*introduced by PR #(\d+)\b", re.MULTILINE)
+
+#: Cap for the fetched page. relore's compact form already bounds a thread hard
+#: — the opening body is cut to ~800 chars and the comments are a window of ten
+#: — so this is a backstop, not the usual path: measured over eight real
+#: transformers threads (#48714, #48750, #48168, #47988, #47168, #48535, #38943,
+#: #35466) the page ran 689–5,275 chars. Tighter than the tool-result cap
+#: because this text is billed on every turn, not once.
+MAX_CULPRIT_THREAD_CHARS = 6000
+
+
+@dataclass(frozen=True)
+class CulpritThread:
+    """The blamed pull request's discussion, or why it is not here.
+
+    ``page`` is relore's own output, byte for byte, envelope intact. ``error``
+    is relore's own failure sentence when there is no page. Exactly one of the
+    two is ever set, and they are kept apart for the reason
+    :class:`PriorArtResult` keeps `ran` from `failed`: a thread relore could not
+    serve is UNREAD, not a thread with nothing in it, and the two take opposite
+    next actions.
+    """
+
+    number: int
+    page: str = ""
+    error: str = ""
+
+
+def culprit_pr_number(context: str) -> Optional[int]:
+    """The pull request CI's bisect blamed, or ``None`` when this is not a
+    regression cluster. First match only — a group has one culprit."""
+    match = _CULPRIT_PR_RE.search(context or "")
+    return int(match.group(1)) if match else None
+
+
+def culprit_thread(env: ReloreEnv, *, number: int) -> CulpritThread:
+    """Fetch one thread for the prompt. Never raises, never gates.
+
+    ``--plain`` and no ``--files``: the changed-file list would duplicate the
+    bad-commit diff the dispatcher already puts in the context, and an outline
+    would drop the comment bodies, which are the whole point here.
+    """
+    argv = [env.executable, "--plain", "thread", str(number), "--repo", env.repo]
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=env.timeout,
+            check=False,
+            env=_subprocess_env(env),
+        )
+    except subprocess.TimeoutExpired:
+        return CulpritThread(number, error=f"it timed out after {env.timeout}s")
+    except FileNotFoundError:
+        return CulpritThread(
+            number, error=f"the {env.executable!r} client is not installed here"
+        )
+    except Exception:  # pragma: no cover — defensive
+        log.debug("culprit-thread lookup crashed; continuing", exc_info=True)
+        return CulpritThread(number, error="the relore client could not be run")
+
+    stdout = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not stdout:
+        # relore's own sentence, relayed: a 404 on an unindexed number, a stale
+        # client refused with 426 and a daemon that is down read identically to
+        # a caller that only looks at the exit code, and take different actions.
+        detail = (
+            (proc.stderr or "").strip()
+            or stdout
+            or f"it exited {proc.returncode} with no output"
+        )
+        return CulpritThread(number, error=_truncate(detail, 400))
+    return CulpritThread(number, page=_truncate(stdout, MAX_CULPRIT_THREAD_CHARS))
+
+
+def culprit_thread_note(result: Optional[CulpritThread]) -> str:
+    """The task-side block, or ``""`` when this is not a regression cluster.
+
+    The page is appended **verbatim, envelope and all**. It is not re-wrapped in
+    serge's own `--- BEGIN UNTRUSTED ---` markers (that would put relore's
+    ``[authoritative]`` labels inside a "discount everything below" region — see
+    :func:`run_relore_tool`) and it is not run through
+    ``prompts._scrub_delimiters`` (that would edit bytes we promised to relay).
+    Neither is needed: relore prefixes every quoted line with ``> `` on the way
+    out, so a comment forging one of serge's boundary lines arrives as a quoted
+    one. Marking is one-directional; content cannot un-mark itself.
+    """
+    if result is None:
+        return ""
+    head = f"\n── THE CULPRIT PULL REQUEST (#{result.number}) ────────────\n"
+    if result.page:
+        return (
+            head
+            + "CI's bisect blamed this group on one commit; serge fetched the pull "
+            "request that carried it before you were asked anything. Below is what "
+            "it was FOR — the argument, where the failure report has only the diff. "
+            "Your patch has to keep whatever it fixed working, so read this first "
+            "and name that behaviour in `body`.\n"
+            "relore's page follows exactly as it served it: lines marked `>` are "
+            "what GitHub users wrote, unmarked ones are relore's own.\n"
+            f"{result.page}\n"
+        )
+    # No page. The old triage instruction — reconstruct the intent from what the
+    # commit left in the tree — was deleted because it is a bad method that was
+    # running on every cluster; it is still the right method when there is
+    # genuinely nothing to read, so it lives here, where that is known.
+    return (
+        head
+        + f"CI's bisect blamed this group on #{result.number}, and serge could not "
+        f"fetch it: {result.error}\n"
+        f"So its discussion is UNREAD, not empty. Retry it yourself with "
+        f"`history_thread {result.number}`; if that fails too, establish what the "
+        "culprit protected from what it left in the tree — the comment block above "
+        "the code it changed, the test it added — and if you cannot, say so in "
+        "`body` and produce no patch rather than guessing.\n"
+    )

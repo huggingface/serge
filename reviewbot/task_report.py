@@ -52,8 +52,9 @@ _STEP_PHASES: dict[str, tuple[str, str]] = {
     "launch": ("launch", "Launch runner"),
     "clone": ("clone", "Checkout"),
     "preflight": ("preflight", "Preflight"),
-    # Emitted by tasks._prior_art_note: serge's own history lookup, which runs
-    # between the reproduce gate and the first turn.
+    # Emitted by tasks._history_notes: serge's own history lookups, which run
+    # between the reproduce gate and the first turn. One step covers both the
+    # prior-art search and, on a regression cluster, the culprit PR's thread.
     "history": ("history", "Project history"),
     "llm": ("llm", "Agent loop"),
     "apply": ("apply", "Apply patch"),
@@ -120,6 +121,8 @@ _PHASE_RULES: dict[str, tuple[tuple[str, str], ...]] = {
         (_OK, "already discuss these tests"),
         # A search that ran and matched nothing is a real answer, not a miss.
         (_OK, "no earlier thread matched"),
+        # A regression cluster only: the blamed PR's discussion was fetched.
+        (_OK, "its discussion is in the"),
     ),
     "pr": ((_OK, "Opened PR"),),
     "done": ((_OK, "Opened PR"),),
