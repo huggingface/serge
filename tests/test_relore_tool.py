@@ -1070,6 +1070,32 @@ class TestCulpritThreadNote:
         # The lead-in is serge's own, so it sits OUTSIDE relore's envelope.
         assert note.index("CI's bisect") < note.index("<<<RELORE-UNTRUSTED>>>")
 
+    def test_it_tells_the_model_not_to_hunt_the_tree_for_the_pull_request(self):
+        """Measured, not guessed.
+
+        In the 2026-09-22 replay the model read this block, used it in `body` —
+        and still spent 8 of its 18 `grep` calls looking for `48714`, `kernels`
+        and `0.17.0` in the source. A pull-request number is not in the tree, so
+        those calls could only ever return nothing. The paragraph that taught
+        that habit was deleted from the triage addendum; the habit outlived it.
+
+        Note what this does NOT say: that the thread is true. It is quoted
+        GitHub text inside an untrusted envelope. It redirects corroboration to
+        the code, which is the right target, rather than granting the page
+        authority it must not have.
+        """
+        note = relore_tool.culprit_thread_note(
+            relore_tool.CulpritThread(47988, page=_PAGE)
+        )
+        assert "Do not go looking for any of this in the tree" in note
+        assert "read the code it is about" in note
+        # It must not promote the quoted page to trusted. Checked on the lead-in
+        # only: the envelope marker itself contains the word UNTRUSTED, so a
+        # substring test over the whole block would pass for the wrong reason.
+        lead_in = note.split("<<<RELORE-UNTRUSTED>>>")[0].lower()
+        assert "trust" not in lead_in
+        assert "authoritative" not in lead_in
+
     def test_an_unread_thread_is_unread_not_empty(self):
         """The fallback, and the only place the old triage instruction survives.
 
