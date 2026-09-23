@@ -8,8 +8,8 @@ on:
     branches:
       - main
 
-permissions:
-  contents: read
+
+permissions: {}
 
 jobs:
   # Lint the workflow files themselves first. actionlint statically checks
@@ -17,6 +17,8 @@ jobs:
   # which catches errors that otherwise only surface as a startup failure with
   # zero jobs run — e.g. the invalid trim() that broke ai-review.yml.
   actionlint:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
 
     steps:
@@ -33,6 +35,8 @@ jobs:
         shell: bash
 
   test:
+    permissions:
+      contents: read
     needs: actionlint
     runs-on: ubuntu-latest
 
@@ -55,6 +59,8 @@ jobs:
         run: make test
 
   helm:
+    permissions:
+      contents: read
     needs: actionlint
     runs-on: ubuntu-latest
 

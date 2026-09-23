@@ -41,12 +41,13 @@ on:
         required: false
         default: ""
 
-permissions:
-  id-token: write   # required to mint the OIDC token serge verifies
-  contents: read
+
+permissions: {}
 
 jobs:
   run-task:
+    permissions:
+      id-token: write
     # In-VPC self-hosted runner group; reaches the internal ALB directly.
     runs-on:
       group: aws-general-8-plus
