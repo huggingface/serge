@@ -60,6 +60,7 @@ def run_normalize(
     timeout: int,
     memory: Optional[str] = None,
     network: bool = False,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> tuple[int, str]:
     """Run ``command`` against the worktree in the selected sandbox backend.
 
@@ -81,6 +82,7 @@ def run_normalize(
         timeout=timeout,
         memory=memory,
         network=network,
+        extra_env=extra_env,
     )
 
 
@@ -95,6 +97,7 @@ def _run_subprocess(
     timeout: int,
     memory: Optional[str],
     network: bool,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> tuple[int, str]:
     """bwrap / docker / auto backends: wrap the command and run it locally."""
     try:
@@ -118,7 +121,7 @@ def _run_subprocess(
             text=True,
             timeout=timeout,
             cwd=workdir,
-            env=_helper_subprocess_env(),
+            env={**_helper_subprocess_env(), **(extra_env or {})},
         )
     except subprocess.TimeoutExpired as exc:
         raise NormalizeError(f"normalize command timed out after {timeout}s") from exc

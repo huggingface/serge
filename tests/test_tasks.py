@@ -4,9 +4,11 @@ worktree via CloneCache, fake GitHub Git Data API)."""
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -2126,3 +2128,118 @@ class CulpritThreadStepTests(unittest.TestCase):
             )
         self.assertEqual(culprit, "")
         self.assertIn(("step", "history"), events)
+
+
+class PatchShapedForCheckersTests(unittest.TestCase):
+    """Make the worktree answer "what did this patch change?" while the
+    normalizer runs.
+
+    transformers#49026: on 2026-09-22 the normalizer failed 7 of 10 ITF groups
+    on `noisy_comments`. Nothing was wrong with the patches. serge's worktree
+    has no `origin/main` (CloneCache detaches it) so the checker could not
+    resolve the patch, fell back to scanning the whole tree, and
+    `--fail-on-findings` blocked on 375 comments in files serge never opened.
+    The shallow clone compounded it: `git blame` pins every line older than the
+    graft to the boundary commit, so the checker's date and ownership filters —
+    both of which read blame — silently became no-ops.
+    """
+
+    def _repo(self):
+        import subprocess as sp
+        import tempfile
+
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, True)
+
+        def run(*a):
+            return sp.run(["git", "-C", path, *a], capture_output=True, text=True)
+
+        run("init", "-q", "-b", "main")
+        run("config", "user.email", "t@t")
+        run("config", "user.name", "t")
+        (Path(path) / "a.py").write_text("x = 1\n")
+        run("add", "-A")
+        run("commit", "-qm", "base")
+        return path, run
+
+    def _checkout(self, path):
+        return Checkout(path=path, branch="b", bare="x", owner="o", repo="r")
+
+    def test_the_patch_becomes_visible_as_a_commit_then_is_undone(self):
+        path, run = self._repo()
+        base = run("rev-parse", "HEAD").stdout.strip()
+        (Path(path) / "a.py").write_text("x = 2\n")  # serge's patch, uncommitted
+
+        with tasks_module._patch_shaped_for_checkers(self._checkout(path)):
+            inside_head = run("rev-parse", "HEAD").stdout.strip()
+            # The whole point: `merge_base...HEAD` is now exactly the patch.
+            diff = run("diff", "--name-only", f"{base}...HEAD").stdout.split()
+            self.assertNotEqual(inside_head, base)
+            self.assertEqual(diff, ["a.py"])
+            self.assertEqual(
+                run("rev-parse", "refs/remotes/origin/main").stdout.strip(), base
+            )
+
+        self.assertEqual(run("rev-parse", "HEAD").stdout.strip(), base)
+        # Still uncommitted, and still the patched content.
+        self.assertTrue(run("status", "--porcelain").stdout.strip())
+        self.assertEqual((Path(path) / "a.py").read_text(), "x = 2\n")
+        self.assertEqual(
+            run("rev-parse", "--verify", "-q", "refs/remotes/origin/main").returncode, 1
+        )
+
+    def test_new_files_are_visible_too(self):
+        # `add -A`, not a path list: a checker that cannot see a file serge
+        # added reports it as unchanged, which is the silent half of #49026.
+        path, run = self._repo()
+        base = run("rev-parse", "HEAD").stdout.strip()
+        (Path(path) / "new.py").write_text("y = 1\n")
+        with tasks_module._patch_shaped_for_checkers(self._checkout(path)):
+            self.assertIn("new.py", run("diff", "--name-only", f"{base}...HEAD").stdout)
+        self.assertTrue((Path(path) / "new.py").exists())
+
+    def test_it_is_undone_when_the_normalizer_raises(self):
+        path, run = self._repo()
+        base = run("rev-parse", "HEAD").stdout.strip()
+        (Path(path) / "a.py").write_text("x = 3\n")
+        with self.assertRaises(RuntimeError):
+            with tasks_module._patch_shaped_for_checkers(self._checkout(path)):
+                raise RuntimeError("normalizer blew up")
+        self.assertEqual(run("rev-parse", "HEAD").stdout.strip(), base)
+        self.assertEqual((Path(path) / "a.py").read_text(), "x = 3\n")
+
+    def test_an_existing_base_ref_is_left_alone(self):
+        # Only ever delete what we minted; clobbering a real origin/main would
+        # outlive the normalizer.
+        path, run = self._repo()
+        base = run("rev-parse", "HEAD").stdout.strip()
+        run("update-ref", "refs/remotes/origin/main", base)
+        (Path(path) / "a.py").write_text("x = 4\n")
+        with tasks_module._patch_shaped_for_checkers(self._checkout(path)):
+            pass
+        self.assertEqual(
+            run("rev-parse", "refs/remotes/origin/main").stdout.strip(), base
+        )
+
+    def test_a_clean_worktree_is_a_no_op(self):
+        path, run = self._repo()
+        base = run("rev-parse", "HEAD").stdout.strip()
+        with tasks_module._patch_shaped_for_checkers(self._checkout(path)):
+            # Nothing to commit, so HEAD must not move.
+            self.assertEqual(run("rev-parse", "HEAD").stdout.strip(), base)
+        self.assertEqual(run("rev-parse", "HEAD").stdout.strip(), base)
+
+    def test_somewhere_that_is_not_a_repo_still_runs_the_normalizer(self):
+        # Fail-soft: un-shaped is today's behaviour, but not running the
+        # normalizer at all would be worse.
+        import tempfile
+
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, True)
+        with tasks_module._patch_shaped_for_checkers(self._checkout(path)):
+            pass
+
+    def test_the_checker_env_asks_for_patch_scoping(self):
+        # Without this the checker's `diff_only` is False and it scans the
+        # whole tree however well-shaped the worktree is.
+        self.assertEqual(tasks_module._CHECKER_ENV["CI_PULL_REQUEST"], "1")

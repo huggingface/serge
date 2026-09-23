@@ -22,9 +22,10 @@ import json
 import logging
 import os
 import re
+import contextlib
 import subprocess
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from . import __version__, anchored_edits, budget, pr_links
 from .brevity import BrevityResult, condense_patch_comments
@@ -497,6 +498,85 @@ def format_pr_files_diff(files: list[dict[str, Any]], *, limit: int = 30000) -> 
 # ---------------------------------------------------------------------------
 # Agentic loop → patch (with in-loop normalize validation)
 # ---------------------------------------------------------------------------
+# A serge worktree cannot answer "what did this patch change?", so checkers that
+# scope to the patch fall back to scanning the whole tree. transformers#49026:
+# `noisy_comments` blocked 7 of 10 groups on 377 findings, 375 of them in files
+# serge never opened. Two causes, both silent — CloneCache detaches the worktree
+# so `origin/main` does not exist and the diff is unresolvable, and the clone is
+# shallow so `git blame` (which both of the checker's noise filters read) pins
+# every old line to the graft. Shape the tree for the normalizer instead: the
+# diff then IS serge's patch, and the gate blocks on serge's own comments only.
+_CHECKER_BASE_REF = "refs/remotes/origin/main"
+_CHECKER_ENV = {
+    # `_running_in_pr()`: without it a checker never scopes to the patch.
+    "CI_PULL_REQUEST": "1",
+}
+
+
+def _git_in(checkout: Checkout, *args: str) -> tuple[int, str]:
+    """One git call in the worktree. Never raises; every use here is best-effort."""
+    try:
+        done = subprocess.run(
+            ["git", "-C", checkout.path, *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception:
+        log.debug("git %s failed in %s", args, checkout.path, exc_info=True)
+        return 1, ""
+    return done.returncode, (done.stdout or "").strip()
+
+
+@contextlib.contextmanager
+def _patch_shaped_for_checkers(checkout: Checkout) -> Iterator[None]:
+    """Make the worktree look like a pull request while the normalizer runs.
+
+    Best-effort both ways: un-shaped still runs (today's behaviour), and what was
+    shaped is always undone, so the worktree comes back byte-identical.
+    """
+    base_rc, base = _git_in(checkout, "rev-parse", "HEAD")
+    if base_rc != 0 or not base:
+        yield
+        return
+
+    # Mint only if missing, delete only what we minted.
+    ref_existed = (
+        _git_in(checkout, "rev-parse", "--verify", "-q", _CHECKER_BASE_REF)[0] == 0
+    )
+    minted_ref = False
+    if not ref_existed:
+        minted_ref = _git_in(checkout, "update-ref", _CHECKER_BASE_REF, base)[0] == 0
+
+    # `add -A`: a checker cannot see a file serge added unless it is tracked.
+    committed = False
+    if _git_in(checkout, "add", "-A")[0] == 0:
+        committed = (
+            _git_in(
+                checkout,
+                "-c",
+                "user.email=serge@huggingface.co",
+                "-c",
+                "user.name=serge",
+                "commit",
+                "--quiet",
+                "--no-verify",
+                "-m",
+                "serge: patch under validation",
+            )[0]
+            == 0
+        )
+    try:
+        yield
+    finally:
+        if committed:
+            # --soft: the fixers' writes stay in the worktree for publish_task.
+            _git_in(checkout, "reset", "--soft", base)
+        if minted_ref:
+            _git_in(checkout, "update-ref", "-d", _CHECKER_BASE_REF)
+
+
 def _run_repo_normalizer(
     cfg: Config,
     checkout: Checkout,
@@ -539,16 +619,18 @@ def _run_repo_normalizer(
         )
     emit("log", f"Running the repo normalizer: `{' '.join(command)}`…")
     try:
-        return run_normalize(
-            command,
-            workdir=checkout.path,
-            write_root=checkout.path,
-            backend=cfg.task_sandbox_backend,
-            image=cfg.task_normalize_image,
-            mode=cfg.helper_sandbox,
-            timeout=timeout,
-            memory=cfg.task_normalize_memory,
-        )
+        with _patch_shaped_for_checkers(checkout):
+            return run_normalize(
+                command,
+                workdir=checkout.path,
+                write_root=checkout.path,
+                backend=cfg.task_sandbox_backend,
+                image=cfg.task_normalize_image,
+                mode=cfg.helper_sandbox,
+                timeout=timeout,
+                memory=cfg.task_normalize_memory,
+                extra_env=_CHECKER_ENV,
+            )
     except NormalizeError as exc:
         # Infrastructure problem (sandbox unavailable, timeout) — not the
         # model's fault. Signal best-effort with a None returncode; CI still
