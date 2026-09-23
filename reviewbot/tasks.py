@@ -498,54 +498,23 @@ def format_pr_files_diff(files: list[dict[str, Any]], *, limit: int = 30000) -> 
 # ---------------------------------------------------------------------------
 # Agentic loop → patch (with in-loop normalize validation)
 # ---------------------------------------------------------------------------
-# Env the normalizer's checkers see, and the ref the worktree grows for them.
-#
-# transformers' `utils/check_noisy_comments.py` — and any checker that reasons
-# about "what this patch changed" — answers a different question depending on
-# whether it can resolve the patch:
-#
-#     diff_only         = _running_in_pr() and not args.all_files
-#     patch_is_resolved = diff_only and _patch_added_lines() is not None
-#     if patch_is_resolved:
-#         findings = _filter_findings_to_patch(findings)
-#     blocking = args.fail_on_findings or (patch_is_resolved and ...)
-#
-# A serge worktree resolved NEITHER half, and both failures are silent:
-#
-# 1. `CloneCache` makes a detached worktree with no branch refs, so `origin/main`
-#    does not exist, `merge-base` fails and the patch is unresolved. The checker
-#    then scans the whole tree. It is written to degrade to *reporting* there —
-#    but `--fail-on-findings` (which transformers' `fix_args` now passes, and
-#    `make fix-repo` runs fix mode) sits on the left of that `or` and blocks
-#    anyway. Measured on a real worktree: 377 findings, 375 of them comments in
-#    files serge never opened. That is what failed 7 of 10 groups on 2026-09-22
-#    (transformers#49026).
-# 2. The clone is shallow (`--depth 50`), so `git blame` attributes every line
-#    older than the graft to the boundary commit. The checker's two noise filters
-#    — ignore findings last committed before a cutoff, ignore an owner's own
-#    comments — both read blame, so both silently become no-ops. The same scan on
-#    a full clone yields 2 findings, not 375.
-#
-# So: give the worktree the ref, and commit the patch, for the duration of the
-# normalizer only. Then `merge_base...HEAD` is exactly serge's patch and the
-# checker blocks on serge's own comments and nothing else — verified on the same
-# worktree: "Restricting noisy comment scan to 1 Python file(s) changed in this
-# patch. Found 2 noisy comment finding(s) on lines this patch adds."
-#
-# The commit is temporary and undone in a `finally`: `publish_task` still commits
-# the worktree itself, exactly as before.
+# A serge worktree cannot answer "what did this patch change?", so checkers that
+# scope to the patch fall back to scanning the whole tree. transformers#49026:
+# `noisy_comments` blocked 7 of 10 groups on 377 findings, 375 of them in files
+# serge never opened. Two causes, both silent — CloneCache detaches the worktree
+# so `origin/main` does not exist and the diff is unresolvable, and the clone is
+# shallow so `git blame` (which both of the checker's noise filters read) pins
+# every old line to the graft. Shape the tree for the normalizer instead: the
+# diff then IS serge's patch, and the gate blocks on serge's own comments only.
 _CHECKER_BASE_REF = "refs/remotes/origin/main"
 _CHECKER_ENV = {
-    # `_running_in_pr()`. Not a lie: serge is preparing a pull request, and this
-    # is the variable that tells a checker to scope to the patch rather than the
-    # tree. Without it `diff_only` is False and the scoping never happens.
+    # `_running_in_pr()`: without it a checker never scopes to the patch.
     "CI_PULL_REQUEST": "1",
 }
 
 
 def _git_in(checkout: Checkout, *args: str) -> tuple[int, str]:
-    """One git call in the worktree. Never raises; callers decide what a
-    non-zero means, because every use here is best-effort."""
+    """One git call in the worktree. Never raises; every use here is best-effort."""
     try:
         done = subprocess.run(
             ["git", "-C", checkout.path, *args],
@@ -564,18 +533,15 @@ def _git_in(checkout: Checkout, *args: str) -> tuple[int, str]:
 def _patch_shaped_for_checkers(checkout: Checkout) -> Iterator[None]:
     """Make the worktree look like a pull request while the normalizer runs.
 
-    Best-effort in both directions. If the shaping cannot be done the normalizer
-    still runs — on today's behaviour, which is the bug, but a normalizer that
-    does not run at all is worse. If it was done it is always undone, including
-    on an exception, so the worktree handed back is byte-identical to the one
-    handed in: same content, same HEAD, nothing staged that was not staged.
+    Best-effort both ways: un-shaped still runs (today's behaviour), and what was
+    shaped is always undone, so the worktree comes back byte-identical.
     """
     base_rc, base = _git_in(checkout, "rev-parse", "HEAD")
     if base_rc != 0 or not base:
         yield
         return
 
-    # Only mint the ref when it is missing, and only delete what we minted.
+    # Mint only if missing, delete only what we minted.
     ref_existed = (
         _git_in(checkout, "rev-parse", "--verify", "-q", _CHECKER_BASE_REF)[0] == 0
     )
@@ -583,8 +549,7 @@ def _patch_shaped_for_checkers(checkout: Checkout) -> Iterator[None]:
     if not ref_existed:
         minted_ref = _git_in(checkout, "update-ref", _CHECKER_BASE_REF, base)[0] == 0
 
-    # `add -A` and not a path list: serge's patch may add files, and a checker
-    # that cannot see a new file reports it as unchanged.
+    # `add -A`: a checker cannot see a file serge added unless it is tracked.
     committed = False
     if _git_in(checkout, "add", "-A")[0] == 0:
         committed = (
@@ -606,9 +571,7 @@ def _patch_shaped_for_checkers(checkout: Checkout) -> Iterator[None]:
         yield
     finally:
         if committed:
-            # --soft: HEAD goes back to the base commit and every change the
-            # normalizer's fixers made stays in the worktree, which is what
-            # `publish_task` reads.
+            # --soft: the fixers' writes stay in the worktree for publish_task.
             _git_in(checkout, "reset", "--soft", base)
         if minted_ref:
             _git_in(checkout, "update-ref", "-d", _CHECKER_BASE_REF)
