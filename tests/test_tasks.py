@@ -1982,6 +1982,22 @@ class PriorArtStepTests(unittest.TestCase):
             ("log", "Project history: #37665 already discuss these tests"), events
         )
 
+    def test_the_task_page_says_when_the_quality_filter_dropped_something(self):
+        # Otherwise a group whose only hits were rejected patches reads on the
+        # page as a group with no history, which is the difference the filter
+        # exists to make.
+        env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
+        result = relore_tool.PriorArtResult([], ["nemotron test_x"], [], [], 2)
+        events = []
+        with patch.object(tasks_module, "prior_art", return_value=result):
+            tasks_module._history_notes(
+                self._req(test_links={self.NODE_ID: []}),
+                env,
+                lambda kind, text: events.append((kind, text)),
+            )
+        logs = [t for k, t in events if k == "log"]
+        self.assertTrue(any("2 excluded" in t for t in logs), logs)
+
     def test_an_unanswered_query_is_logged_as_unanswered_not_as_empty(self):
         # "relore did not answer" and "there is nothing there" are different
         # facts, and the note tells the model to retry only the first.

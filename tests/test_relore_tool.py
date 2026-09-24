@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Optional
 
@@ -719,18 +719,43 @@ class TestFailureSearchQueries:
 
 
 class _FakeRun:
-    """Captures argv and replays canned `relore --json` payloads in order."""
+    """Captures argv and replays canned `relore --json` payloads in order.
 
-    def __init__(self, payloads):
+    ``search`` calls consume ``payloads``; ``thread`` calls (the per-candidate
+    header lookup the quality filter needs) are answered from ``headers``,
+    keyed by number, and default to a merged pull request so a test that only
+    cares about the search half does not have to spell one out.
+    """
+
+    def __init__(self, payloads, headers=None):
         self.payloads = list(payloads)
+        self.headers = dict(headers or {})
         self.calls = []
 
     def __call__(self, argv, **kw):
         self.calls.append(argv)
+        # argv is [exe, "--json", <verb>, ...] — the verb by position, not by
+        # membership: a search whose query happens to be the word "thread"
+        # would match a membership test.
+        if len(argv) > 2 and argv[2] == "thread":
+            number = int(argv[3])
+            header = self.headers.get(number, _header())
+            if header is None:  # the header lookup itself failed
+                return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"thread": header}), stderr=""
+            )
         payload = self.payloads.pop(0) if self.payloads else {}
         if payload is None:  # relore ran and failed
             return SimpleNamespace(returncode=1, stdout="", stderr="boom")
         return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+
+def _header(**kw):
+    """A thread header as `relore --json thread` serves it. Merged by default."""
+    base = {"type": "pr", "state": "closed", "merged": True, "labels": []}
+    base.update(kw)
+    return base
 
 
 def _hit(number, **kw):
@@ -834,9 +859,215 @@ class TestPriorArt:
         assert not result.searched_anything
 
 
-def _result(threads=(), ran=(), failed=(), skipped=()):
+class TestPriorArtQualityFilter:
+    """Section 3.1a: the block is headed "trusted", so what is under it has to be.
+
+    `search` ranks how well a thread matches the question and says nothing about
+    whether the project agreed with it, so relevance alone puts rejected patches
+    under that heading. Verified against the production index at 0.3.17: a hit
+    is `number/type/title/url/author/trust/age` and carries no verdict at all,
+    which is why each candidate costs a second call.
+    """
+
+    ENV = relore_tool.ReloreEnv(repo="huggingface/transformers", api="https://x")
+    NODE_ID = "tests/models/nemotron/test_modeling_nemotron.py::T::test_model_8b"
+    OTHER = "tests/models/gemma/test_modeling_gemma.py::T::test_other"
+
+    def _run(self, monkeypatch, payloads, headers):
+        run = _FakeRun(payloads, headers)
+        monkeypatch.setattr(relore_tool.subprocess, "run", run)
+        return run
+
+    def test_a_pull_request_closed_without_merging_is_dropped(self, monkeypatch):
+        """A proposal the project turned down is not project history.
+
+        Left in, it invites the agent to re-derive a patch maintainers have
+        already rejected — and on serge's own rejected attempts (titled
+        `[serge] …`) to re-derive its own.
+        """
+        self._run(
+            monkeypatch,
+            [{"hits": [_hit(1), _hit(2)]}],
+            {1: _header(state="closed", merged=False), 2: _header()},
+        )
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        assert [t.number for t in result.threads] == [2]
+        assert result.dropped == 1
+
+    def test_a_junk_label_drops_a_thread_that_is_still_open(self, monkeypatch):
+        # The state filter would not catch this one: the maintainers' label is
+        # the only signal, and it is the signal they left on purpose.
+        self._run(
+            monkeypatch,
+            [{"hits": [_hit(1)]}],
+            {1: _header(state="open", merged=False, labels=["Code Agent Slop"])},
+        )
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        assert result.threads == []
+        assert result.dropped == 1
+
+    def test_a_closed_issue_is_kept(self, monkeypatch):
+        """The filter's one dangerous false positive, guarded.
+
+        An issue is closed when it is RESOLVED. relore's own benchmark scores
+        the `failure` slice highest precisely because those answers are mostly
+        issues, so reading `state: closed` as a rejection would throw away the
+        best evidence the index has.
+        """
+        self._run(
+            monkeypatch,
+            [{"hits": [_hit(1, type="issue")]}],
+            {1: _header(type="issue", state="closed", merged=False)},
+        )
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        assert [t.number for t in result.threads] == [1]
+        assert result.dropped == 0
+
+    def test_merged_outranks_open_and_relevance_breaks_the_tie(self, monkeypatch):
+        # relore returned 1..4 in relevance order. The sort is stable and tier
+        # is its only key, so within a tier that order survives.
+        self._run(
+            monkeypatch,
+            [{"hits": [_hit(1), _hit(2), _hit(3), _hit(4)]}],
+            {
+                1: _header(state="open", merged=False),
+                2: _header(review_decision="approved"),
+                3: _header(),
+                4: _header(state="open", merged=False, review_decision="approved"),
+            },
+        )
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        assert [t.number for t in result.threads] == [2, 3, 4, 1]
+
+    def test_an_issue_is_not_demoted_below_an_open_pull_request(self, monkeypatch):
+        self._run(
+            monkeypatch,
+            [{"hits": [_hit(1, type="issue"), _hit(2)]}],
+            {
+                1: _header(type="issue", state="open", merged=False),
+                2: _header(state="open", merged=False, review_decision="approved"),
+            },
+        )
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        assert [t.number for t in result.threads] == [1, 2]
+
+    def test_a_header_relore_did_not_answer_keeps_the_thread(self, monkeypatch):
+        """Unknown is not bad, and it is not good either.
+
+        Dropping on a failed lookup would make a relore hiccup silently shorten
+        the block; keeping it as if it were merged would launder the very thing
+        the filter exists to catch. It is kept, ranked last, and rendered as
+        unknown.
+        """
+        self._run(monkeypatch, [{"hits": [_hit(1), _hit(2)]}], {1: None, 2: _header()})
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        assert [t.number for t in result.threads] == [2, 1]
+        assert result.dropped == 0
+        assert relore_tool.prior_art_note(result).count("state unknown") == 1
+
+    def test_the_filter_looks_past_the_keep_budget(self, monkeypatch):
+        # Otherwise a run of rejects shortens the block instead of filtering it:
+        # six hits, the first four rejected, still fills two slots rather than
+        # stopping at six candidates.
+        monkeypatch.setattr(relore_tool, "MAX_PRIOR_ART", 2)
+        self._run(
+            monkeypatch,
+            [{"hits": [_hit(n) for n in range(1, 7)]}],
+            {n: _header(state="closed", merged=False) for n in (1, 2, 3, 4)},
+        )
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        assert [t.number for t in result.threads] == [5, 6]
+        assert result.dropped == 4
+
+    def test_the_candidate_budget_stops_the_header_lookups(self, monkeypatch):
+        monkeypatch.setattr(relore_tool, "MAX_PRIOR_ART_CANDIDATES", 2)
+        run = self._run(
+            monkeypatch,
+            [{"hits": [_hit(1), _hit(2), _hit(3), _hit(4)]}],
+            {n: _header(state="closed", merged=False) for n in (1, 2, 3, 4)},
+        )
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID, self.OTHER])
+        assert result.dropped == 2
+        # Two header calls, not four, and the second query was never sent.
+        assert sum(1 for c in run.calls if c[2] == "thread") == 2
+        assert result.skipped == ["gemma test_other"]
+
+    def test_the_header_lookup_is_scoped_and_bounded(self, monkeypatch):
+        run = self._run(monkeypatch, [{"hits": [_hit(1)]}], {})
+        relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        header = next(c for c in run.calls if c[2] == "thread")
+        assert header[3:] == ["1", "--repo", "huggingface/transformers"]
+
+    def test_the_header_lookup_gets_a_shorter_timeout(self, monkeypatch):
+        """A metadata read must not be able to spend the tool timeout.
+
+        Twelve candidates at 45s is nine minutes of nothing before the first
+        turn, against a promise that a slow relore costs the task nothing.
+        """
+        seen = {}
+
+        def run(argv, **kw):
+            seen[argv[2]] = kw.get("timeout")
+            payload = (
+                {"hits": [_hit(1)]} if argv[2] == "search" else {"thread": _header()}
+            )
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+        monkeypatch.setattr(relore_tool.subprocess, "run", run)
+        relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        assert seen["search"] == relore_tool.DEFAULT_RELORE_TIMEOUT
+        assert seen["thread"] == relore_tool.PRIOR_ART_STATE_TIMEOUT
+
+    def test_a_header_missing_the_verdict_fields_makes_the_filter_inert(
+        self, monkeypatch, caplog
+    ):
+        """The one way this could throw the whole block away.
+
+        A merged pull request's `state` IS "closed" — merge is a separate
+        field. So a relore that stopped serving `merged` would make every
+        merged hit read as a rejected one and the filter would drop the lot.
+        Absent keys are unknown, not false.
+        """
+        self._run(
+            monkeypatch, [{"hits": [_hit(1)]}], {1: {"type": "pr", "state": "closed"}}
+        )
+        with caplog.at_level("WARNING"):
+            result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        assert [t.number for t in result.threads] == [1]
+        assert result.dropped == 0
+        assert "quality filter is inert" in caplog.text
+
+    def test_the_mistral4_block_from_run_35971338918(self, monkeypatch):
+        """The worked example section 3.1a was found on, with real headers.
+
+        The four hits presented to task 1e95ef4520fc as project history, exactly
+        as the production index serves them. #48946 was closed unmerged AND
+        labelled `Code agent slop`; presenting it under a "trusted" heading is
+        the worst case the untrusted-envelope design exists to prevent, arriving
+        through the one channel that skips it.
+        """
+        self._run(
+            monkeypatch,
+            [{"hits": [_hit(n) for n in (48652, 48946, 48920, 48447)]}],
+            {
+                48652: _header(review_decision="approved"),
+                48946: _header(
+                    state="closed", merged=False, labels=["Code agent slop"]
+                ),
+                48920: _header(state="open", merged=False),
+                48447: _header(review_decision="approved"),
+            },
+        )
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        assert [t.number for t in result.threads] == [48652, 48447, 48920]
+        note = relore_tool.prior_art_note(result)
+        assert "48946" not in note
+        assert "Code agent slop" not in note
+
+
+def _result(threads=(), ran=(), failed=(), skipped=(), dropped=0):
     return relore_tool.PriorArtResult(
-        list(threads), list(ran), list(failed), list(skipped)
+        list(threads), list(ran), list(failed), list(skipped), dropped
     )
 
 
@@ -894,6 +1125,40 @@ class TestPriorArtNote:
     def test_one_thread_is_not_pluralised(self):
         note = relore_tool.prior_art_note(_result(threads=[self.THREAD], ran=["a"]))
         assert "1 earlier thread matched" in note
+
+    def test_the_verdict_is_rendered_next_to_the_trust_tier(self):
+        merged = replace(self.THREAD, state="closed", merged=True, review="approved")
+        note = relore_tool.prior_art_note(_result(threads=[merged], ran=["a"]))
+        # "closed" is GitHub's word for a merged PR's state and would read as a
+        # rejection; the block says what happened to it.
+        assert "(merged, approved, reported, 16mo)" in note
+        assert "closed" not in note
+
+    def test_an_open_thread_says_nobody_has_accepted_it(self):
+        open_pr = replace(self.THREAD, state="open")
+        note = relore_tool.prior_art_note(_result(threads=[open_pr], ran=["a"]))
+        assert "(open, reported, 16mo)" in note
+        assert "nobody has accepted" in note
+
+    def test_excluded_threads_are_counted_but_not_named(self):
+        """Both halves matter, and they pull against each other.
+
+        Counted, because a block that quietly returns four of six is the same
+        silently-incomplete shape the ran/failed/skipped split exists to
+        prevent. Not named, because handing the numbers back is handing back
+        exactly what the filter took away.
+        """
+        note = relore_tool.prior_art_note(
+            _result(threads=[self.THREAD], ran=["a"], dropped=2)
+        )
+        assert "2 further matches were excluded" in note
+        assert "Do not go looking for them" in note
+
+    def test_everything_dropped_is_not_reported_as_an_empty_history(self):
+        # "Nothing worth reading" and "nothing at all" are different facts, and
+        # a group whose only matches were rejected patches has a history.
+        note = relore_tool.prior_art_note(_result(ran=["a"], dropped=3))
+        assert "found nothing worth putting in front of you" in note
 
 
 # -- the culprit PR's thread -----------------------------------------------
