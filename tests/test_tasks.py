@@ -1998,6 +1998,97 @@ class PriorArtStepTests(unittest.TestCase):
         logs = [t for k, t in events if k == "log"]
         self.assertTrue(any("2 excluded" in t for t in logs), logs)
 
+    def test_a_retry_round_reuses_the_lookup_instead_of_repeating_it(self):
+        """§3.7 part 1. The saving is not the point; the silent failure is.
+
+        Both lookups are keyed on the ORIGINAL failing tests and the culprit
+        number, neither of which a retry changes — measured over run
+        35971338918, 7 of 8 multi-round jobs got byte-identical results. What
+        the cache buys is that a relore which is up for round 1 and down for
+        round 2 cannot quietly drop a block the job already had.
+        """
+        env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
+        result = relore_tool.PriorArtResult([], ["nemotron test_x"], [], [], 0)
+        cache: dict = {}
+        req = self._req(test_links={self.NODE_ID: []})
+        events = []
+
+        def run(kind, text):
+            events.append((kind, text))
+
+        with patch.object(tasks_module, "prior_art", return_value=result) as art:
+            first, _ = tasks_module._history_notes(req, env, run, cache)
+            second, _ = tasks_module._history_notes(req, env, run, cache)
+        self.assertEqual(art.call_count, 1)
+        self.assertEqual(first, second)
+        self.assertTrue(any("reusing this job" in t for k, t in events if k == "log"))
+        # Both rounds still get their own step, so the page shows two rounds.
+        self.assertEqual([e for e in events if e == ("step", "history")].__len__(), 2)
+
+    def test_a_lookup_that_failed_is_not_cached(self):
+        # Otherwise a relore blip in round 1 costs the job every later round,
+        # which is the failure this cache exists to prevent, inverted.
+        env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
+        cache: dict = {}
+        req = self._req(test_links={self.NODE_ID: []})
+        with patch.object(tasks_module, "prior_art", side_effect=OSError("down")) as a:
+            tasks_module._history_notes(req, env, lambda *a_: None, cache)
+            tasks_module._history_notes(req, env, lambda *a_: None, cache)
+        self.assertEqual(a.call_count, 2)
+        self.assertEqual(cache, {})
+
+    def test_the_failure_lookup_runs_every_round_and_is_never_cached(self):
+        """§3.7 part 2. This is the one thing a retry MUST re-ask.
+
+        It is keyed on the traceback the round was given, which is precisely
+        what changed — and it is the only question that uses what the GPU run
+        just said.
+        """
+        env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
+        art = relore_tool.PriorArtResult([], ["nemotron test_x"], [], [], 0)
+        thread = relore_tool.PriorThread(
+            number=48653,
+            kind="pr",
+            title="[MoE] Fix eager EP",
+            url="u",
+            author="vasqu",
+            trust="authoritative",
+            age="14d",
+            query="q",
+            state="closed",
+            merged=True,
+        )
+        failure = relore_tool.PriorArtResult(
+            [thread], ["RuntimeError mat_a"], [], [], 0
+        )
+        req = self._req(
+            test_links={self.NODE_ID: []},
+            context="Your previous patch did NOT fix the tests\nE  RuntimeError: x",
+        )
+        cache: dict = {}
+        with (
+            patch.object(tasks_module, "prior_art", return_value=art) as prior,
+            patch.object(tasks_module, "failure_art", return_value=failure) as fail,
+        ):
+            note1, _ = tasks_module._history_notes(req, env, lambda *a: None, cache)
+            note2, _ = tasks_module._history_notes(req, env, lambda *a: None, cache)
+        self.assertEqual(prior.call_count, 1)  # cached
+        self.assertEqual(fail.call_count, 2)  # not cached
+        self.assertIn("#48653", note1)
+        self.assertIn("#48653", note2)
+
+    def test_the_failure_lookup_is_absent_on_a_first_round(self):
+        env = SimpleNamespace(relore=SimpleNamespace(repo="x", api="y"))
+        art = relore_tool.PriorArtResult([], ["nemotron test_x"], [], [], 0)
+        with (
+            patch.object(tasks_module, "prior_art", return_value=art),
+            patch.object(tasks_module, "failure_art") as fail,
+        ):
+            tasks_module._history_notes(
+                self._req(test_links={self.NODE_ID: []}), env, lambda *a: None
+            )
+        fail.assert_not_called()
+
     def test_an_unanswered_query_is_logged_as_unanswered_not_as_empty(self):
         # "relore did not answer" and "there is nothing there" are different
         # facts, and the note tells the model to retry only the first.

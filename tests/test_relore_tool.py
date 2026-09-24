@@ -1376,3 +1376,170 @@ class TestCulpritThreadNote:
         assert "history_thread 47988" in note
         assert "404" in note
         assert "produce no patch" in note
+
+
+# -- the failure the LAST patch produced (§3.7) ----------------------------
+
+
+_FEEDBACK = """## Your previous patch did NOT fix the tests (GPU verification)
+
+A previous candidate was run on GPU; the verdict was `not_fixed`.
+
+### tests/models/mistral4/test_modeling_mistral4.py::T::test_logits
+```
+    hidden = experts(hidden)
+src/transformers/integrations/moe.py:59: in forward
+    out = torch._grouped_mm(mat_a, mat_b)
+E       RuntimeError: Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Float8_e4m3fn
+/usr/local/lib/python3.10/dist-packages/torch/nn/functional.py:7168: RuntimeError
+```
+"""
+
+
+class TestVerifyFeedbackBlock:
+    def test_round_one_has_none(self):
+        assert relore_tool.verify_feedback_block("group facts, no retry yet") == ""
+
+    def test_it_starts_at_the_marker_not_at_the_context(self):
+        block = relore_tool.verify_feedback_block("GROUP FACTS\n\n" + _FEEDBACK)
+        # Anchored on the sentence, not on the heading level, so a reformatted
+        # heading does not silently stop the failure lookup from ever running.
+        assert block.startswith("Your previous patch did NOT fix")
+        assert "GROUP FACTS" not in block
+        assert "Float8_e4m3fn" in block
+
+
+class TestFailureKey:
+    def test_it_takes_the_exception_terms_and_the_deepest_repo_frame(self):
+        exc, terms, repo_file = relore_tool.failure_key(_FEEDBACK)
+        assert exc == "RuntimeError"
+        # `Float32`/`BFloat16` survive; `matrix`, `expected` and `got` are the
+        # message's own furniture and do not.
+        assert terms == ["mat_a", "Float32", "BFloat16"]
+        # NOT torch/nn/functional.py, which is where it was raised. A file
+        # filter on somebody else's library tells relore nothing about ours.
+        assert repo_file == "src/transformers/integrations/moe.py"
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "E       AssertionError: Tensor-likes are not close!",
+            "E       AssertionError: Lists differ: ['a'] != ['b']",
+            "E       torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB",
+        ],
+    )
+    def test_the_two_measured_dead_ends_yield_no_query(self, line):
+        """§3.7a, measured blind over 20 of these.
+
+        An assertion message is a diff of two outputs and an OOM message is
+        allocator boilerplate — in both the message IS the data. A query built
+        from one returns four-year-old noise, and worse, it moves off §3.1's
+        test-keyed lookup, which for these two shapes is the better key: it
+        finds how this same test was fixed last time.
+        """
+        exc, terms, repo_file = relore_tool.failure_key(
+            _FEEDBACK.replace(
+                "E       RuntimeError: Expected mat_a to be Float32, BFloat16 "
+                "or Float16 matrix, got Float8_e4m3fn",
+                line,
+            )
+        )
+        assert terms == []
+        assert repo_file == ""
+
+    def test_no_exception_line_yields_nothing(self):
+        assert relore_tool.failure_key("a block with no E line") == ("", [], "")
+
+
+class TestFailureArt:
+    ENV = relore_tool.ReloreEnv(repo="huggingface/transformers", api="https://x")
+
+    def test_a_dead_end_shape_makes_no_call_at_all(self, monkeypatch):
+        run = _FakeRun([])
+        monkeypatch.setattr(relore_tool.subprocess, "run", run)
+        feedback = _FEEDBACK.replace(
+            "RuntimeError: Expected mat_a to be Float32, "
+            "BFloat16 or Float16 matrix, got Float8_e4m3fn",
+            "AssertionError: Tensor-likes are not close!",
+        )
+        assert relore_tool.failure_art(self.ENV, feedback=feedback) is None
+        assert run.calls == []
+
+    def test_round_one_makes_no_call(self, monkeypatch):
+        run = _FakeRun([])
+        monkeypatch.setattr(relore_tool.subprocess, "run", run)
+        assert relore_tool.failure_art(self.ENV, feedback="") is None
+        assert run.calls == []
+
+    def test_it_asks_the_terms_then_the_file(self, monkeypatch):
+        run = _FakeRun([{"hits": [_hit(1)]}, {"hits": [_hit(2)]}])
+        monkeypatch.setattr(relore_tool.subprocess, "run", run)
+        result = relore_tool.failure_art(self.ENV, feedback=_FEEDBACK)
+        assert result is not None
+        assert {t.number for t in result.threads} == {1, 2}
+        searches = [c for c in run.calls if c[2] == "search"]
+        assert searches[0][3] == "RuntimeError mat_a Float32 BFloat16"
+        # The file query carries a bigger limit: --file ranks a slice against
+        # an empty query, and the thread that rewrote the file came back at
+        # rank 8 on the real index.
+        assert "--file" in searches[1]
+        assert searches[1][searches[1].index("--limit") + 1] == str(
+            relore_tool.FAILURE_FILE_LIMIT
+        )
+
+    def test_the_quality_filter_applies_here_too(self, monkeypatch):
+        # A rejected pull request is no more admissible because the query that
+        # found it was keyed on a traceback.
+        monkeypatch.setattr(
+            relore_tool.subprocess,
+            "run",
+            _FakeRun(
+                [{"hits": [_hit(1)]}, {"hits": [_hit(2)]}],
+                {1: _header(state="closed", merged=False), 2: _header()},
+            ),
+        )
+        result = relore_tool.failure_art(self.ENV, feedback=_FEEDBACK)
+        assert result is not None
+        assert [t.number for t in result.threads] == [2]
+        assert result.dropped == 1
+
+
+class TestFailureSection:
+    THREAD = relore_tool.PriorThread(
+        number=48653,
+        kind="pr",
+        title="[MoE] Fix eager EP",
+        url="https://github.com/huggingface/transformers/pull/48653",
+        author="vasqu",
+        trust="authoritative",
+        age="14d",
+        query="RuntimeError mat_a",
+        state="closed",
+        merged=True,
+        review="approved",
+    )
+
+    def test_the_two_searches_are_labelled_as_different_questions(self):
+        note = relore_tool.prior_art_note(
+            _result(threads=[TestPriorArtNote.THREAD], ran=["nemotron test_x"]),
+            _result(threads=[self.THREAD], ran=["RuntimeError mat_a"]),
+        )
+        # Both lists in one block, but the model is told which is which.
+        assert "#37665" in note and "#48653" in note
+        assert "the failure THAT patch produced" in note
+        assert "Different question" in note
+
+    def test_no_failure_lookup_leaves_the_block_unchanged(self):
+        result = _result(threads=[TestPriorArtNote.THREAD], ran=["a"])
+        assert relore_tool.prior_art_note(result) == relore_tool.prior_art_note(
+            result, None
+        )
+
+    def test_a_failure_search_that_found_nothing_says_so(self):
+        # Distinct from not having searched: the model must not re-run it.
+        note = relore_tool.prior_art_note(
+            _result(threads=[TestPriorArtNote.THREAD], ran=["a"]),
+            _result(ran=["RuntimeError mat_a"]),
+        )
+        assert "nothing matched it" in note
+        assert "do NOT repeat: `RuntimeError mat_a`" in note

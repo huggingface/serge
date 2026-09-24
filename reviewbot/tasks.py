@@ -39,11 +39,14 @@ from .llm_client import ChatCompletionClient
 from .normalize import NormalizeError, run_normalize
 from .prompts import build_task_system_prompt, build_task_user_prompt
 from .relore_tool import (
+    PriorArtResult,
     culprit_pr_number,
     culprit_thread,
     culprit_thread_note,
+    failure_art,
     prior_art,
     prior_art_note,
+    verify_feedback_block,
 )
 from .tools import ToolEnv
 from .reviewer import (
@@ -1402,10 +1405,20 @@ def _failing_node_ids(req: TaskRequest) -> list[str]:
     return node_ids
 
 
+#: Per-job memo for the two lookups that a GPU-verify retry cannot change.
+#: Keyed on what they are keyed on — the original node-ids and the culprit
+#: number — so a request that somehow DID change them re-queries rather than
+#: serving a stale answer.
+HistoryCache = dict[
+    tuple[tuple[str, ...], Optional[int]], tuple[Optional[PriorArtResult], str]
+]
+
+
 def _history_notes(
     req: TaskRequest,
     tool_env: Optional[ToolEnv],
     emit: Callable[[str, str], None],
+    cache: Optional[HistoryCache] = None,
 ) -> tuple[str, str]:
     """Everything serge looks up in the project history BEFORE the first turn.
 
@@ -1428,6 +1441,21 @@ def _history_notes(
 
     Fail-soft and non-gating throughout: a relore that is down, slow or
     unindexed costs this task nothing but the empty string.
+
+    ``cache`` makes this idempotent across the GPU-verify retry rounds. Both
+    lookups are keyed on the ORIGINAL failing tests and the culprit number,
+    neither of which a retry changes, so re-running them returns the same
+    thing: measured over run 35971338918, 7 of the 8 jobs that made more than
+    one pre-loop lookup got byte-identical results. The saving is not the point
+    — the blocks sit in the prompt prefix either way — the silent failure is.
+    A relore that is up for round 1 and down for round 2 drops a block the job
+    already had, and nothing anywhere reports the difference. Only successes
+    are cached, so a round that failed can still recover on the next one.
+
+    What a retry DOES change is the failure: by round 2 the agent has the
+    traceback its own patch produced, which is a different question, asked at
+    the moment it is most lost. :func:`relore_tool.failure_art` answers that
+    one — on the failure shapes where an answer exists at all (§3.7a).
     """
     if tool_env is None or tool_env.relore is None:
         return "", ""
@@ -1436,29 +1464,95 @@ def _history_notes(
     if not node_ids and culprit is None:
         return "", ""
     emit("step", "history")
-    return (
-        _prior_art_note(tool_env, emit, node_ids=node_ids),
-        _culprit_thread_note(tool_env, emit, number=culprit),
+    key = (tuple(node_ids), culprit)
+    cached = cache.get(key) if cache is not None else None
+    if cached is not None:
+        art, culprit_note = cached
+        emit("log", "Project history: reusing this job's earlier lookup unchanged.")
+    else:
+        art = _prior_art(tool_env, emit, node_ids=node_ids)
+        culprit_note = _culprit_thread_note(tool_env, emit, number=culprit)
+        if cache is not None and (art is not None or culprit_note):
+            cache[key] = (art, culprit_note)
+    # The failure lookup is the one thing a retry round must NOT reuse: it is
+    # keyed on the traceback this round was given, which is what changed.
+    failure = _failure_art(req, tool_env, emit)
+    history_note = (
+        prior_art_note(art, failure) if art is not None else _orphan_note(failure)
+    )
+    return history_note, culprit_note
+
+
+def _failure_art(
+    req: TaskRequest,
+    tool_env: ToolEnv,
+    emit: Callable[[str, str], None],
+) -> Optional[PriorArtResult]:
+    """The retry round's own lookup: what the LAST patch's failure is about.
+
+    ``None`` on round 1, and ``None`` on the failure shapes section 3.7a
+    measured as unanswerable. That silence is deliberate: rendering "serge
+    searched the new failure and found nothing" where no search was possible
+    is a false claim of the kind this block's heading exists to avoid.
+    """
+    feedback = verify_feedback_block(req.context or "")
+    if not feedback:
+        return None
+    try:
+        result = failure_art(tool_env.relore, feedback=feedback)
+    except Exception:
+        log.debug("failure-keyed lookup failed; continuing", exc_info=True)
+        return None
+    if result is None:
+        return None
+    if result.threads:
+        emit(
+            "log",
+            "Project history (verify failure): "
+            + ", ".join(f"#{t.number}" for t in result.threads)
+            + " discuss the failure the last patch produced",
+        )
+    elif result.ran:
+        emit("log", "Project history (verify failure): nothing matched it.")
+    return result
+
+
+def _orphan_note(failure: Optional[PriorArtResult]) -> str:
+    """The failure lookup with no prior-art block to hang it on.
+
+    Reachable when the tests' own search found nothing at all but the retry's
+    failure search did. Rare, and it must still render: the alternative is
+    throwing away the one result that used the new information.
+    """
+    if failure is None or not failure.searched_anything:
+        return ""
+    return prior_art_note(
+        PriorArtResult([], ["(the failing tests)"], [], [], 0), failure
     )
 
 
-def _prior_art_note(
+def _prior_art(
     tool_env: ToolEnv,
     emit: Callable[[str, str], None],
     *,
     node_ids: list[str],
-) -> str:
-    """The failing tests' earlier threads. Step already emitted by the caller."""
+) -> Optional[PriorArtResult]:
+    """The failing tests' earlier threads. Step already emitted by the caller.
+
+    Returns the result rather than the rendered block, because a retry round
+    renders the same result beside a different failure lookup — so the cache
+    holds this, and the rendering happens once per round.
+    """
     if not node_ids:
-        return ""
+        return None
     try:
         result = prior_art(tool_env.relore, node_ids=node_ids)
     except Exception:
         log.debug("prior-art lookup failed; continuing", exc_info=True)
         emit("log", "Project history: lookup failed; continuing without it.")
-        return ""
+        return None
     if not result.searched_anything:
-        return ""
+        return None
 
     # The quality filter's own line on the task page. Without it a group whose
     # hits were all rejected patches reads as a group with no history, and the
@@ -1491,7 +1585,7 @@ def _prior_art_note(
             "Project history: relore did not answer "
             f"{'; '.join(result.failed)} — left for the model to retry.",
         )
-    return prior_art_note(result)
+    return result
 
 
 def _culprit_thread_note(
@@ -1541,6 +1635,7 @@ def prepare_task(
     clone_cache: CloneCache,
     existing_diff: Optional[str] = None,
     chunk_callback: Optional[Callable[[str, str], None]] = None,
+    history_cache: Optional[HistoryCache] = None,
 ) -> TaskPlan:
     """Run the agentic loop (read-only browse tools rooted at the checkout)
     and return the LLM's proposed patch + PR meta. ``cfg.repo_checkout_path``
@@ -1563,7 +1658,7 @@ def prepare_task(
     _emit("log", f"Preparing task for {req.repo_full_name} (base={req.base_ref})")
     tool_env = _make_tool_env(cfg, helper_tools=[], repo_full_name=req.repo_full_name)
     # Before the prompt is built and before the first turn — the whole point.
-    history_note, culprit_note = _history_notes(req, tool_env, _emit)
+    history_note, culprit_note = _history_notes(req, tool_env, _emit, history_cache)
 
     llm = ChatCompletionClient(
         cfg.llm_api_base,
@@ -2937,6 +3032,9 @@ def prepare_and_publish_candidate(
     rounds = cfg.verify_max_rounds if cfg.verify_on_gpu else 0
     req_i = candidate_req
     result: Optional[TaskResult] = None
+    # One memo for the whole job, so the two lookups keyed on the original
+    # failing tests run once rather than once per round (see _history_notes).
+    history_cache: HistoryCache = {}
     # Every round runs a fresh agent loop with its own budget; the job-level
     # bill is their sum, so fold each one in as it completes.
     session: dict[str, Any] = {}
@@ -2951,6 +3049,7 @@ def prepare_and_publish_candidate(
             clone_cache=clone_cache,
             existing_diff=existing_diff,
             chunk_callback=emit,
+            history_cache=history_cache,
         )
         session = merge_session_records(session, plan.session)
         try:
