@@ -72,7 +72,8 @@ import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, Optional
 
 log = logging.getLogger(__name__)
@@ -864,10 +865,34 @@ MAX_PRIOR_ART_QUERIES = 3
 # re-sent every turn, so it is capped hard.
 MAX_PRIOR_ART = 6
 PRIOR_ART_SEARCH_LIMIT = 4
+# Hits we are willing to pay a header lookup for while filling that budget. A
+# rejected candidate costs one call and yields nothing, so the keep budget alone
+# would let a run of junk hits return a short list; this is the ceiling on how
+# far past it we will look. It is deliberately set to everything three searches
+# can return (3 x 4), so today it binds only on the cost of the lookups and
+# never on which hits are considered — raise the search limit and it will.
+MAX_PRIOR_ART_CANDIDATES = MAX_PRIOR_ART_QUERIES * PRIOR_ART_SEARCH_LIMIT
+# Wall clock for the whole header pass, checked BETWEEN calls, plus a shorter
+# per-call timeout than the model's own tools get. A header is metadata serge
+# reads for itself, never a gate: the promise is that a slow relore costs the
+# task nothing, and 12 candidates at the 45 s tool timeout is nine minutes of
+# nothing before the first turn. Past the deadline the rest keep their state
+# unknown and are rendered as such.
+PRIOR_ART_STATE_BUDGET_SECONDS = 20.0
+PRIOR_ART_STATE_TIMEOUT = 15
 
 # `tests/models/<model>/test_modeling_x.py::Class::test_name[param]`
 _TEST_MODEL_RE = re.compile(r"tests/models/([^/]+)/")
 _PARAM_RE = re.compile(r"\[.*\]$")
+
+
+# Labels that say the thread's CONTENT is not worth reading, as opposed to
+# labels that classify it. Deliberately short: a label is a maintainer's word
+# about a thread, and only a few of them mean "this is noise". `Code agent slop`
+# is the one observed in the wild — transformers #48946, which §3.1a found being
+# presented to a task as project history. Matched case-insensitively; extend it
+# when a maintainer coins another, not on a guess.
+_JUNK_LABELS = frozenset({"code agent slop"})
 
 
 @dataclass(frozen=True)
@@ -880,6 +905,85 @@ class PriorThread:
     trust: str
     age: str
     query: str
+    #: The thread's own verdict, from its header rather than the search hit —
+    #: ``search`` returns neither, which is why this costs a second call. Empty
+    #: ``state`` means the lookup did not answer, NOT that the thread is open:
+    #: the two are kept apart everywhere else in this module for the same
+    #: reason, and an unknown verdict is rendered as unknown rather than guessed.
+    state: str = ""
+    merged: bool = False
+    review: str = ""
+    labels: tuple[str, ...] = ()
+
+    @property
+    def verdict(self) -> str:
+        """How this thread ended, in the words the block prints."""
+        if not self.state:
+            return "state unknown"
+        if self.kind == "pr" and self.merged:
+            return "merged"
+        return self.state
+
+    @property
+    def tier(self) -> int:
+        """Rank order for the block. Lower is stronger evidence.
+
+        A merged pull request is a decision the project made; an issue is a
+        report, which is neither accepted nor rejected and is often the best
+        answer there is — relore's own §10 benchmark scores the `failure` slice
+        highest precisely because those answers are mostly issues, so an issue
+        must not be demoted below a live proposal. An open pull request is
+        somebody's argument, and an approved one is an argument a maintainer has
+        already agreed with.
+
+        Ties keep relore's relevance order: the sort is stable and this is the
+        only key.
+        """
+        if self.kind != "pr":
+            return 2
+        if self.merged:
+            return 0 if self.review == "approved" else 1
+        if not self.state:
+            return 5
+        # Open. `changes_requested` is not separated from no-verdict-yet: both
+        # are a proposal nobody has accepted, and splitting them would be a
+        # distinction invented with no measurement behind it.
+        return 3 if self.review == "approved" else 4
+
+
+def junk_label(labels: Iterable[str]) -> str:
+    """The first label marking this thread as not worth reading, or ``""``."""
+    for label in labels:
+        if str(label).strip().lower() in _JUNK_LABELS:
+            return str(label)
+    return ""
+
+
+def rejection_reason(thread: PriorThread) -> str:
+    """Why this thread must not appear under a "trusted" heading, or ``""``.
+
+    Two rejections, and only two. A pull request **closed without merging** is a
+    proposal the project turned down: presenting it as project history invites
+    the agent to re-derive a patch maintainers have already rejected, and on the
+    mistral4 task of run 35971338918 one of the four hits was exactly that. A
+    **junk-labelled** thread is the maintainers saying so outright.
+
+    Everything else is kept and ranked, including a *closed issue* — an issue is
+    closed when it is resolved, which makes it evidence, not noise — and
+    including a thread whose header could not be fetched, which is unknown
+    rather than bad.
+
+    Note what is deliberately NOT special-cased: a closed-unmerged pull request
+    that serge itself opened (they are titled ``[serge] …``). It is dropped like
+    any other. serge's own earlier attempts on a group already reach the prompt
+    through the dispatcher's context, which lists them as ``- PR #N (…) — closed
+    unmerged``; a second, unlabelled copy in a block headed "trusted" is the
+    thing this filter exists to stop.
+    """
+    if thread.kind == "pr" and thread.state == "closed" and not thread.merged:
+        return "closed without merging"
+    label = junk_label(thread.labels)
+    return f"labelled {label!r}" if label else ""
 
 
 @dataclass(frozen=True)
@@ -899,12 +1003,18 @@ class PriorArtResult:
     The first version of this collapsed all three into one list, which is the
     failure shape relore's own build plan §13.3 is about: confident, well-formed,
     silently incomplete output.
+
+    ``dropped`` counts hits the quality filter refused (see
+    :func:`rejection_reason`). It is reported rather than merely applied, for
+    that same reason: a block that quietly returns four of six hits is the
+    §13.3 shape again, whatever the sixth was worth.
     """
 
     threads: list[PriorThread]
     ran: list[str]
     failed: list[str]
     skipped: list[str]
+    dropped: int = 0
 
     @property
     def searched_anything(self) -> bool:
@@ -943,6 +1053,54 @@ def failure_search_queries(node_ids: Iterable[str]) -> list[str]:
     return queries
 
 
+def thread_header(env: ReloreEnv, *, number: int) -> Optional[dict[str, Any]]:
+    """One thread's header — state, merge, labels, review decision.
+
+    A second call per candidate, which needs justifying because the obvious
+    reading is that one search should be enough. It is not: `search` returns
+    ``number/type/title/url/author/trust/age`` and **none of the verdict**.
+    Verified against the production index at 0.3.17 — a hit for a pull request
+    that was closed unmerged and labelled `Code agent slop` is byte-identical in
+    those fields to a hit for a merged, approved one. The verdict lives on
+    ``thread``, so this is where it has to come from.
+
+    ``None`` on every failure path, which the caller renders as unknown rather
+    than treating as either verdict.
+    """
+    payload = _relore_json(
+        replace(env, timeout=min(env.timeout, PRIOR_ART_STATE_TIMEOUT)),
+        ["thread", str(number), "--repo", env.repo],
+    )
+    thread = (payload or {}).get("thread")
+    return thread if isinstance(thread, dict) else None
+
+
+def _with_header(env: ReloreEnv, thread: PriorThread) -> PriorThread:
+    header = thread_header(env, number=thread.number)
+    if header is None:
+        return thread
+    if "state" not in header or "merged" not in header:
+        # A relore that stopped serving these would otherwise read as "every
+        # pull request is closed and unmerged" and the filter would throw the
+        # whole block away. Absent keys are unknown, which is a state this
+        # already renders honestly — the same distinction `failed` draws from
+        # `ran`. Fails loud in the log, soft in the prompt.
+        log.warning(
+            "prior art: relore thread header has no state/merged field; "
+            "the quality filter is inert for #%s",
+            thread.number,
+        )
+        return thread
+    labels = header.get("labels")
+    return replace(
+        thread,
+        state=str(header.get("state") or ""),
+        merged=bool(header.get("merged")),
+        review=str(header.get("review_decision") or ""),
+        labels=tuple(str(x) for x in labels) if isinstance(labels, list) else (),
+    )
+
+
 def prior_art(env: ReloreEnv, *, node_ids: Iterable[str]) -> PriorArtResult:
     """Threads this repository already has about the failing tests.
 
@@ -950,18 +1108,31 @@ def prior_art(env: ReloreEnv, *, node_ids: Iterable[str]) -> PriorArtResult:
     failure, and that is the slice §10's benchmark scores highest on. Never
     raises and never gates — this is context for a task, and a relore that is
     down costs it nothing.
+
+    Each hit is then looked up by :func:`thread_header` and run past
+    :func:`rejection_reason` before it can reach the block, and the survivors
+    are ordered by :attr:`PriorThread.tier`. The block is headed *"serge already
+    searched — trusted"*, and a heading like that is a promise about what is
+    under it: relevance alone does not keep it, because relore ranks how well a
+    thread matches the question and not whether the project agreed with it.
     """
     queries = failure_search_queries(node_ids)
     found: list[PriorThread] = []
     ran: list[str] = []
     failed: list[str] = []
     seen: set[int] = set()
+    considered = 0
+    dropped = 0
+    deadline = time.monotonic() + PRIOR_ART_STATE_BUDGET_SECONDS
 
     for index, query in enumerate(queries):
-        if len(found) >= MAX_PRIOR_ART:
-            # Budget filled by an earlier query: the rest were never sent, and
-            # must not be reported as searches that came back empty.
-            return PriorArtResult(found, ran, failed, list(queries[index:]))
+        # Budget filled, or we have paid for as many headers as this is worth:
+        # the rest were never sent, and must not be reported as searches that
+        # came back empty.
+        if len(found) >= MAX_PRIOR_ART or considered >= MAX_PRIOR_ART_CANDIDATES:
+            return PriorArtResult(
+                _ranked(found), ran, failed, list(queries[index:]), dropped
+            )
         payload = _relore_json(
             env,
             [
@@ -986,21 +1157,33 @@ def prior_art(env: ReloreEnv, *, node_ids: Iterable[str]) -> PriorArtResult:
             if not isinstance(number, int) or number in seen:
                 continue
             seen.add(number)
-            found.append(
-                PriorThread(
-                    number=number,
-                    kind=str(raw.get("type") or "thread"),
-                    title=str(raw.get("title") or ""),
-                    url=str(raw.get("url") or ""),
-                    author=str(raw.get("author") or ""),
-                    trust=str(raw.get("trust") or ""),
-                    age=str(raw.get("age") or ""),
-                    query=query,
-                )
+            candidate = PriorThread(
+                number=number,
+                kind=str(raw.get("type") or "thread"),
+                title=str(raw.get("title") or ""),
+                url=str(raw.get("url") or ""),
+                author=str(raw.get("author") or ""),
+                trust=str(raw.get("trust") or ""),
+                age=str(raw.get("age") or ""),
+                query=query,
             )
-            if len(found) >= MAX_PRIOR_ART:
+            considered += 1
+            if time.monotonic() < deadline:
+                candidate = _with_header(env, candidate)
+            reason = rejection_reason(candidate)
+            if reason:
+                log.debug("prior art: dropping #%s (%s)", candidate.number, reason)
+                dropped += 1
+            else:
+                found.append(candidate)
+            if len(found) >= MAX_PRIOR_ART or considered >= MAX_PRIOR_ART_CANDIDATES:
                 break
-    return PriorArtResult(found, ran, failed, [])
+    return PriorArtResult(_ranked(found), ran, failed, [], dropped)
+
+
+def _ranked(threads: list[PriorThread]) -> list[PriorThread]:
+    """Strongest evidence first, relore's relevance order kept within a tier."""
+    return sorted(threads, key=lambda t: t.tier)
 
 
 def prior_art_note(result: PriorArtResult) -> str:
@@ -1024,23 +1207,37 @@ def prior_art_note(result: PriorArtResult) -> str:
         lines.append(
             f"relore searched this repository's issue and pull-request history "
             f"for these failing tests before you were asked anything, and "
-            f"{_count(len(result.threads), 'earlier thread')} matched:"
+            f"{_count(len(result.threads), 'earlier thread')} matched, strongest "
+            f"first:"
         )
         for t in result.threads:
             who = f" by @{t.author}" if t.author else ""
-            meta = ", ".join(x for x in (t.trust, t.age) if x)
+            verdict = [t.verdict]
+            if t.review:
+                verdict.append(t.review.replace("_", " "))
+            meta = ", ".join(x for x in (*verdict, t.trust, t.age) if x)
             lines.append(f"- #{t.number} {t.kind}{who} ({meta}) — {t.title}")
             lines.append(f"  {t.url}")
         lines.append(
             "These are pointers, not evidence: a title is not a decision. Read "
             "one with `history_thread <number>` before you rely on it, and cite "
-            "it in `body` if it settles anything."
+            "it in `body` if it settles anything. `merged` is what the project "
+            "did; `open` is what somebody proposed and nobody has accepted."
         )
     elif result.ran:
+        # "Nothing worth reading" and "nothing at all" are different facts and
+        # the second must not be printed for the first: a group whose only
+        # matches were rejected patches has a history, and telling the model the
+        # history is empty would be the lie this filter was added to stop.
+        nothing = (
+            "found nothing worth putting in front of you"
+            if result.dropped
+            else "found nothing"
+        )
         lines.append(
             "relore searched this repository's issue and pull-request history "
-            "for these failing tests before you were asked anything, and found "
-            "nothing."
+            f"for these failing tests before you were asked anything, and "
+            f"{nothing}."
         )
 
     if result.ran:
@@ -1058,6 +1255,19 @@ def prior_art_note(result: PriorArtResult) -> str:
     if result.skipped:
         lines.append(
             f"Not run (the list above filled first): {_queries(result.skipped)}."
+        )
+    if result.dropped:
+        # Counted, not listed. The point of dropping them is that they are not
+        # worth the agent's turns, and naming the numbers would hand back
+        # exactly what the filter took away. Saying nothing at all is the other
+        # failure: the heading claims a complete search, and this keeps it true.
+        one = result.dropped == 1
+        noun, was = ("further match", "was") if one else ("further matches", "were")
+        lines.append(
+            f"{result.dropped} {noun} {was} excluded: "
+            "pull requests the project closed without merging, or threads "
+            "maintainers labelled as not worth reading. Do not go looking for "
+            "them."
         )
     return "\n".join(lines) + "\n"
 

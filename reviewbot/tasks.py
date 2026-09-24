@@ -1460,19 +1460,28 @@ def _prior_art_note(
     if not result.searched_anything:
         return ""
 
+    # The quality filter's own line on the task page. Without it a group whose
+    # hits were all rejected patches reads as a group with no history, and the
+    # difference is the whole point of the filter.
+    excluded = (
+        f" ({result.dropped} excluded: closed unmerged, or labelled as noise)"
+        if result.dropped
+        else ""
+    )
     if result.threads:
         emit(
             "log",
             "Project history: "
             + ", ".join(f"#{t.number}" for t in result.threads)
-            + " already discuss these tests",
+            + " already discuss these tests"
+            + excluded,
         )
     elif result.ran:
         emit(
             "log",
             "Project history: no earlier thread matched "
-            f"{'; '.join(result.ran)} — the model is told so, so it does not "
-            "re-run the search.",
+            f"{'; '.join(result.ran)}{excluded} — the model is told so, so it "
+            "does not re-run the search.",
         )
     # Reported separately and never as "found nothing": a query relore did not
     # answer leaves the history unread, and the note tells the model to try it.
