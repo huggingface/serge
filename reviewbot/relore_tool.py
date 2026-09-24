@@ -1116,7 +1116,30 @@ def prior_art(env: ReloreEnv, *, node_ids: Iterable[str]) -> PriorArtResult:
     under it: relevance alone does not keep it, because relore ranks how well a
     thread matches the question and not whether the project agreed with it.
     """
-    queries = failure_search_queries(node_ids)
+    return _collect(env, failure_search_queries(node_ids))
+
+
+def _collect(
+    env: ReloreEnv,
+    queries: list[str],
+    *,
+    file: Optional[str] = None,
+    limit: Optional[int] = None,
+    keep: Optional[int] = None,
+) -> PriorArtResult:
+    """Run the queries, header-check every hit, rank the survivors.
+
+    Shared by :func:`prior_art` and :func:`failure_art` so the §3.1a quality
+    filter applies to both: a rejected pull request is no more admissible
+    because the query that found it was keyed on a traceback.
+
+    The budgets default to ``None`` and resolve here rather than in the
+    signature: a default argument is evaluated once at import, which would
+    freeze the module constants and make them unpatchable — including by the
+    tests that check the budget behaviour.
+    """
+    limit = PRIOR_ART_SEARCH_LIMIT if limit is None else limit
+    keep = MAX_PRIOR_ART if keep is None else keep
     found: list[PriorThread] = []
     ran: list[str] = []
     failed: list[str] = []
@@ -1129,23 +1152,14 @@ def prior_art(env: ReloreEnv, *, node_ids: Iterable[str]) -> PriorArtResult:
         # Budget filled, or we have paid for as many headers as this is worth:
         # the rest were never sent, and must not be reported as searches that
         # came back empty.
-        if len(found) >= MAX_PRIOR_ART or considered >= MAX_PRIOR_ART_CANDIDATES:
+        if len(found) >= keep or considered >= MAX_PRIOR_ART_CANDIDATES:
             return PriorArtResult(
                 _ranked(found), ran, failed, list(queries[index:]), dropped
             )
-        payload = _relore_json(
-            env,
-            [
-                "search",
-                query,
-                "--kind",
-                "failure",
-                "--limit",
-                str(PRIOR_ART_SEARCH_LIMIT),
-                "--repo",
-                env.repo,
-            ],
-        )
+        argv = ["search", query, "--kind", "failure", "--limit", str(limit)]
+        if file:
+            argv += ["--file", file]
+        payload = _relore_json(env, argv + ["--repo", env.repo])
         if payload is None:
             failed.append(query)
             continue
@@ -1176,7 +1190,7 @@ def prior_art(env: ReloreEnv, *, node_ids: Iterable[str]) -> PriorArtResult:
                 dropped += 1
             else:
                 found.append(candidate)
-            if len(found) >= MAX_PRIOR_ART or considered >= MAX_PRIOR_ART_CANDIDATES:
+            if len(found) >= keep or considered >= MAX_PRIOR_ART_CANDIDATES:
                 break
     return PriorArtResult(_ranked(found), ran, failed, [], dropped)
 
@@ -1186,7 +1200,163 @@ def _ranked(threads: list[PriorThread]) -> list[PriorThread]:
     return sorted(threads, key=lambda t: t.tier)
 
 
-def prior_art_note(result: PriorArtResult) -> str:
+# -- the failure the LAST patch produced (§3.7) -----------------------------
+#
+# A red GPU verify re-prompts the model with the real tracebacks, up to three
+# rounds. Both lookups above are keyed on the ORIGINAL failing tests, which have
+# not changed, so they return the same thing every round — measured over run
+# 35971338918, 7 of 8 multi-round jobs got byte-identical results. Meanwhile the
+# question has changed: by round 2 the agent knows how its own patch failed, and
+# that is a different failure from the one it was asked about.
+#
+# What NOT to do here is the measured part (§3.7a). The obvious move — search
+# the new exception — is worse than useless on two whole categories:
+#
+# * an **assertion** message is a diff of two outputs (`Tensor-likes are not
+#   close!`, `Lists differ: [...] != [...]`, `'<unk>' != 'happiness'`), and
+# * an **out-of-memory** message is allocator boilerplate, whose only
+#   "distinctive" words are `PyTorch`, `large` and `setting`, lifted out of
+#   *"If reserved but unallocated memory is large try setting…"*.
+#
+# In both the message IS the data, not a description of a defect. Measured blind
+# over 20 distinct such failures harvested from the verify artifacts: a
+# hand-written failure-keyed query beat the §3.1 test-keyed block on 2, and was
+# WORSE than it on 11 — because `<model> <test function>` finds how this same
+# test was fixed last time, which for an expectation drift or a memory blow-up
+# is the precedent that matters (moshi's own earlier OOM fix, smollm3's own CI
+# revert). So on these two shapes the correct action is to add nothing, and the
+# gate is the exception type, which is the variable that was measured.
+SKIP_FAILURE_EXCEPTIONS = frozenset({"AssertionError", "OutOfMemoryError"})
+
+#: The block `tasks._format_verify_feedback` appends to the context on a retry.
+_VERIFY_FEEDBACK_MARK = "Your previous patch did NOT fix the tests"
+#: pytest's `E   SomeError: message` line.
+_E_LINE = re.compile(r"^E\s+(?P<exc>[\w.]+):\s*(?P<msg>.+)$", re.M)
+#: A frame in THIS repository. The deepest frame overall is routinely in torch
+#: — mistral4's was `torch/nn/functional.py:7168` — and a file filter on that
+#: tells relore nothing, so the deepest *repo* frame is the one worth having.
+_REPO_FRAME = re.compile(r"\b((?:src/transformers|src|tests)/[\w./\-]+\.py)\b")
+_FAILURE_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
+#: Words an exception message carries that are not about this defect: pytest's
+#: and the allocator's furniture, plus the bare type names that appear in every
+#: dtype complaint.
+_FAILURE_STOP = frozenset(
+    """object attribute have has with self this that from none nonetype tried
+    allocate total capacity which free process memory used allocated reserved
+    unallocated error assert than torch cuda tensor dtype device call last true
+    false list dict tuple given type value must lists differ chars matrix
+    expected expect got""".split()
+)
+#: Terms per query. relore's own guidance: two or three distinctive terms, never
+#: a sentence — every term ANDs, so a long list is an empty result.
+MAX_FAILURE_TERMS = 3
+#: `--file` alone ranks a slice against an empty query, so on a hot file the
+#: causally relevant thread is not near the top: measured, `--file
+#: src/transformers/integrations/moe.py` reaches #48653 — the pull request that
+#: rewrote that file, and the one the agent needed — at **rank 8**. The default
+#: search limit of 4 makes it invisible.
+FAILURE_FILE_LIMIT = 10
+#: Threads kept from the failure lookup. Half §3.1's budget: this block sits
+#: in the prompt prefix beside that one and is re-sent every turn.
+MAX_FAILURE_ART = 3
+
+
+def verify_feedback_block(context: str) -> str:
+    """The GPU-verify feedback appended to a retry's context, or ``""``.
+
+    Round 1 has none, which is the signal that there is no new failure to key
+    on — not an extraction that came back empty.
+    """
+    index = (context or "").find(_VERIFY_FEEDBACK_MARK)
+    return context[index:] if index >= 0 else ""
+
+
+def failure_key(feedback: str) -> tuple[str, list[str], str]:
+    """``(exception, terms, repo_file)`` from a verify-feedback block.
+
+    Empty terms and an empty file mean there is nothing here worth a query —
+    which is the expected answer for the shapes in
+    :data:`SKIP_FAILURE_EXCEPTIONS` and is why they are refused by name rather
+    than left to produce a query out of boilerplate.
+    """
+    matches = list(_E_LINE.finditer(feedback or ""))
+    if not matches:
+        return "", [], ""
+    exc = matches[-1].group("exc")
+    msg = matches[-1].group("msg")
+    if exc.rsplit(".", 1)[-1] in SKIP_FAILURE_EXCEPTIONS:
+        return exc, [], ""
+    frames = _REPO_FRAME.findall(feedback)
+    terms: list[str] = []
+    for match in _FAILURE_IDENT.finditer(msg):
+        word = match.group(0)
+        if word.lower() in _FAILURE_STOP or word in terms:
+            continue
+        terms.append(word)
+        if len(terms) >= MAX_FAILURE_TERMS:
+            break
+    return exc, terms, frames[-1] if frames else ""
+
+
+def failure_art(env: ReloreEnv, *, feedback: str) -> Optional[PriorArtResult]:
+    """Threads about the failure the previous patch produced, or ``None``.
+
+    ``None`` — not an empty result — when there is nothing to ask: round 1, an
+    unparseable block, or one of the two shapes that carry no searchable term.
+    The caller renders nothing at all in that case, because "serge searched the
+    new failure and found nothing" is a different and false claim.
+    """
+    exc, terms, repo_file = failure_key(feedback)
+    if not terms and not repo_file:
+        return None
+    queries: list[str] = []
+    if terms:
+        queries.append(" ".join([exc.rsplit(".", 1)[-1], *terms]))
+    result = _collect(env, queries, keep=MAX_FAILURE_ART) if queries else None
+    # The file axis is a FALLBACK, not an equal partner, and the measurement
+    # says why. `--file` ranks its slice against an empty query, so on a hot
+    # file the causally relevant thread is not near the top: on the real index
+    # `--file src/transformers/integrations/moe.py` reaches #48653 — the pull
+    # request that rewrote that file, and the one mistral4's agent needed — at
+    # rank 8 of 8. Giving it guaranteed slots in a block this small would show
+    # ranks 1-2 and still miss it, so it earns its call only when the terms
+    # underfilled, which is the case it actually covers: three ANDed terms that
+    # match nothing.
+    if repo_file and (result is None or len(result.threads) < MAX_FAILURE_ART):
+        by_file = _collect(
+            env, [""], file=repo_file, limit=FAILURE_FILE_LIMIT, keep=MAX_FAILURE_ART
+        )
+        result = _merge(result, by_file, file=repo_file)
+    return result
+
+
+def _merge(
+    first: Optional[PriorArtResult], second: PriorArtResult, *, file: str
+) -> PriorArtResult:
+    """Fold the file-keyed result into the term-keyed one, deduped."""
+    second = replace(
+        second,
+        # A bare `--file` query has no text; name it so the "already run" line
+        # is something the model can read and not repeat.
+        ran=[f"--file {file}" for _ in second.ran],
+        failed=[f"--file {file}" for _ in second.failed],
+    )
+    if first is None:
+        return replace(second, threads=_ranked(second.threads)[:MAX_FAILURE_ART])
+    seen = {t.number for t in first.threads}
+    merged = first.threads + [t for t in second.threads if t.number not in seen]
+    return PriorArtResult(
+        _ranked(merged)[:MAX_FAILURE_ART],
+        first.ran + second.ran,
+        first.failed + second.failed,
+        first.skipped + second.skipped,
+        first.dropped + second.dropped,
+    )
+
+
+def prior_art_note(
+    result: PriorArtResult, failure: Optional[PriorArtResult] = None
+) -> str:
     """The task-side note, or ``""`` when no search ran at all.
 
     Carries thread *metadata* only — number, kind, title, author, age, url — and
@@ -1269,7 +1439,44 @@ def prior_art_note(result: PriorArtResult) -> str:
             "maintainers labelled as not worth reading. Do not go looking for "
             "them."
         )
+    lines.extend(_failure_lines(failure))
     return "\n".join(lines) + "\n"
+
+
+def _failure_lines(failure: Optional[PriorArtResult]) -> list[str]:
+    """The retry round's second search, kept visibly apart from the first.
+
+    Same block and the same trust — both are thread metadata serge looked up —
+    but a different question, and the model has to be told which. The list
+    above is about the tests it was asked to fix; this one is about the failure
+    its own patch produced, which is the information it did not have in round 1
+    and the only reason a second round is worth more than the first.
+    """
+    if failure is None or not failure.searched_anything:
+        return []
+    lines = [
+        "Your previous patch was rejected, so serge also searched the failure "
+        "THAT patch produced. Different question, and the only one that uses "
+        "what the GPU run just told you:"
+    ]
+    for t in failure.threads:
+        who = f" by @{t.author}" if t.author else ""
+        verdict = [t.verdict]
+        if t.review:
+            verdict.append(t.review.replace("_", " "))
+        meta = ", ".join(x for x in (*verdict, t.trust, t.age) if x)
+        lines.append(f"- #{t.number} {t.kind}{who} ({meta}) — {t.title}")
+        lines.append(f"  {t.url}")
+    if not failure.threads and failure.ran:
+        lines.append("- nothing matched it.")
+    if failure.ran:
+        lines.append(f"Already run, do NOT repeat: {_queries(failure.ran)}.")
+    if failure.failed:
+        lines.append(
+            "Could not be reached, so UNANSWERED rather than empty: "
+            f"{_queries(failure.failed)}."
+        )
+    return lines
 
 
 def _count(n: int, noun: str) -> str:
