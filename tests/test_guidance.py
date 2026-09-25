@@ -393,15 +393,17 @@ def test_no_guidance_means_no_section_at_all():
     assert "no maintainer guidance" in result.log_line()
 
 
-def test_a_clean_check_is_one_line_and_says_what_it_read():
+def test_a_clean_check_publishes_nothing_and_still_says_so_in_the_log():
+    """Measured over serge's whole fix history, the check fires on 1 of the 60
+    patches that had anything to check. A "no contradiction" line on the other
+    59 public pull requests is how a reviewer learns to skip the one that
+    matters — so the clean verdict lives in the job log, which is where the fire
+    rate is counted from anyway."""
     result = GuidanceResult(
         anchors=3, with_guidance=2, quotes=3, asked=True, citations=["#40001"]
     )
-    section = result.pr_section()
-    assert section.count("\n") <= 3
-    assert "no contradiction found" in section
-    assert "#40001" in section
-    assert "⚠️" not in section
+    assert result.pr_section() == ""
+    assert "no contradiction with maintainer guidance" in result.log_line()
 
 
 def test_a_contradiction_is_a_heading_that_names_what_it_is():
@@ -458,9 +460,10 @@ def test_the_happy_path_asks_once_and_reports_the_threads_it_read(monkeypatch, e
     assert len(llm.calls) == 1
     assert result is not None
     assert result.asked is True and result.contradicts is False
-    # The grader listed nothing, so the section still names what was read.
+    # The grader listed nothing, so the thread that WAS read is recorded — it
+    # is what a ⚠️ on a later round would have to cite.
     assert result.citations == ["#47827"]
-    assert "no contradiction found" in result.pr_section()
+    assert result.pr_section() == ""
 
 
 def test_the_repo_is_serges_fact_on_every_call(monkeypatch, env):

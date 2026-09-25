@@ -19,8 +19,9 @@ Advisory, never a gate
 ----------------------
 "Contradicts a maintainer" is a judgement, and a wrong one costs a whole night's
 group — the ITF nightly dispatches ten and a blocked patch is not retried. So
-the verdict is a PR-body section for the human reviewer, marked ⚠️ when it fires
-and one italic line when it does not. The gate stays GPU verify. Hard-gating on
+the verdict is a ⚠️ PR-body section for the human reviewer when it fires, and
+nothing in the PR body when it does not — see :meth:`GuidanceResult.pr_section`
+for why the clean case is silent too. The gate stays GPU verify. Hard-gating on
 this is worth revisiting only with a measured precision, which is why
 ``serge/playbooks/guidance-check-replay.py`` exists in the playbooks repo and
 why this ships behind ``TASK_GUIDANCE_CHECK`` (default **off**).
@@ -594,13 +595,25 @@ class GuidanceResult:
         )
 
     def pr_section(self) -> str:
-        """The PR-body section, or ``""`` when there was nothing to check.
+        """The PR-body section — **only when the check fires**, else ``""``.
 
-        Silence is the honest output of a check that found no guidance: a
-        "nothing found" line on a patch whose lines nobody ever reviewed reads
-        as a clean bill of health that was never issued.
+        Two different silences, and both are deliberate:
+
+        * **Nothing to check.** No authoritative comment on any changed line. A
+          "nothing found" line there reads as a clean bill of health that was
+          never issued.
+        * **Checked and clean.** Measured over serge's whole fix history
+          (117 patches, 2026-09-25), the check fires on **1 of the 60** patches
+          that had anything to check. Publishing the clean verdict would put a
+          line that says nothing on 59 of every 60 public pull requests, which
+          is how a reviewer learns to skip the one that matters. The clean
+          verdict is not lost — it is in the job log
+          (:meth:`log_line`) and the task page's ``guidance`` step, which is
+          where the fire rate is counted from anyway.
+
+        So the PR body carries the warning and nothing else.
         """
-        if not self.asked or not self.with_guidance:
+        if not self.asked or not self.with_guidance or not self.contradicts:
             return ""
         cited = ", ".join(self.citations)
         checked = (
@@ -609,8 +622,6 @@ class GuidanceResult:
             + (f": {cited}" if cited else "")
             + "."
         )
-        if not self.contradicts:
-            return f"\n---\n_📚 Maintainer guidance: no contradiction found. {checked}_"
         return "\n".join(
             [
                 "",
