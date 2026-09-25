@@ -389,6 +389,22 @@ class Config:
     # Hard cap on how many comments/bodies one call is asked about (longest
     # first). Bounds the prompt for a pathological patch.
     comment_brevity_max_items: int = 40
+    # §3.4 of the relore-in-ITF plan: one extra LLM call that asks whether the
+    # finished patch contradicts what maintainers already decided about the
+    # lines it changes (:mod:`reviewbot.guidance`). Advisory — it writes a PR
+    # body section and gates nothing.
+    #
+    # Default OFF, unlike the brevity passes, and for a reason that is not
+    # timidity: this one PUBLISHES a judgement about a named maintainer's
+    # review on a public pull request, and its false-positive rate has never
+    # been measured on real patches. Turn it on once
+    # `serge/playbooks/guidance-check-replay.py` has been run over a batch and
+    # the rate written down.
+    task_guidance_check: bool = False
+    # Changed lines asked about per patch, and per file within it. Each is a
+    # relore call made while the task holds a runner.
+    guidance_max_anchors: int = 8
+    guidance_max_anchors_per_file: int = 3
     task_sandbox_backend: str = sandbox.AUTO_BACKEND
     # Kubernetes placement for the per-task runner Jobs (TASK_EXECUTION=
     # kubernetes; see SERGE_PERTASK_POD_PLAN.md). ``task_k8s_namespace`` defaults
@@ -700,6 +716,9 @@ class Config:
             comment_brevity_width=_int_env("COMMENT_BREVITY_WIDTH", 88),
             comment_brevity_min_chars=_int_env("COMMENT_BREVITY_MIN_CHARS", 100),
             comment_brevity_max_items=_int_env("COMMENT_BREVITY_MAX_ITEMS", 40),
+            task_guidance_check=_bool_env("TASK_GUIDANCE_CHECK", False),
+            guidance_max_anchors=_int_env("GUIDANCE_MAX_ANCHORS", 8),
+            guidance_max_anchors_per_file=_int_env("GUIDANCE_MAX_ANCHORS_PER_FILE", 3),
             task_sandbox_backend=sandbox.normalize_backend(
                 os.environ.get("TASK_SANDBOX_BACKEND")
             ),

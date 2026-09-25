@@ -35,6 +35,7 @@ from .compression import MessageCompressor
 from .config import Config
 from .expectation_guard import PatchClassification, classify_patch
 from .github_client import SERGE_GIT_EMAIL, GitHubClient
+from .guidance import GuidanceResult, check_patch
 from .llm_client import ChatCompletionClient
 from .normalize import NormalizeError, run_normalize
 from .prompts import build_task_system_prompt, build_task_user_prompt
@@ -244,6 +245,12 @@ class TaskPlan:
     # for the code it touches (``scope_paths``, ``classify_patch``), which a
     # comment rewrite cannot change.
     worktree_prepared: bool = False
+    # The §3.4 maintainer-guidance section, already rendered, or "" — which is
+    # what it is whenever the check is off, relore is unavailable, or no
+    # maintainer ever spoke on the lines this patch changes. Carried on the plan
+    # rather than recomputed at publish time because the call that produced it
+    # is billed to this task's metrics.
+    guidance_note: str = ""
 
 
 @dataclass
@@ -814,6 +821,45 @@ def _condense_added_comments(
             "comment brevity pass failed; keeping the original comments", exc_info=True
         )
         return None
+
+
+def _guidance_check(
+    cfg: Config,
+    *,
+    tool_env: Optional[ToolEnv],
+    llm: Optional[ChatCompletionClient],
+    patch: str,
+    emit: Callable[[str, str], None],
+) -> Optional[GuidanceResult]:
+    """§3.4: ask whether the finished patch contradicts maintainer guidance on
+    the lines it changes (:mod:`reviewbot.guidance`).
+
+    Runs here — after the loop accepted an answer, before anything is committed
+    — because that is the first moment the patch is final and the last moment
+    before it becomes a public pull request.
+
+    Off by default (``TASK_GUIDANCE_CHECK``) and silent when relore is not
+    configured for this repository. Never raises, and never gates: the section
+    it produces is read by a human, and a false positive that blocked a patch
+    would cost a whole night's group.
+    """
+    if not cfg.task_guidance_check:
+        return None
+    if tool_env is None or tool_env.relore is None or llm is None:
+        return None
+    if not (patch or "").strip():
+        return None
+    emit("step", "guidance")
+    return check_patch(
+        tool_env.relore,
+        llm,
+        patch=patch,
+        max_anchors=cfg.guidance_max_anchors,
+        max_per_file=cfg.guidance_max_anchors_per_file,
+        max_tokens=cfg.llm_max_tokens,
+        reasoning_effort=cfg.llm_reasoning_effort,
+        emit=emit,
+    )
 
 
 def _validate_patch(
@@ -1862,6 +1908,15 @@ def prepare_task(
     if normalize_configured and not outcome["prepared"]:
         clone_cache.reset_worktree(checkout)
 
+    # §3.4, last thing before the plan leaves the loop: the patch is final here
+    # and nothing has been written to GitHub yet. Its call is billed into the
+    # same metrics line as the loop's, so the PR footer keeps accounting for
+    # every token this task spent rather than for the turns alone.
+    guidance = _guidance_check(cfg, tool_env=tool_env, llm=llm, patch=patch, emit=_emit)
+    if guidance is not None and guidance.chat is not None:
+        metrics.record_usage(guidance.chat)
+        metrics_line = _format_aggregated_metrics(metrics)
+
     return TaskPlan(
         title=req.title or title,
         body=body,
@@ -1872,6 +1927,7 @@ def prepare_task(
         session=session_record(metrics),
         model=llm.model,
         worktree_prepared=outcome["prepared"],
+        guidance_note=guidance.pr_section() if guidance is not None else "",
     )
 
 
@@ -2008,6 +2064,12 @@ def _decorate_body(
     # the serge footer (not tacked on after them).
     if verification_footer:
         body += f"\n{verification_footer}"
+    # §3.4, directly under the verification it qualifies: both sections are
+    # evidence about this change, and this one is the weaker of the two — an
+    # LLM judgement about review prose, not a test result — so it reads after
+    # the GPU verdict, never instead of it.
+    if plan.guidance_note:
+        body += f"\n{plan.guidance_note}"
     related = _related_issues_section(gh, req, plan)
     if related:
         body += f"\n\n{related}"

@@ -57,6 +57,10 @@ _STEP_PHASES: dict[str, tuple[str, str]] = {
     # prior-art search and, on a regression cluster, the culprit PR's thread.
     "history": ("history", "Project history"),
     "llm": ("llm", "Agent loop"),
+    # Emitted by tasks._guidance_check (§3.4): the finished patch against what
+    # maintainers already decided about the lines it changes. Between the loop
+    # and the commit, because that is where it runs.
+    "guidance": ("guidance", "Maintainer guidance"),
     "apply": ("apply", "Apply patch"),
     "normalize": ("normalize", "Normalize"),
     "commit": ("commit", "Commit"),
@@ -115,6 +119,16 @@ _PHASE_RULES: dict[str, tuple[tuple[str, str], ...]] = {
         (_OK, "LLM done:"),
     ),
     "apply": ((_FAILED, "patch did not apply"),),
+    # The ⚠️ verdict is a warning about the PATCH, not about the check, and it
+    # is the whole reason to look: a green row here would bury it. "No
+    # guidance" and "no contradiction" are both clean outcomes and read the
+    # same way at a glance, which is correct — neither is a finding.
+    "guidance": (
+        (_WARN, "may contradict maintainer guidance"),
+        (_OK, "no contradiction with maintainer guidance"),
+        (_OK, "no maintainer guidance on"),
+        (_OK, "changes no line with a history"),
+    ),
     "history": (
         (_WARN, "lookup failed"),
         (_WARN, "relore did not answer"),
