@@ -103,6 +103,22 @@ class WebappReviewsTests(unittest.TestCase):
             r = self._submit(client, llm_max_input_tokens="750000")
         self.assertEqual(r.status_code, 200, r.text)
         job = worker.call_args.args[0]
+        self.assertEqual(self.webapp._billing_session_id(job), f"serge-review-{job.id}")
+        restored = self.webapp._load_job_from_store(job.id)
+        self.assertEqual(restored.task_spec["billing"], job.task_spec["billing"])
+        with patch.object(
+            self.webapp,
+            "fetch_session_cost",
+            return_value={
+                "status": "reported",
+                "cost_usd": 0.15,
+                "request_count": 3,
+                "checked_at": 1000,
+            },
+        ):
+            info = client.get(r.json()["url"] + "/info")
+        self.assertEqual(info.status_code, 200)
+        self.assertEqual(info.json()["billing"]["cost_usd"], 0.15)
         self.assertEqual(job.llm_max_input_tokens, 750000)
 
     def test_submit_without_override_leaves_job_default(self):

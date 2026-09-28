@@ -46,6 +46,7 @@ _SPEC_MOUNT_PATH = "/etc/serge/task.json"
 # separately in ``llm`` (and win); secrets (App key, session secret) are never
 # transmitted — the runner needs none of them.
 RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
+    "llm_billing_session_id",
     "task_normalize_command",
     "task_normalize_guidance",
     "task_normalize_timeout",

@@ -4,6 +4,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 import requests
 
@@ -285,6 +286,7 @@ class ChatCompletionClient:
         bill_to: Optional[str] = None,
         stream: bool = False,
         compressor: Optional["MessageCompressor"] = None,
+        billing_session_id: Optional[str] = None,
     ):
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
@@ -292,6 +294,7 @@ class ChatCompletionClient:
         self.bill_to = bill_to or None
         self.stream = stream
         self.compressor = compressor
+        self.billing_session_id = billing_session_id
         # Adaptive pacing, learned from 429s (see :meth:`_throttle_wait`). One
         # client serves one agentic loop, so this is per-task state: the loop
         # that tripped a rate limit is the loop that must slow down.
@@ -311,6 +314,11 @@ class ChatCompletionClient:
         if self.bill_to:
             # HF Router: route inference billing to an org the token has access to.
             headers["X-HF-Bill-To"] = self.bill_to
+        if (
+            self.billing_session_id
+            and urlsplit(self.api_base).hostname == "router.huggingface.co"
+        ):
+            headers["X-HF-Session-id"] = self.billing_session_id
         if _is_anthropic_base(self.api_base):
             # /v1/chat/completions is Anthropic's OpenAI shim, but /v1/models is
             # the native route and rejects requests without anthropic-version.

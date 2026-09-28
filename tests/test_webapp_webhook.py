@@ -45,7 +45,7 @@ class WebappWebhookTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
         sys.modules.pop("reviewbot.webapp", None)
 
-    def _import_webapp(self):
+    def _import_webapp(self, **extra_env):
         env = {
             "DEV_NO_AUTH": "1",
             "GITHUB_APP_ID": "123",
@@ -55,6 +55,7 @@ class WebappWebhookTests(unittest.TestCase):
             "WEB_STORE_PATH": os.path.join(self.tmpdir, "jobs.db"),
             "WEB_CLONE_CACHE_DIR": os.path.join(self.tmpdir, "clones"),
         }
+        env.update(extra_env)
         with patch.dict(os.environ, env, clear=True):
             return importlib.import_module("reviewbot.webapp")
 
@@ -79,7 +80,7 @@ class WebappWebhookTests(unittest.TestCase):
     def test_webhook_accepts_inline_comment_and_dispatches_worker(self) -> None:
         if TestClient is None:
             self.skipTest("fastapi is not installed")
-        webapp = self._import_webapp()
+        webapp = self._import_webapp(LLM_API_BASE="https://router.huggingface.co/v1")
         client = TestClient(webapp.app)
         body = json.dumps(_inline_payload()).encode()
 
@@ -109,6 +110,13 @@ class WebappWebhookTests(unittest.TestCase):
         gh = run_followup.call_args.args[1]
         req = run_followup.call_args.args[2]
         self.assertEqual(cfg.llm_api_key, "llm-token")
+        self.assertEqual(
+            cfg.llm_billing_session_id, f"serge-review-{response.json()['id']}"
+        )
+        restored = webapp._load_job_from_store(response.json()["id"])
+        self.assertEqual(
+            webapp._billing_session_id(restored), cfg.llm_billing_session_id
+        )
         self.assertIs(gh, github_client.return_value)
         self.assertEqual(req.owner, "acme")
         self.assertEqual(req.repo, "widgets")
