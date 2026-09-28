@@ -38,6 +38,7 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeSerializer
 
 from . import __version__, build_info, git_sha
+from .billing import fetch_session_cost
 from .clone_cache import CloneCache, Checkout
 from .config import Config
 from .github_auth import (
@@ -1199,6 +1200,7 @@ def _run_review_worker(job: Job) -> None:
         llm_api_key=job.llm_api_key,
         llm_model=job.llm_model,
         llm_bill_to=_llm_bill_to_for_provider(job.llm_provider),
+        llm_billing_session_id=_billing_session_id(job),
     )
     if job.llm_max_input_tokens is not None:
         worker_cfg = dataclasses.replace(
@@ -2036,6 +2038,12 @@ async def github_app_webhook(request: Request) -> Response:
         llm_api_key=worker_cfg.llm_api_key,
         source="webhook",
     )
+    _enable_job_billing(
+        job, _store.find_provider_config_for_repo(owner=req.owner, repo=req.repo)
+    )
+    worker_cfg = dataclasses.replace(
+        worker_cfg, llm_billing_session_id=_billing_session_id(job)
+    )
     job.loop = asyncio.get_running_loop()
     with _jobs_lock:
         _jobs[job.id] = job
@@ -2052,6 +2060,7 @@ async def github_app_webhook(request: Request) -> Response:
         created_at=job.created_at,
         status=job.status,
         source=job.source,
+        task_spec_json=_json.dumps(job.task_spec),
     )
     _prune_store()
     _WEBHOOK_REVIEW_POOL.submit(
@@ -3185,6 +3194,12 @@ async def submit_task(request: Request) -> JSONResponse:
         kind="task",
         task_spec=spec_summary,
     )
+    _enable_job_billing(
+        job, _store.find_provider_config_for_repo(owner=owner, repo=repo)
+    )
+    worker_cfg = dataclasses.replace(
+        worker_cfg, llm_billing_session_id=_billing_session_id(job)
+    )
     job.loop = asyncio.get_running_loop()
     with _jobs_lock:
         _jobs[job.id] = job
@@ -3440,6 +3455,7 @@ async def submit_review(request: Request) -> JSONResponse:
         llm_api_key=matched["api_key"],
         llm_max_input_tokens=llm_max_input_tokens,
     )
+    _enable_job_billing(job, matched)
     job.loop = asyncio.get_running_loop()
     with _jobs_lock:
         _jobs[job.id] = job
@@ -3455,6 +3471,7 @@ async def submit_review(request: Request) -> JSONResponse:
         llm_model=job.llm_model,
         created_at=job.created_at,
         status=job.status,
+        task_spec_json=_json.dumps(job.task_spec),
     )
     _prune_store()
     threading.Thread(
@@ -3635,6 +3652,7 @@ def review_info(
             "llm_base_url": job.llm_api_base,
             "llm_model": job.llm_model or "",
             "error": job.error,
+            "billing": _job_billing(job),
         }
     )
 
@@ -3958,11 +3976,74 @@ def task_info(request: Request, owner: str, repo: str, job_id: str) -> JSONRespo
             "llm_model": job.llm_model or "",
             "error": job.error,
             "session": job.session or None,
+            "billing": _job_billing(job),
             "steps": build_steps(history),
             "tools": build_tool_usage(history),
             "trace": trace,
         }
     )
+
+
+_billing_lock = threading.Lock()
+
+
+def _enable_job_billing(job: Job, provider: Optional[dict[str, Any]]) -> None:
+    if (
+        job.llm_provider != "hf"
+        or urllib.parse.urlsplit(job.llm_api_base).hostname != "router.huggingface.co"
+    ):
+        return
+    if job.task_spec is None:
+        job.task_spec = {}
+    job.task_spec["billing"] = {
+        "session_id": f"serge-{job.kind}-{job.id}",
+        "bill_to": _llm_bill_to_for_provider(job.llm_provider),
+        "provider_config_id": provider["id"] if provider else None,
+    }
+
+
+def _billing_session_id(job: Job) -> Optional[str]:
+    return ((job.task_spec or {}).get("billing") or {}).get("session_id")
+
+
+def _job_billing(job: Job) -> dict[str, Any]:
+    """This job's HF-reported cost, cached in the store for 60s."""
+    metadata = (job.task_spec or {}).get("billing")
+    if not metadata:
+        return {"status": "untracked", "cost_usd": None}
+    with _billing_lock:
+        cached = _safe_json_obj((_store.load(job.id) or {}).get("billing_json"))
+        now = time.time()
+        if cached and now - cached.get("checked_at", 0) < 60:
+            return cached
+        config_id = metadata.get("provider_config_id")
+        provider = _store.get_provider_config(config_id) if config_id else None
+        api_key = (
+            provider["api_key"] if provider and provider["provider"] == "hf" else None
+        )
+        if not config_id:
+            api_key = cfg.llm_api_key
+        if api_key:
+            result = fetch_session_cost(
+                api_key=api_key,
+                bill_to=metadata.get("bill_to"),
+                session_id=metadata["session_id"],
+                created_at=job.created_at,
+                now=now,
+            )
+        else:
+            result = {"status": "unavailable", "cost_usd": None, "checked_at": now}
+        if (
+            cached
+            and cached.get("cost_usd") is not None
+            and result["status"] != "reported"
+        ):
+            # Keep the last known bill through an outage or key rotation.
+            result = {**cached, "status": "stale", "checked_at": now}
+        elif result["status"] == "reported":
+            result["reported_at"] = now
+        _store.save_billing(job.id, result)
+        return result
 
 
 # Bound on the normalize output returned by /status. The transformers checker
@@ -4064,6 +4145,7 @@ def task_status(request: Request, owner: str, repo: str, job_id: str) -> JSONRes
             "model": job.llm_model,
             "prompt_tokens": (row or {}).get("prompt_tokens"),
             "completion_tokens": (row or {}).get("completion_tokens"),
+            "billing": _job_billing(job),
             # Agent-loop counters for the whole job, so the triage reconciler can
             # report *why* a group came back no_fix — a guard ending the session
             # reads very differently from the model deciding it had no fix.

@@ -24,6 +24,17 @@ def _interrupted_iter_lines(prefix_lines: list[str], exc: Exception):
 
 
 class ChatCompletionClientTests(unittest.TestCase):
+    def test_billing_session_header_is_only_sent_to_hf_router(self):
+        for base, expected in (
+            ("https://router.huggingface.co/v1", "serge-task-123"),
+            ("https://api.anthropic.com/v1", None),
+            ("https://router.huggingface.co.example/v1", None),
+        ):
+            client = ChatCompletionClient(
+                base, "secret", billing_session_id="serge-task-123"
+            )
+            self.assertEqual(client._headers().get("X-HF-Session-id"), expected)
+
     def test_complete_uses_explicit_model_without_discovery(self) -> None:
         with (
             patch("reviewbot.llm_client.requests.get") as mock_get,

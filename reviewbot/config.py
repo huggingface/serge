@@ -93,6 +93,8 @@ class Config:
     # When true, tool_max_iterations caps total tool calls instead of only
     # blind tool turns. Used by /tasks to preserve final-answer budget.
     tool_max_iterations_strict: bool = False
+    # X-HF-Session-id sent on every HF Router call of one job, for cost lookup.
+    llm_billing_session_id: Optional[str] = None
     # Hard cap on cumulative *input* tokens consumed by LLM calls during a
     # single review (across all chunks and tool turns). When exceeded we
     # stop the agentic loop, ask the model for a final review with tools

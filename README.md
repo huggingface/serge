@@ -35,6 +35,7 @@ optional, write-capable [tasks flow](docs/tasks-flow.md).
 - [Configuration](docs/configuration.md)
 - [Repository customization](docs/repository-customization.md)
 - [LLM providers](docs/llm-providers.md)
+- [HF inference costs](docs/billing.md)
 - [Architecture](docs/architecture.md)
 - [How it works](docs/how-it-works.md)
 - [Security](docs/security.md)

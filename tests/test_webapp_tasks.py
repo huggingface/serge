@@ -173,6 +173,106 @@ class WebappTasksTests(unittest.TestCase):
         # Persisted with task kind.
         row = webapp._store.load(body["id"])
         self.assertEqual(row["kind"], "task")
+        billing = json.loads(row["task_spec_json"])["billing"]
+        self.assertEqual(billing["session_id"], f"serge-task-{body['id']}")
+        self.assertEqual(
+            submitted["worker_cfg"].llm_billing_session_id, billing["session_id"]
+        )
+        self.assertEqual(billing["provider_config_id"], "c1")
+
+    def test_billing_survives_reload_refreshes_with_rotated_key_and_keeps_last_cost(
+        self,
+    ):
+        webapp = self._import_webapp(LLM_BILL_TO="acme")
+        self._seed_write_config(webapp)
+        with (
+            patch.object(webapp, "verify_token", return_value=_Claims()),
+            patch.object(webapp._TASK_POOL, "submit"),
+        ):
+            client = TestClient(webapp.app)
+            response = client.post(
+                "/tasks",
+                json={"instruction": "fix tests"},
+                headers={"Authorization": "Bearer tok"},
+            )
+        job_id = response.json()["id"]
+        job = webapp._load_job_from_store(job_id)
+        cost = {
+            "status": "reported",
+            "cost_usd": 1.2345,
+            "request_count": 7,
+            "checked_at": 1000,
+        }
+        with (
+            patch.object(webapp, "fetch_session_cost", return_value=cost) as fetch,
+            patch.object(webapp.time, "time", return_value=1000),
+        ):
+            self.assertEqual(webapp._job_billing(job)["cost_usd"], 1.2345)
+            self.assertEqual(
+                webapp._job_billing(webapp._load_job_from_store(job_id))["cost_usd"],
+                1.2345,
+            )
+        fetch.assert_called_once()
+        self.assertEqual(fetch.call_args.kwargs["api_key"], "key")
+        self.assertEqual(fetch.call_args.kwargs["bill_to"], "acme")
+        # Re-read the configured key for refresh (rotation), never persist it.
+        provider = {**webapp._store.get_provider_config("c1"), "api_key": "rotated"}
+        with (
+            patch.object(webapp._store, "get_provider_config", return_value=provider),
+            patch.object(
+                webapp,
+                "fetch_session_cost",
+                return_value={
+                    "status": "unavailable",
+                    "cost_usd": None,
+                    "checked_at": 1061,
+                },
+            ) as fetch,
+            patch.object(webapp.time, "time", return_value=1061),
+        ):
+            result = webapp._job_billing(job)
+        self.assertEqual(fetch.call_args.kwargs["api_key"], "rotated")
+        self.assertEqual(result["status"], "stale")
+        self.assertEqual(result["cost_usd"], 1.2345)
+        self.assertEqual(result["reported_at"], 1000)
+        self.assertNotIn("rotated", webapp._store.load(job_id)["billing_json"])
+
+    def test_unsupported_billing_key_does_not_break_task_status(self):
+        webapp = self._import_webapp()
+        self._seed_write_config(webapp)
+        client = TestClient(webapp.app)
+        with (
+            patch.object(webapp, "verify_token", return_value=_Claims()),
+            patch.object(webapp._TASK_POOL, "submit"),
+        ):
+            response = client.post(
+                "/tasks",
+                json={"instruction": "fix tests"},
+                headers={"Authorization": "Bearer tok"},
+            )
+            url = response.json()["url"] + "/status"
+            with patch.object(
+                webapp,
+                "fetch_session_cost",
+                return_value={
+                    "status": "forbidden",
+                    "cost_usd": None,
+                    "checked_at": 1000,
+                },
+            ):
+                status = client.get(url, headers={"Authorization": "Bearer tok"})
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["billing"]["status"], "forbidden")
+        self.assertIsNone(status.json()["billing"]["cost_usd"])
+        with (
+            patch.object(
+                webapp, "verify_token", return_value=_Claims(repository="other/repo")
+            ),
+            patch.object(webapp, "fetch_session_cost") as fetch,
+        ):
+            denied = client.get(url, headers={"Authorization": "Bearer tok"})
+        self.assertEqual(denied.status_code, 403)
+        fetch.assert_not_called()
 
     def test_debug_max_tasks_caps_a_burst(self):
         if TestClient is None:

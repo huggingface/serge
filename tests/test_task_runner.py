@@ -381,6 +381,7 @@ class BuildRunnerConfigTests(unittest.TestCase):
                 "tool_max_iterations_strict": True,
                 "llm_max_tokens": 12345,
                 "llm_max_input_tokens": 250000,
+                "llm_billing_session_id": "serge-task-j",
             },
         )
         with patch.dict(os.environ, {"LLM_API_KEY": ""}, clear=True):
@@ -394,6 +395,10 @@ class BuildRunnerConfigTests(unittest.TestCase):
         self.assertTrue(cfg.tool_max_iterations_strict)
         self.assertEqual(cfg.llm_max_tokens, 12345)
         self.assertEqual(cfg.llm_max_input_tokens, 250000)
+        self.assertEqual(cfg.llm_billing_session_id, "serge-task-j")
+        from reviewbot.launcher import runner_config
+
+        self.assertEqual(runner_config(cfg)["llm_billing_session_id"], "serge-task-j")
         # LLM provider settings win from the llm dict.
         self.assertEqual(cfg.llm_api_key, "secret-key")
         self.assertEqual(cfg.llm_api_base, "https://llm.example/v1")

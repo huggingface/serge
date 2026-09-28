@@ -396,6 +396,13 @@
         add("tokens", `${num(s.prompt_tokens)} in / ${num(s.completion_tokens)} out`);
       }
       if (s.seconds != null) add("llm time", secs(s.seconds));
+      const billing = info.billing || {};
+      if (billing.cost_usd != null) {
+        add("HF cost", `$${Number(billing.cost_usd).toFixed(4)}${billing.status === "stale" ? " (stale)" : " (reported)"}`);
+        add("billed requests", num(billing.request_count));
+      } else if (billing.status === "pending") {
+        add("HF cost", "pending");
+      }
       document.getElementById("spec-chips").innerHTML = chips.join("");
     }
 
@@ -453,6 +460,8 @@
     }
 
     const es = new EventSource(`${apiBase}/stream`);
+    // HF reconciles costs after the task ends, so keep polling (server caches 60s).
+    setInterval(loadInfo, 60000);
     es.onmessage = (e) => { try { append(JSON.parse(e.data)); } catch { append(e.data); } };
     // A `chat` event is a JSON payload of what the model emitted that turn
     // (reviewer._emit_chat_message); render it human-readably.

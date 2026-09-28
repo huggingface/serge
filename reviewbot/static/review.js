@@ -303,6 +303,12 @@
     targetEl.textContent = info.target;
     setStatus(info.status);
     infoCache = info;
+    const billing = info.billing || {};
+    const cost = document.getElementById("billing-cost");
+    cost.hidden = billing.cost_usd == null && billing.status !== "pending";
+    cost.textContent = billing.cost_usd != null
+      ? `HF inference cost: $${Number(billing.cost_usd).toFixed(4)} · ${billing.request_count} billed requests (${billing.status === "stale" ? "stale" : "reported"})`
+      : "HF inference cost: pending";
     return info;
   }
 
@@ -810,6 +816,7 @@
   (async () => {
     const info = await loadInfo();
     if (!info) return;
+    setInterval(() => loadInfo().catch(() => {}), 60000);
     if (info.status === "running") {
       attachStream();
     } else {

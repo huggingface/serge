@@ -2243,6 +2243,7 @@ def prepare_review(
         cfg.llm_api_key,
         cfg.llm_model,
         bill_to=cfg.llm_bill_to,
+        billing_session_id=cfg.llm_billing_session_id,
         stream=cfg.llm_stream,
         compressor=MessageCompressor.from_env(),
     )
@@ -2708,6 +2709,7 @@ def run_followup(
         cfg.llm_api_key,
         cfg.llm_model,
         bill_to=cfg.llm_bill_to,
+        billing_session_id=cfg.llm_billing_session_id,
         stream=cfg.llm_stream,
         compressor=MessageCompressor.from_env(),
     )

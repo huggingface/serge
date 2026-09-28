@@ -151,6 +151,7 @@ class JobStore:
             self._ensure_column("task_spec_json", "TEXT")
             self._ensure_column("result_json", "TEXT")
             self._ensure_column("session_json", "TEXT")
+            self._ensure_column("billing_json", "TEXT")
             self._ensure_column(
                 "task_write_enabled",
                 "INTEGER NOT NULL DEFAULT 0",
@@ -215,6 +216,14 @@ class JobStore:
                     kind,
                     task_spec_json,
                 ),
+            )
+            self._conn.commit()
+
+    def save_billing(self, job_id: str, billing: dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE jobs SET billing_json = ? WHERE id = ?",
+                (json.dumps(billing), job_id),
             )
             self._conn.commit()
 
