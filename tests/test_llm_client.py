@@ -26,12 +26,17 @@ def _interrupted_iter_lines(prefix_lines: list[str], exc: Exception):
 class ChatCompletionClientTests(unittest.TestCase):
     def test_billing_session_header_is_only_sent_to_hf_router(self):
         for base, expected in (
-            ("https://router.huggingface.co/v1", "serge-task-123"),
+            (
+                "https://router.huggingface.co/v1",
+                "97efaf4f-679d-4337-a25c-aa7c1690c484",
+            ),
             ("https://api.anthropic.com/v1", None),
             ("https://router.huggingface.co.example/v1", None),
         ):
             client = ChatCompletionClient(
-                base, "secret", billing_session_id="serge-task-123"
+                base,
+                "secret",
+                billing_session_id="97efaf4f-679d-4337-a25c-aa7c1690c484",
             )
             self.assertEqual(client._headers().get("X-HF-Session-id"), expected)
 

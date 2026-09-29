@@ -13,6 +13,7 @@ import sys
 import tempfile
 import types
 import unittest
+import uuid
 from unittest.mock import patch
 
 try:
@@ -174,7 +175,10 @@ class WebappTasksTests(unittest.TestCase):
         row = webapp._store.load(body["id"])
         self.assertEqual(row["kind"], "task")
         billing = json.loads(row["task_spec_json"])["billing"]
-        self.assertEqual(billing["session_id"], f"serge-task-{body['id']}")
+        session_id = uuid.UUID(billing["session_id"])
+        self.assertEqual(session_id.version, 4)
+        self.assertEqual(session_id.variant, uuid.RFC_4122)
+        self.assertEqual(str(session_id), billing["session_id"])
         self.assertEqual(
             submitted["worker_cfg"].llm_billing_session_id, billing["session_id"]
         )
