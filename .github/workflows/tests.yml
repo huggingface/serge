@@ -31,8 +31,10 @@ jobs:
         shell: bash
 
       - name: Lint workflow files
-        run: ${{ steps.get_actionlint.outputs.executable }} -color
+        run: ${STEPS_GET_ACTIONLINT_OUTPUTS_EXECUTABLE} -color
         shell: bash
+        env:
+          STEPS_GET_ACTIONLINT_OUTPUTS_EXECUTABLE: ${{ steps.get_actionlint.outputs.executable }}
 
   test:
     permissions:
