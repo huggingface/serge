@@ -7,6 +7,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest.mock import Mock, patch
 
 try:
@@ -110,9 +111,10 @@ class WebappWebhookTests(unittest.TestCase):
         gh = run_followup.call_args.args[1]
         req = run_followup.call_args.args[2]
         self.assertEqual(cfg.llm_api_key, "llm-token")
-        self.assertEqual(
-            cfg.llm_billing_session_id, f"serge-review-{response.json()['id']}"
-        )
+        session_id = uuid.UUID(cfg.llm_billing_session_id)
+        self.assertEqual(session_id.version, 4)
+        self.assertEqual(session_id.variant, uuid.RFC_4122)
+        self.assertEqual(str(session_id), cfg.llm_billing_session_id)
         restored = webapp._load_job_from_store(response.json()["id"])
         self.assertEqual(
             webapp._billing_session_id(restored), cfg.llm_billing_session_id

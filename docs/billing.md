@@ -5,10 +5,16 @@ the configured HF key can read billing for the account being charged. This
 includes web reviews, webhook reviews, and integration-failure tasks. Other
 providers and HF keys without billing access keep working without a cost display.
 
-Each new job sends one `X-HF-Session-id` across all of its HF Router calls:
+Each new job generates and persists a UUID v4, sent as `X-HF-Session-id`
+across all of its HF Router calls:
 classification, agent turns, retries, normalization repairs, and follow-up
 verification rounds share the same ID. The ID travels to isolated runners in
 their configuration. It does not change prompt-cache settings.
+
+HF validates the header as a UUID, including its version and variant. Invalid
+values are silently discarded while inference still succeeds and is billed.
+The old `serge-task-<id>` / `serge-review-<id>` values were invalid: those jobs
+have no recorded session and their costs cannot be backfilled through this API.
 
 Serge reads `billing/usage-by-inference-session` for the configured billing
 organization (`LLM_BILL_TO`), or the token owner's account when there is no

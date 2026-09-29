@@ -3996,7 +3996,9 @@ def _enable_job_billing(job: Job, provider: Optional[dict[str, Any]]) -> None:
     if job.task_spec is None:
         job.task_spec = {}
     job.task_spec["billing"] = {
-        "session_id": f"serge-{job.kind}-{job.id}",
+        # HF silently discards session headers that are not valid UUIDs.
+        # Persist once so every runner/round and billing lookup shares this ID.
+        "session_id": str(uuid.uuid4()),
         "bill_to": _llm_bill_to_for_provider(job.llm_provider),
         "provider_config_id": provider["id"] if provider else None,
     }

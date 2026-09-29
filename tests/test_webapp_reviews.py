@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest.mock import patch
 
 from reviewbot.reviewer import (
@@ -103,7 +104,11 @@ class WebappReviewsTests(unittest.TestCase):
             r = self._submit(client, llm_max_input_tokens="750000")
         self.assertEqual(r.status_code, 200, r.text)
         job = worker.call_args.args[0]
-        self.assertEqual(self.webapp._billing_session_id(job), f"serge-review-{job.id}")
+        billing_id = self.webapp._billing_session_id(job)
+        session_id = uuid.UUID(billing_id)
+        self.assertEqual(session_id.version, 4)
+        self.assertEqual(session_id.variant, uuid.RFC_4122)
+        self.assertEqual(str(session_id), billing_id)
         restored = self.webapp._load_job_from_store(job.id)
         self.assertEqual(restored.task_spec["billing"], job.task_spec["billing"])
         with patch.object(
