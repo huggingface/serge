@@ -153,11 +153,15 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Only the task pods may reach the proxy, on the proxy port.
+    # Only the task pods (and any configured extraClients) may reach the
+    # proxy, on the proxy port.
     - from:
         - podSelector:
             matchLabels:
               serge.io/task-pod: "true"
+        {{- with $egress.extraClients }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       ports:
         - protocol: TCP
           port: {{ $egress.port }}

@@ -165,6 +165,10 @@ taskExecution:
         - '(^|\.)github\.com$'
         - '(^|\.)githubusercontent\.com$'
         - '^router\.huggingface\.co$'
+      # Extra NetworkPolicy peers (besides the task pods) allowed to use the
+      # proxy, e.g. another namespace's workload that needs one allowlisted
+      # domain. Each entry is a NetworkPolicy `from` peer.
+      extraClients: []
       resources:
         requests:
           cpu: 50m
