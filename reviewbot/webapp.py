@@ -37,7 +37,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import __version__, build_info, git_sha
+from . import __version__, build_info, dashboard_api, git_sha
 from .billing import fetch_session_cost
 from .clone_cache import CloneCache, Checkout
 from .config import Config
@@ -3383,6 +3383,89 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
             str(payload.get("text") or ""),
         )
     return JSONResponse({"ok": True})
+
+
+# --- Dashboard API (/dashboard/*) ------------------------------------------
+# GitHub writes the transformers-ci dashboard asks for (reviewbot/dashboard_api.py).
+# Separate from /tasks on purpose: no LLM, no job, no runner pod, and a
+# different caller (the dashboard's service token plus the acting user, who is
+# checked here for write access) — /tasks and its OIDC callers are untouched.
+_dashboard_roles = dashboard_api.RoleCache()
+
+
+async def _dashboard_call(request: Request, operation) -> JSONResponse:
+    try:
+        dashboard_api.authorize_service(
+            cfg.dashboard_api_token, request.headers.get("authorization") or ""
+        )
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        target = dashboard_api.parse_target(body, cfg.dashboard_repositories)
+        if not (cfg.github_app_id and cfg.github_private_key):
+            raise dashboard_api.DashboardError(500, "github_app_not_configured")
+
+        def run():
+            token = installation_token_for_repo(
+                cfg.github_app_id, cfg.github_private_key, target.owner, target.repo
+            )
+            return operation(GitHubClient(token), target, body)
+
+        result = await asyncio.to_thread(run)
+    except dashboard_api.DashboardError as exc:
+        return JSONResponse(status_code=exc.status, content={"detail": exc.detail})
+    except AppNotInstalledError as exc:
+        return JSONResponse(status_code=502, content={"detail": str(exc)})
+    except Exception:  # noqa: BLE001 — a GitHub failure, never a 500 trace
+        log.exception("dashboard %s failed", request.url.path)
+        return JSONResponse(status_code=502, content={"detail": "github_error"})
+    log.info(
+        "dashboard %s for %s by %s: %s",
+        request.url.path,
+        target.repository,
+        target.actor,
+        result,
+    )
+    return JSONResponse(result)
+
+
+@app.post("/dashboard/permission")
+async def dashboard_permission(request: Request) -> JSONResponse:
+    return await _dashboard_call(
+        request,
+        lambda client, target, body: dashboard_api.permission(
+            client, target, _dashboard_roles
+        ),
+    )
+
+
+@app.post("/dashboard/runs/cancel")
+async def dashboard_cancel_run(request: Request) -> JSONResponse:
+    return await _dashboard_call(
+        request,
+        lambda client, target, body: dashboard_api.cancel_run(
+            client,
+            target,
+            body,
+            cancel_workflows=cfg.dashboard_cancel_workflows,
+            cache=_dashboard_roles,
+        ),
+    )
+
+
+@app.post("/dashboard/workflows/dispatch")
+async def dashboard_dispatch_workflow(request: Request) -> JSONResponse:
+    return await _dashboard_call(
+        request,
+        lambda client, target, body: dashboard_api.dispatch_workflow(
+            client,
+            target,
+            body,
+            dispatch_workflows=cfg.dashboard_dispatch_workflows,
+            cache=_dashboard_roles,
+        ),
+    )
 
 
 @app.post("/reviews")
