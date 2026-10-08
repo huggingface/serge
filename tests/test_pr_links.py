@@ -6,7 +6,7 @@ from reviewbot import pr_links, tasks
 GEMMA = "tests/models/gemma3/test_modeling_gemma3.py"
 NODE = f"{GEMMA}::Gemma3IntegrationTest::test_dynamic_sliding_window_is_default"
 OTHER = "tests/models/foo/test_modeling_foo.py::FooTest::test_a"
-DASH = "https://transformers-ci.lor-e.huggingface.cool/d/pytest-test/test"
+DASH = "https://transformers-ci.huggingface.cool/d/pytest-test/test"
 # What a dispatcher sends: finished links, keyed by node-id. serge renders them
 # without knowing what they point at.
 LINKS = {NODE: [{"label": "Dashboard", "url": f"{DASH}?var-test_nodeid=x"}]}
