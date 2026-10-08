@@ -528,6 +528,42 @@ class GitHubClient:
         r.raise_for_status()
         return (r.json() or {}).get("workflow_runs", [])
 
+    def get_repo(self, owner: str, repo: str) -> dict:
+        r = self.session.get(f"https://api.github.com/repos/{owner}/{repo}", timeout=30)
+        r.raise_for_status()
+        return r.json() or {}
+
+    def get_workflow_run(self, owner: str, repo: str, run_id: int) -> dict:
+        r = self.session.get(
+            f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}",
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json() or {}
+
+    def cancel_workflow_run(self, owner: str, repo: str, run_id: int) -> int:
+        """Ask GitHub to cancel a run; returns its status code as-is: 202 is
+        "accepted" (not yet cancelled), 409 means the run is already finishing.
+        Never force-cancels."""
+        r = self.session.post(
+            f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}/cancel",
+            timeout=30,
+        )
+        return r.status_code
+
+    def collaborator_role(self, owner: str, repo: str, login: str) -> str:
+        """``login``'s role on the repository (admin / maintain / write /
+        triage / read), or "" when GitHub has none for them."""
+        r = self.session.get(
+            f"https://api.github.com/repos/{owner}/{repo}/collaborators/{login}/permission",
+            timeout=30,
+        )
+        if r.status_code == 404:
+            return ""
+        r.raise_for_status()
+        data = r.json() or {}
+        return str(data.get("role_name") or data.get("permission") or "")
+
     def list_run_artifacts(self, owner: str, repo: str, run_id: int) -> list[dict]:
         r = self.session.get(
             f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",

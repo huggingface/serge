@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dashboard API (`/dashboard/*`).** The transformers-ci dashboard can ask serge
+  to make the GitHub writes behind "Re-run failed tests", so its public-facing
+  exporter never holds a write credential: `POST /dashboard/permission`,
+  `/dashboard/runs/cancel` and `/dashboard/workflows/dispatch`. The dashboard
+  authenticates with `DASHBOARD_API_TOKEN` and names the acting user, whom serge
+  checks for write access with its App. Cancels are limited to runs of
+  `DASHBOARD_CANCEL_WORKFLOWS`, dispatches to `DASHBOARD_DISPATCH_WORKFLOWS` on
+  the default branch, both in `DASHBOARD_REPOSITORIES`. Off (404) without the
+  token. `/tasks` is unchanged: the dashboard token is not a `/tasks` credential.
+
 - **A task can answer with anchored edits instead of a unified diff.** A diff
   asks the model for three things at once — what to change, the surrounding
   context byte for byte, and the `@@` geometry that has to agree with it — and

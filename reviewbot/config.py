@@ -51,6 +51,14 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _csv_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Comma-separated values, or ``default`` when unset or empty."""
+    values = tuple(
+        v.strip() for v in (os.environ.get(name) or "").split(",") if v.strip()
+    )
+    return values or default
+
+
 # The dataclass default and the ``from_env`` fallback are the SAME name on
 # purpose. They were two literals until 2026-09-16, when lowering the repeat cap
 # changed only the dataclass one — every production path builds its Config
@@ -212,6 +220,25 @@ class Config:
     task_api_enabled: bool = False
     task_oidc_issuer: str = "https://token.actions.githubusercontent.com"
     task_oidc_audience: str = "serge"
+
+    # --- Dashboard API (/dashboard/*) -----------------------------------
+    # GitHub writes the transformers-ci dashboard asks serge to make with its
+    # App (re-run failed tests: cancel a CI run, dispatch a rerun caller), so
+    # the public-facing exporter never holds a write credential. Off unless
+    # DASHBOARD_API_TOKEN is set; the exporter sends it as a bearer token and
+    # names the acting user, whom serge checks for write access itself. Every
+    # operation is allowlisted: these repositories, cancelling only runs of
+    # these workflow paths, dispatching only these workflow files.
+    dashboard_api_token: str = ""
+    dashboard_repositories: tuple[str, ...] = ("huggingface/transformers",)
+    dashboard_cancel_workflows: tuple[str, ...] = (
+        ".github/workflows/pr-ci-caller.yml",
+        ".github/workflows/self-comment-ci.yml",
+    )
+    dashboard_dispatch_workflows: tuple[str, ...] = (
+        "rerun-failed-cpu.yml",
+        "rerun-failed-gpu.yml",
+    )
     # Completion-token budget for the cheap product-vs-test classifier
     # (reviewbot/classify.py). Reasoning models (Kimi) burn tokens on reasoning
     # before emitting the JSON verdict, so the old 300 default always truncated
@@ -660,6 +687,16 @@ class Config:
             or "https://token.actions.githubusercontent.com",
             task_oidc_audience=(os.environ.get("TASK_OIDC_AUDIENCE") or "").strip()
             or "serge",
+            dashboard_api_token=(os.environ.get("DASHBOARD_API_TOKEN") or "").strip(),
+            dashboard_repositories=_csv_env(
+                "DASHBOARD_REPOSITORIES", Config.dashboard_repositories
+            ),
+            dashboard_cancel_workflows=_csv_env(
+                "DASHBOARD_CANCEL_WORKFLOWS", Config.dashboard_cancel_workflows
+            ),
+            dashboard_dispatch_workflows=_csv_env(
+                "DASHBOARD_DISPATCH_WORKFLOWS", Config.dashboard_dispatch_workflows
+            ),
             task_llm_max_tokens=(_int_env("TASK_LLM_MAX_TOKENS", 0) or None),
             task_llm_max_input_tokens=(
                 _int_env("TASK_LLM_MAX_INPUT_TOKENS", 0) or None
