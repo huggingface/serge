@@ -309,6 +309,20 @@ class GitHubClient:
         r.raise_for_status()
         return r.json()
 
+    def close_pull_request(
+        self, owner: str, repo: str, number: int, *, body: Optional[str] = None
+    ) -> dict:
+        payload: dict = {"state": "closed"}
+        if body is not None:
+            payload["body"] = body
+        r = self.session.patch(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}",
+            json=payload,
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
+
     def add_reaction_to_issue_comment(
         self, owner: str, repo: str, comment_id: int, content: str = "eyes"
     ) -> None:

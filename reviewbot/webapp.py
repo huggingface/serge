@@ -37,7 +37,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import __version__, build_info, dashboard_api, git_sha
+from . import __version__, build_info, dashboard_api, git_sha, task_pr_close
 from .billing import fetch_session_cost
 from .clone_cache import CloneCache, Checkout
 from .config import Config
@@ -4237,6 +4237,73 @@ def task_status(request: Request, owner: str, repo: str, job_id: str) -> JSONRes
             "session": (row or {}).get("session") or job.session or {},
         }
     )
+
+
+@app.post("/tasks/{owner}/{repo}/pulls/{number}/close")
+async def close_task_pr(
+    request: Request, owner: str, repo: str, number: int
+) -> JSONResponse:
+    """Close one of serge's own task PRs that the dispatcher reports is no
+    longer needed (target tests pass on main, or a newer PR covers them).
+
+    Same caller and authorization as ``POST /tasks``: a GitHub Actions OIDC
+    bearer whose ``repository`` claim names this repo, which must have opted
+    into task writes. No LLM and no job: one comment and one close, made with
+    serge's App. What serge may close is checked in
+    :func:`task_pr_close.close_task_pr`."""
+    if not cfg.task_api_enabled:
+        raise HTTPException(status_code=404, detail="tasks_api_disabled")
+
+    token = _bearer_token(request)
+    try:
+        claims = verify_token(
+            token,
+            issuer=cfg.task_oidc_issuer,
+            audience=cfg.task_oidc_audience,
+        )
+    except OIDCError as exc:
+        raise HTTPException(status_code=401, detail=f"oidc_verification_failed: {exc}")
+    if claims.repository.lower() != f"{owner}/{repo}".lower():
+        raise HTTPException(status_code=403, detail="repo_claim_mismatch")
+    if not _GH_NAME_RE.match(owner) or not _GH_NAME_RE.match(repo):
+        raise HTTPException(status_code=400, detail="bad_repository")
+    matched = _store.find_provider_config_for_repo(owner=owner, repo=repo)
+    if matched is None or not matched.get("task_write_enabled"):
+        raise HTTPException(status_code=403, detail="task_writes_not_enabled")
+    if not (cfg.github_app_id and cfg.github_private_key):
+        raise HTTPException(status_code=500, detail="github_app_not_configured")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = None
+
+    def run() -> dict:
+        gh_token = installation_token_for_repo(
+            cfg.github_app_id, cfg.github_private_key, owner, repo
+        )
+        return task_pr_close.close_task_pr(
+            GitHubClient(gh_token), owner, repo, number, payload
+        )
+
+    try:
+        result = await asyncio.to_thread(run)
+    except task_pr_close.ClosePRError as exc:
+        return JSONResponse(status_code=exc.status, content={"detail": exc.detail})
+    except AppNotInstalledError as exc:
+        return JSONResponse(status_code=502, content={"detail": str(exc)})
+    except Exception:  # noqa: BLE001 — a GitHub failure, never a 500 trace
+        log.exception("closing %s/%s#%s failed", owner, repo, number)
+        return JSONResponse(status_code=502, content={"detail": "github_error"})
+    log.info(
+        "task PR %s/%s#%s close requested by %s: %s",
+        owner,
+        repo,
+        number,
+        claims.workflow_ref or claims.actor,
+        result,
+    )
+    return JSONResponse(result)
 
 
 @app.get("/tasks/{owner}/{repo}/{job_id}/stream")

@@ -226,6 +226,15 @@ class BodyDecorationTests(unittest.TestCase):
             ['repo:huggingface/transformers "test_dynamic_sliding_window_is_default"'],
         )
 
+    def test_body_ends_with_every_group_test(self):
+        """The header shows one failure; the marker lists the whole group, so
+        the nightly triage can tell when the PR has gone stale."""
+        body = tasks._decorate_body(self.cfg, self.plan, self.req)
+        marker = body.rstrip().splitlines()[-1]
+        self.assertTrue(marker.startswith("<!-- serge-tests: "))
+        self.assertIn(NODE, marker)
+        self.assertIn("FooTest", marker)  # the bullet the header did not pick
+
     def test_no_github_client_no_search(self):
         body = tasks._decorate_body(self.cfg, self.plan, self.req)
         self.assertNotIn("Possibly related", body)

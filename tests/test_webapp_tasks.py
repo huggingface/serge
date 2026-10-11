@@ -1708,5 +1708,97 @@ class TaskLauncherTests(unittest.TestCase):
         self.assertEqual(job.error, "boom")
 
 
+class ClosePRRouteTests(unittest.TestCase):
+    """POST /tasks/{owner}/{repo}/pulls/{number}/close: same OIDC gate as
+    POST /tasks, and the close itself delegated to task_pr_close."""
+
+    # Borrow the fixtures without inheriting (and re-running) every /tasks test.
+    setUp = WebappTasksTests.setUp
+    _import_webapp = WebappTasksTests._import_webapp
+    _seed_write_config = WebappTasksTests._seed_write_config
+
+    URL = "/tasks/acme/widgets/pulls/7/close"
+    BODY = {"reason": "stale", "comment": "passes on main"}
+
+    def _post(self, webapp, claims=None, url=None, body=None):
+        with patch.object(webapp, "verify_token", return_value=claims or _Claims()):
+            return TestClient(webapp.app).post(
+                url or self.URL,
+                json=body or self.BODY,
+                headers={"Authorization": "Bearer tok"},
+            )
+
+    def test_disabled_returns_404(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp(task_api_enabled=False)
+        r = TestClient(webapp.app).post(self.URL, json=self.BODY)
+        self.assertEqual(r.status_code, 404)
+
+    def test_bad_oidc_returns_401(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        with patch.object(webapp, "verify_token", side_effect=webapp.OIDCError("bad")):
+            r = TestClient(webapp.app).post(
+                self.URL, json=self.BODY, headers={"Authorization": "Bearer tok"}
+            )
+        self.assertEqual(r.status_code, 401)
+
+    def test_repo_claim_must_match_path(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._seed_write_config(webapp)
+        r = self._post(webapp, claims=_Claims(repository="evil/repo"))
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["detail"], "repo_claim_mismatch")
+
+    def test_requires_task_write_config(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._seed_write_config(webapp, task_write_enabled=False)
+        r = self._post(webapp)
+        self.assertEqual(r.status_code, 403)
+
+    def test_closes_through_task_pr_close(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._seed_write_config(webapp)
+        with (
+            patch.object(webapp, "installation_token_for_repo", return_value="t"),
+            patch.object(webapp, "GitHubClient") as client_cls,
+            patch.object(
+                webapp.task_pr_close,
+                "close_task_pr",
+                return_value={"closed": True, "number": 7, "reason": "stale"},
+            ) as close,
+        ):
+            r = self._post(webapp)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["closed"], True)
+        client_cls.assert_called_once_with("t")
+        args = close.call_args.args
+        self.assertEqual(args[1:4], ("acme", "widgets", 7))
+        self.assertEqual(args[4], self.BODY)
+
+    def test_refusal_maps_to_status(self):
+        if TestClient is None:
+            self.skipTest("fastapi not installed")
+        webapp = self._import_webapp()
+        self._seed_write_config(webapp)
+        err = webapp.task_pr_close.ClosePRError(403, "not a serge branch: 'x'")
+        with (
+            patch.object(webapp, "installation_token_for_repo", return_value="t"),
+            patch.object(webapp, "GitHubClient"),
+            patch.object(webapp.task_pr_close, "close_task_pr", side_effect=err),
+        ):
+            r = self._post(webapp)
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("not a serge branch", r.json()["detail"])
+
+
 if __name__ == "__main__":
     unittest.main()

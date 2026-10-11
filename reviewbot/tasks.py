@@ -2031,6 +2031,23 @@ def _selected_failure_context(req: TaskRequest, plan: TaskPlan) -> str:
     return "\n".join(lines)
 
 
+# Every node-id of the failure group, machine-readable. The PR body shows one
+# representative failure, so without this nothing on the PR says which tests
+# it covers; the nightly triage reads it to tell when a PR has gone stale (its
+# tests pass on main) or is covered by a newer one. Written by code, never by
+# the model.
+GROUP_TESTS_MARKER = "<!-- serge-tests: {} -->"
+
+
+def _group_tests_marker(req: TaskRequest) -> str:
+    node_ids: list[str] = []
+    for block in _failure_blocks(req.context):
+        for nid in extract_verify_targets(block, "")[0]:
+            if nid not in node_ids and "--" not in nid:
+                node_ids.append(nid)
+    return GROUP_TESTS_MARKER.format(" ".join(node_ids)) if node_ids else ""
+
+
 def _related_issues_section(
     gh: Optional[GitHubClient], req: TaskRequest, plan: TaskPlan
 ) -> str:
@@ -2088,6 +2105,9 @@ def _decorate_body(
         footer.append(plan.metrics_line)
     if footer:
         body += f"\n\n_{' · '.join(footer)}_"
+    tests_marker = _group_tests_marker(req)
+    if tests_marker:
+        body += f"\n\n{tests_marker}"
     return body
 
 
