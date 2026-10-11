@@ -2350,3 +2350,83 @@ class PatchShapedForCheckersTests(unittest.TestCase):
         # Without this the checker's `diff_only` is False and it scans the
         # whole tree however well-shaped the worktree is.
         self.assertEqual(tasks_module._CHECKER_ENV["CI_PULL_REQUEST"], "1")
+
+
+class ExpectationShapeValidationTests(unittest.TestCase):
+    """A patch that overwrites a non-runner Expectations key is sent back for
+    correction, like a normalizer failure (reviewbot/expectation_keys.py)."""
+
+    _TEST = "tests/models/x/test_modeling_x.py"
+    _OLD = (
+        "def test_logits(self):\n"
+        "    e = Expectations({\n"
+        "        (None, None): [0.9989, 0.1953],\n"
+        "    })\n"
+    )
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = self._tmp.name
+        src = os.path.join(root, "src")
+        os.makedirs(os.path.join(src, "tests/models/x"))
+        with open(os.path.join(src, self._TEST), "w") as f:
+            f.write(self._OLD)
+        _git(src, "init", "--quiet", "-b", "main")
+        _git(src, "add", "-A")
+        _git(src, "commit", "--quiet", "-m", "main commit")
+        self.cache = CloneCache(os.path.join(root, "cache"))
+        self.co = self.cache.acquire_ref(
+            token="",
+            owner="acme",
+            repo="widget",
+            ref="main",
+            job_id="keys1234",
+            remote_url=src,
+        )
+
+    def _validate(self, old_line, new_lines, **cfg):
+        edits = [{"path": self._TEST, "old": old_line, "new": new_lines}]
+        report: dict = {}
+        feedback, _ = _validate_patch(
+            _make_cfg(
+                helper_sandbox="off",
+                task_sandbox_backend="bwrap",
+                task_normalize_command=["true"],
+                task_normalize_timeout=30,
+                **cfg,
+            ),
+            checkout=self.co,
+            clone_cache=self.cache,
+            content=json.dumps({"title": "t", "body": "b", "edits": edits}),
+            emit=lambda *a: None,
+            report=report,
+        )
+        return feedback, report
+
+    def test_overwriting_the_generic_key_is_sent_back(self):
+        feedback, report = self._validate(
+            "(None, None): [0.9989, 0.1953],", "(None, None): [0.9950, 0.1953],"
+        )
+        self.assertIn("maintainers do not accept", feedback)
+        self.assertIn('("cuda", 8)', feedback)
+        self.assertEqual(report["rejection"], "expectations")
+        self.assertTrue(report["expectation_problems"])
+        with open(os.path.join(self.co.path, self._TEST)) as fh:
+            self.assertEqual(fh.read(), self._OLD)  # worktree reset
+
+    def test_adding_the_runner_key_is_accepted(self):
+        feedback, report = self._validate(
+            "(None, None): [0.9989, 0.1953],",
+            '(None, None): [0.9989, 0.1953],\n        ("cuda", 8): [0.9987, 0.1953],',
+        )
+        self.assertIsNone(feedback)
+        self.assertEqual(report["expectation_problems"], [])
+
+    def test_kill_switch(self):
+        feedback, _ = self._validate(
+            "(None, None): [0.9989, 0.1953],",
+            "(None, None): [0.9950, 0.1953],",
+            task_expectation_key_check=False,
+        )
+        self.assertIsNone(feedback)

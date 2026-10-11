@@ -34,6 +34,8 @@ from .commit_scope import describe_dropped, scope_paths
 from .compression import MessageCompressor
 from .config import Config
 from .expectation_guard import PatchClassification, classify_patch
+from .expectation_keys import RULE_TEXT as _EXPECTATION_RULE_TEXT
+from .expectation_keys import expectation_key_problems
 from .github_client import SERGE_GIT_EMAIL, GitHubClient
 from .guidance import GuidanceResult, check_patch
 from .llm_client import ChatCompletionClient
@@ -251,6 +253,10 @@ class TaskPlan:
     # rather than recomputed at publish time because the call that produced it
     # is billed to this task's metrics.
     guidance_note: str = ""
+    # Expectation-shape problems (reviewbot/expectation_keys.py) still present in
+    # the final patch after the correction budget ran out. Empty when the patch
+    # has the accepted shape or touches no expectations.
+    expectation_problems: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -901,6 +907,7 @@ def _validate_patch(
         # Cleared per attempt: a patch synthesized from an accepted answer must
         # never outlive the answer it came from.
         report["patch"] = ""
+        report["expectation_problems"] = []
 
     try:
         result = _extract_json(content, _TASK_JSON_KEYS)
@@ -996,6 +1003,29 @@ def _validate_patch(
             )
             return msg, False
 
+    problems = _expectation_shape_problems(cfg, checkout, patch)
+    if report is not None:
+        report["expectation_problems"] = problems
+    if problems:
+        clone_cache.reset_worktree(checkout)
+        emit("rejected_patch", _bounded_rejected_patch(patch))
+        emit(
+            "log",
+            "Expectation change rejected: " + " ".join(problems),
+        )
+        if report is not None:
+            report["rejection"] = "expectations"
+        return (
+            "Your patch changes test expectations in a way transformers "
+            "maintainers do not accept:\n\n"
+            + "\n".join(f"- {p}" for p in problems)
+            + f"\n\n{_EXPECTATION_RULE_TEXT}\n\nReturn the corrected change. "
+            "If the new values cannot be expressed that way (they moved far more "
+            "than hardware drift, or the fix belongs in the code), return an "
+            "empty `edits` list and say why in `body`.",
+            False,
+        )
+
     # The patch is applied and nothing has reformatted it yet, so the file's
     # line numbers are still the diff's new-side ones: the one point where the
     # comments the patch added can be located exactly. Shorten them here so the
@@ -1062,6 +1092,40 @@ def _validate_patch(
     if report is not None:
         report["rejection"] = ""
     return None, True
+
+
+def _expectation_shape_problems(
+    cfg: Config, checkout: Checkout, patch: str
+) -> list[str]:
+    """Shape problems in how the applied ``patch`` changes test expectations.
+
+    Compares each changed test file in the worktree with its committed version
+    (:mod:`reviewbot.expectation_keys`). Best-effort: a file git cannot show (new,
+    or outside the repo) is skipped, never an error."""
+    if not cfg.task_expectation_key_check:
+        return []
+    classification = classify_patch(patch)
+    problems: list[str] = []
+    for path in classification.test_files:
+        full = os.path.join(checkout.path, path)
+        try:
+            with open(full, encoding="utf-8") as fh:
+                new_src = fh.read()
+            old_src = subprocess.run(
+                ["git", "-C", checkout.path, "show", f"HEAD:{path}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        problems += expectation_key_problems(
+            path,
+            old_src,
+            new_src,
+            expectation_only=classification.expectation_only,
+        )
+    return problems
 
 
 _HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
@@ -1928,6 +1992,7 @@ def prepare_task(
         session=session_record(metrics),
         model=llm.model,
         worktree_prepared=outcome["prepared"],
+        expectation_problems=list(outcome.get("expectation_problems") or []),
         guidance_note=guidance.pr_section() if guidance is not None else "",
     )
 
@@ -2082,6 +2147,16 @@ def _decorate_body(
     # the serge footer (not tacked on after them).
     if verification_footer:
         body += f"\n{verification_footer}"
+    # A shape problem the correction budget could not fix
+    # (reviewbot/expectation_keys.py). The PR still opens, because a human may
+    # judge the value fine, but the reviewer is told before reading the diff.
+    if plan.expectation_problems:
+        body += (
+            "\n\n### ⚠️ Expectation change not in the maintainer shape\n"
+            'Only the CI runner\'s `("cuda", 8)` entry should change; serge could '
+            "not get the patch into that shape:\n"
+            + "\n".join(f"- {p}" for p in plan.expectation_problems)
+        )
     # §3.4, directly under the verification it qualifies: both sections are
     # evidence about this change, and this one is the weaker of the two — an
     # LLM judgement about review prose, not a test result — so it reads after

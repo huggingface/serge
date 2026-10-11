@@ -390,6 +390,12 @@ class Config:
     # feedback loop (validate once, accept whatever the model produced). The
     # model gets up to ``task_normalize_max_retries + 1`` patch attempts.
     task_normalize_max_retries: int = 2
+    # Reject (and send back for correction) a patch whose test-expectation
+    # change does not have the shape maintainers accept: only the CI runner's
+    # Expectations key may change, no tolerance may loosen
+    # (reviewbot/expectation_keys.py). Rides the same retry budget as the
+    # normalizer; a violation that survives it is flagged in the PR body.
+    task_expectation_key_check: bool = True
     # Optional free-text guidance injected into the task system prompt and the
     # normalize-failure feedback, alongside the normalize command. Use it to
     # encode policy the command itself can't express — e.g. "prefer root-cause
@@ -735,6 +741,7 @@ class Config:
             ).strip()
             or None,
             task_normalize_max_retries=_int_env("TASK_NORMALIZE_MAX_RETRIES", 2),
+            task_expectation_key_check=_bool_env("TASK_EXPECTATION_KEY_CHECK", True),
             task_preflight_command=(
                 shlex.split(os.environ.get("TASK_PREFLIGHT_COMMAND") or "") or None
             ),
