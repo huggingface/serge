@@ -18,7 +18,11 @@ If a change here makes one of these five flip, the change is wrong.
 
 import unittest
 
-from reviewbot.expectation_guard import classify_patch, is_test_path
+from reviewbot.expectation_guard import (
+    classify_patch,
+    degenerate_text,
+    is_test_path,
+)
 
 # --- real serge patches, verbatim -----------------------------------------
 
@@ -200,6 +204,40 @@ class RuleTests(unittest.TestCase):
 +        model = X.from_pretrained(mid, dtype=torch.float32)
 """
         self.assertFalse(classify_patch(patch).expectation_only)
+
+    def test_47698_a_sign_flip_is_still_a_literal_edit(self):
+        patch = (
+            "diff --git a/tests/models/x/test_x.py b/tests/models/x/test_x.py\n"
+            "--- a/tests/models/x/test_x.py\n+++ b/tests/models/x/test_x.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-        expected = torch.tensor([9.7481, 2.5104])\n"
+            "+        expected = torch.tensor([9.7481, -2.5104])\n"
+        )
+        self.assertTrue(classify_patch(patch).expectation_only)
+
+    def test_binary_minus_is_still_code(self):
+        patch = (
+            "diff --git a/tests/models/x/test_x.py b/tests/models/x/test_x.py\n"
+            "--- a/tests/models/x/test_x.py\n+++ b/tests/models/x/test_x.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-        n = seq_len 1\n"
+            "+        n = seq_len-1\n"
+        )
+        self.assertFalse(classify_patch(patch).expectation_only)
+
+    def test_degenerate_text(self):
+        self.assertIn("control", degenerate_text("\x04 A bus"))
+        self.assertIn("control", degenerate_text("\\x04 A bus"))
+        self.assertIn(
+            "hello_world():", degenerate_text("def hello_world(): hello_world():")
+        )
+        for fine in (
+            "very very good",
+            "USER: <image> <image> describe",
+            "line\nline\n",
+            "a\tb",
+        ):
+            self.assertEqual(degenerate_text(fine), "", fine)
 
     def test_an_all_zero_expectation_is_degenerate(self):
         patch = """diff --git a/tests/models/x/test_modeling_x.py b/tests/models/x/test_modeling_x.py

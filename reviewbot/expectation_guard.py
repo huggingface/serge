@@ -45,7 +45,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-__all__ = ["PatchClassification", "classify_patch", "is_test_path"]
+__all__ = [
+    "PatchClassification",
+    "classify_patch",
+    "degenerate_text",
+    "is_test_path",
+]
 
 
 # A quoted literal, honouring backslash escapes, in either quote style. Ordered
@@ -60,8 +65,12 @@ _STRING_LITERAL = re.compile(
 )
 # A number literal. The leading \b keeps it from biting into an identifier —
 # `float16` and `Sam2VisionModel` must survive intact, or every dtype change
-# would read as a literal edit.
-_NUMBER_LITERAL = re.compile(r"\b\d+\.?\d*(?:[eE][-+]?\d+)?\b")
+# would read as a literal edit. A unary minus belongs to the literal: without it
+# a value that changes sign leaves a stray `-` behind, and transformers#47698
+# (a box coordinate re-recorded as -2.5104) read as a code change, so no
+# expectation rule ran on it. The lookbehind keeps binary minus (`n-1`, `1e-4`)
+# out.
+_NUMBER_LITERAL = re.compile(r"(?:(?<![\w)\]])-)?\b\d+\.?\d*(?:[eE][-+]?\d+)?\b")
 # Punctuation that only ever reflects *formatting*. `#48439` reflowed one
 # `Expectations` entry across four lines; dropping these makes that a no-op,
 # which it is.
@@ -161,6 +170,31 @@ def _literals(lines: list[str]) -> list[str]:
     return out
 
 
+# A control character in decoded text, raw or as the escape a source literal
+# spells it with; tab, newline and carriage return are ordinary text.
+# transformers#49244 recorded fuyu's caption as "\x04 A bus parked on ...":
+# a special token leaking past skip_special_tokens, not a new caption.
+_CONTROL_CHAR = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\\x(?:0[0-8bcef]|1[0-9a-f]|7f)", re.IGNORECASE
+)
+# The same token of six or more characters twice in a row: generation that
+# stuttered. transformers#47983 recorded starcoder2 writing
+# "def hello_world(): hello_world():". The token must start with a word
+# character so prompt markup ("<image> <image>") is not a stutter.
+_STUTTER = re.compile(r"(?<!\S)(\w\S{5,})\s+\1(?!\S)")
+
+
+def degenerate_text(value: str) -> str:
+    """Why a text value reads as broken output rather than a new baseline, or
+    ``""``. Takes either the decoded string or its source spelling."""
+    if _CONTROL_CHAR.search(value):
+        return "contains a control character"
+    m = _STUTTER.search(value.replace("\\n", " ").replace("\\t", " "))
+    if m:
+        return f"repeats `{m.group(1)}`"
+    return ""
+
+
 def _is_degenerate(value: str) -> bool:
     stripped = value.strip()
     if stripped.lower() in _DEGENERATE:
@@ -168,7 +202,7 @@ def _is_degenerate(value: str) -> bool:
     # An all-zero tensor/list slice: only zeros, separators and decimal points.
     if stripped and re.fullmatch(r"[0.,\s\[\]-]+", stripped) and "0" in stripped:
         return True
-    return False
+    return bool(degenerate_text(value))
 
 
 @dataclass

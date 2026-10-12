@@ -23,7 +23,24 @@ The rule, as this module enforces it:
 * in an expectation-only patch, nothing outside an ``Expectations`` block may
   change except the glue a conversion needs (the import, the
   ``get_expectation()`` call). That catches loosened tolerances and plain
-  literals overwritten in place.
+  literals overwritten in place. One exemption: an assertion on the *shape or
+  length of the model's inputs* (``inputs.input_ids.shape == (2, 422)``). The
+  tokenizer and image processor run before the model and do not depend on the
+  GPU, so a runner key is the wrong home for that value; #49507 (pegasus) was
+  sent back three times for not putting a tokenizer length under ``("cuda",
+  8)``. The exemption needs an input name *and* a ``.shape``/``len(``/
+  ``.size(`` on the line, so an output count (``len(results["scores"])``,
+  #47698) is still held to the rule.
+
+The runner-key value itself is checked against what it replaces (the old
+runner value, or the ``(None, None)`` value when the key is new, including a
+plain literal just converted into a block, #49243):
+
+* numbers may move by at most :data:`MAX_RUNNER_DRIFT` of their scale;
+* the *count* of numbers may not change: three detections where there were
+  five (#47698) is a different result, not drift;
+* text may not gain a control character or a stutter
+  (:func:`reviewbot.expectation_guard.degenerate_text`; #49244, #47983).
 
 This only reads the two versions of a test file. It cannot tell whether a new
 value is *right* (see :mod:`reviewbot.expectation_guard` for degenerate values);
@@ -37,6 +54,8 @@ import ast
 import difflib
 import re
 from dataclasses import dataclass
+
+from .expectation_guard import degenerate_text
 
 __all__ = ["RUNNER_KEYS", "expectation_key_problems", "RULE_TEXT"]
 
@@ -68,6 +87,17 @@ _TOLERANCE = re.compile(r"\b(atol|rtol)\s*=\s*([0-9.]+(?:[eE][-+]?\d+)?)")
 # a test-code fix is not this module's business (#47697 renamed a config key).
 _EXPECTED_LINE = re.compile(
     r"expect|assert|\batol\b|\brtol\b|^\s*[\[\]\"'\d-]", re.IGNORECASE
+)
+# An assertion on the shape or length of what goes INTO the model (see the
+# module docstring, #49507). Both halves must match, and nothing output-side may
+# appear on the line.
+_INPUT_NAME = re.compile(
+    r"\b(?:inputs|input_ids|attention_mask|token_type_ids|pixel_values"
+    r"|input_features|input_values|encoding|encoded)\b"
+)
+_SIZE_OF = re.compile(r"\.shape\b|\blen\(|\.size\(")
+_OUTPUT_NAME = re.compile(
+    r"output|logits|generat|result|pred|decoded|score", re.IGNORECASE
 )
 # Lines a literal → Expectations conversion has to touch outside the block.
 _GLUE = re.compile(
@@ -141,6 +171,19 @@ def _numbers(value_src: str) -> list[float]:
     return [float(x) for x in _NUMBER.findall(value_src)]
 
 
+def _strings(value_src: str) -> list[str] | None:
+    """Every string in a literal value; ``None`` when it is not a literal."""
+    try:
+        tree = ast.parse(value_src, mode="eval")
+    except SyntaxError:
+        return None
+    return [
+        n.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    ]
+
+
 def _drift(old_src: str, new_src: str) -> float | None:
     """Largest change between two same-shaped numeric values, as a fraction of
     the old value's largest magnitude; ``None`` for text or a shape change."""
@@ -149,6 +192,43 @@ def _drift(old_src: str, new_src: str) -> float | None:
         return None
     scale = max(abs(x) for x in old) or 1.0
     return max(abs(a - b) for a, b in zip(old, new)) / scale
+
+
+def _runner_value_problems(where: str, key, before: str, after: str) -> list[str]:
+    """What is wrong with a runner-key value given the value it replaces."""
+    old_text, new_text = _strings(before), _strings(after)
+    if old_text is None or new_text is None:
+        return []
+    if not old_text and not new_text:
+        old_n, new_n = _numbers(before), _numbers(after)
+        if old_n and new_n and len(old_n) != len(new_n):
+            return [
+                (
+                    f"{where}: the {_fmt(key)} value has {len(new_n)} numbers where "
+                    f"it had {len(old_n)}; a different count is a different result, "
+                    "not hardware drift."
+                )
+            ]
+        drift = _drift(before, after)
+        if drift is not None and drift > MAX_RUNNER_DRIFT:
+            return [
+                (
+                    f"{where}: the {_fmt(key)} values move by {drift:.0%} of the "
+                    f"block's scale; hardware drift is about 1%, so this looks like "
+                    "a regression, not a new baseline."
+                )
+            ]
+        return []
+    out = []
+    for text in new_text:
+        why = degenerate_text(text)
+        if why and not any(degenerate_text(t) == why for t in old_text):
+            out.append(
+                f"{where}: the new {_fmt(key)} text {why}; that is broken "
+                "output, not a new baseline."
+            )
+            break
+    return out
 
 
 def _loosened(old_lines: list[str], new_lines: list[str]) -> list[str]:
@@ -172,6 +252,14 @@ def _loosened(old_lines: list[str], new_lines: list[str]) -> list[str]:
 
 def _fmt(key) -> str:
     return repr(key).replace("'", '"')
+
+
+def _is_input_size(line: str) -> bool:
+    return bool(
+        _INPUT_NAME.search(line)
+        and _SIZE_OF.search(line)
+        and not _OUTPUT_NAME.search(line)
+    )
 
 
 def _within(line: int, blocks: list[_Block]) -> bool:
@@ -205,6 +293,12 @@ def expectation_key_problems(
                     f"{where}: a new Expectations block may only hold `(None, None)` "
                     f"and the runner key, not {', '.join(_fmt(k) for k in extra)}."
                 )
+            before = new.entries.get(GENERIC_KEY)
+            for key in RUNNER_KEYS & new.entries.keys():
+                if before is not None:
+                    problems += _runner_value_problems(
+                        where, key, before, new.entries[key]
+                    )
             continue
         old_values = set(old.entries.values())
         for key, value in old.entries.items():
@@ -223,13 +317,8 @@ def expectation_key_problems(
             )
         for key in RUNNER_KEYS & new.entries.keys():
             before = old.entries.get(key) or new.entries.get(GENERIC_KEY)
-            drift = _drift(before, new.entries[key]) if before else None
-            if drift is not None and drift > MAX_RUNNER_DRIFT:
-                problems.append(
-                    f"{where}: the {_fmt(key)} values move by {drift:.0%} of the "
-                    f"block's scale; hardware drift is about 1%, so this looks like "
-                    "a regression, not a new baseline."
-                )
+            if before and before != new.entries[key]:
+                problems += _runner_value_problems(where, key, before, new.entries[key])
         for key, value in new.entries.items():
             if key in old.entries or key in RUNNER_KEYS:
                 continue
@@ -271,9 +360,14 @@ def expectation_key_problems(
                 continue
             if _loosened(old_lines[i1:i2], new_lines[j1:j2]):
                 continue  # already reported above
-            if not any(_EXPECTED_LINE.search(ln) for ln in changed):
+            flagged = [
+                ln
+                for ln in changed
+                if _EXPECTED_LINE.search(ln) and not _is_input_size(ln)
+            ]
+            if not flagged:
                 continue
-            sample = (new_lines[j1:j2] or old_lines[i1:i2])[0].strip()
+            sample = flagged[0].strip()
             problems.append(
                 f"`{path}` (line {j1 + 1}): changed `{sample[:80]}` outside any "
                 "Expectations block."

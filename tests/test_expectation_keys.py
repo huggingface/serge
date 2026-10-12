@@ -100,6 +100,26 @@ class AcceptedShapes(unittest.TestCase):
         )
         self.assertEqual(problems(old, new), [])
 
+    def test_49507_input_length_is_not_a_hardware_value(self):
+        old = "def test_t(self):\n    assert inputs.input_ids.shape == (2, 421)\n"
+        new = "def test_t(self):\n    assert inputs.input_ids.shape == (2, 422)\n"
+        self.assertEqual(problems(old, new), [])
+
+    def test_an_output_count_is_still_held_to_the_rule(self):
+        old = 'def test_t(self):\n    self.assertEqual(len(results["scores"]), 5)\n'
+        new = 'def test_t(self):\n    self.assertEqual(len(results["scores"]), 3)\n'
+        self.assertIn("outside any Expectations block", problems(old, new)[0])
+
+    def test_new_text_wording_on_the_runner_key_is_fine(self):
+        old = 'def test_t(self):\n    e = Expectations({(None, None): "a cat on a mat"})\n'
+        new = 'def test_t(self):\n    e = Expectations({(None, None): "a cat on a mat", ("cuda", 8): "a cat on the mat"})\n'
+        self.assertEqual(problems(old, new), [])
+
+    def test_existing_stutter_is_not_blamed_on_the_patch(self):
+        old = 'def test_t(self):\n    e = Expectations({("cuda", 8): "very_long very_long tail"})\n'
+        new = 'def test_t(self):\n    e = Expectations({("cuda", 8): "very_long very_long tale"})\n'
+        self.assertEqual(problems(old, new), [])
+
     def test_47697_test_code_fix_is_not_this_rules_business(self):
         old = 'def test_t(self):\n    config.rope_parameters["type"] = "default"\n'
         new = 'def test_t(self):\n    config.rope_parameters["rope_type"] = "default"\n'
@@ -169,6 +189,50 @@ class RejectedShapes(unittest.TestCase):
             "def test_t(self):\n    expected_slice = torch.tensor([-0.2782, 0.4466])\n"
         )
         self.assertEqual(problems(old, new, eo=False), [])
+
+    def test_49243_converted_literal_is_drift_checked(self):
+        old = "def test_t(self):\n    expected_slice = torch.tensor([-1.4192, -1.9158, -0.9702])\n"
+        new = (
+            "def test_t(self):\n    expected_slice = torch.tensor(Expectations({(None, None): "
+            '[-1.4192, -1.9158, -0.9702], ("cuda", 8): [-1.1939, -1.4547, -0.1076]})'
+            ".get_expectation())\n"
+        )
+        out = problems(old, new)
+        self.assertEqual(len(out), 1)
+        self.assertIn("45%", out[0])
+
+    def test_47698_a_different_count_is_not_drift(self):
+        old = "def test_t(self):\n    e = Expectations({(None, None): [0.8732, 0.8563, 0.8554, 0.6080, 0.5895]})\n"
+        new = (
+            "def test_t(self):\n    e = Expectations({(None, None): [0.8732, 0.8563, 0.8554, 0.6080, 0.5895], "
+            '("cuda", 8): [0.5987, 0.5883, 0.3454]})\n'
+        )
+        out = problems(old, new)
+        self.assertEqual(len(out), 1)
+        self.assertIn("3 numbers where it had 5", out[0])
+
+    def test_47983_stuttering_generation(self):
+        old = (
+            'def test_t(self):\n    e = Expectations({(None, None): "def hello_world():\\n\\treturn 1", '
+            '("cuda", 8): "def hello_world():\\n\\treturn 1"})\n'
+        )
+        new = old.replace(
+            '("cuda", 8): "def hello_world():',
+            '("cuda", 8): "def hello_world(): hello_world():',
+        )
+        out = problems(old, new)
+        self.assertEqual(len(out), 1)
+        self.assertIn("repeats `hello_world():`", out[0])
+
+    def test_49244_control_character_in_text(self):
+        old = 'def test_t(self):\n    e = Expectations({(None, None): "A blue bus on a road."})\n'
+        new = (
+            'def test_t(self):\n    e = Expectations({(None, None): "A blue bus on a road.", '
+            '("cuda", 8): "\\x04 A bus on a road."})\n'
+        )
+        out = problems(old, new)
+        self.assertEqual(len(out), 1)
+        self.assertIn("control character", out[0])
 
     def test_unparseable_source_is_not_judged(self):
         self.assertEqual(problems("def broken(:\n", "def broken(:\n  x\n"), [])
