@@ -240,3 +240,55 @@ class RejectedShapes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Severity(unittest.TestCase):
+    """Hard problems (the value is wrong) block the PR once the correction
+    budget is spent; soft ones (the value is in the wrong place) only warn."""
+
+    def _only(self, old: str, new: str):
+        found = expectation_key_problems("test_x.py", old, new, expectation_only=True)
+        self.assertEqual(len(found), 1, found)
+        return found[0]
+
+    def test_wrong_key_is_soft(self):
+        new = BASE.replace("[0.9989, 0.1953, -0.4382]", "[0.9950, 0.1953, -0.4382]")
+        self.assertFalse(self._only(BASE, new).hard)
+
+    def test_runner_drift_is_hard(self):
+        new = BASE.replace(
+            '("xpu", 5)',
+            '("cuda", 8): [0.4989, 0.1953, -0.4381],\n                ("xpu", 5)',
+        )
+        self.assertTrue(self._only(BASE, new).hard)
+
+    def test_changed_count_is_hard(self):
+        new = BASE.replace(
+            '("xpu", 5)', '("cuda", 8): [0.9987, 0.1953],\n                ("xpu", 5)'
+        )
+        self.assertTrue(self._only(BASE, new).hard)
+
+    def test_loosened_tolerance_is_hard(self):
+        new = BASE.replace("rtol=1e-4, atol=1e-4", "rtol=1e-2, atol=1e-2")
+        self.assertTrue(self._only(BASE, new).hard)
+
+    def test_broken_text_is_hard(self):
+        old = _src(
+            """
+            def test_gen(self):
+                e = Expectations({(None, None): "A blue bus parked on the side of a road."})
+            """
+        )
+        new = old.replace(
+            "})",
+            ', ("cuda", 8): "\\x04 A bus parked on the side of a road."})',
+        )
+        self.assertTrue(self._only(old, new).hard)
+
+    def test_problems_still_compare_as_plain_sentences(self):
+        # Existing callers join, quote and compare these as str.
+        new = BASE.replace("rtol=1e-4, atol=1e-4", "rtol=1e-2, atol=1e-2")
+        p = self._only(BASE, new)
+        self.assertIsInstance(p, str)
+        self.assertEqual(p, str(p))
+        self.assertIn("loosened a tolerance", " ".join([p]))

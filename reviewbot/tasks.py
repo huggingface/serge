@@ -35,7 +35,7 @@ from .compression import MessageCompressor
 from .config import Config
 from .expectation_guard import PatchClassification, classify_patch
 from .expectation_keys import RULE_TEXT as _EXPECTATION_RULE_TEXT
-from .expectation_keys import expectation_key_problems
+from .expectation_keys import expectation_key_problems, hard_problems
 from .github_client import SERGE_GIT_EMAIL, GitHubClient
 from .guidance import GuidanceResult, check_patch
 from .llm_client import ChatCompletionClient
@@ -258,6 +258,10 @@ class TaskPlan:
     # the final patch after the correction budget ran out. Empty when the patch
     # has the accepted shape or touches no expectations.
     expectation_problems: list[str] = field(default_factory=list)
+    # The subset that makes the value itself wrong (Problem.hard). Kept as its
+    # own list of plain strings so it survives any copy of the plan: when it is
+    # non-empty and TASK_EXPECTATION_HARD_BLOCK is on, publish_task opens no PR.
+    expectation_hard_problems: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1998,6 +2002,9 @@ def prepare_task(
         model=llm.model,
         worktree_prepared=outcome["prepared"],
         expectation_problems=list(outcome.get("expectation_problems") or []),
+        expectation_hard_problems=hard_problems(
+            outcome.get("expectation_problems") or []
+        ),
         guidance_note=guidance.pr_section() if guidance is not None else "",
     )
 
@@ -2683,6 +2690,34 @@ def publish_task(
             mode=req.mode,
             no_change=True,
             message=plan.body or "No fix was proposed.",
+        )
+
+    # The correction budget ran out with the *value* still wrong (drift, a
+    # changed count, broken text, a loosened tolerance — expectation_keys.Problem
+    # .hard). Open nothing: on 2026-10-12 the review queue was overwhelmed, and
+    # a value that survived three attempts at being right is not worth a
+    # maintainer's review. Nothing is committed, so no branch is left behind —
+    # unlike an unjudged verify run, there is nothing here worth finishing.
+    if plan.expectation_hard_problems and getattr(
+        cfg, "task_expectation_hard_block", True
+    ):
+        if plan.worktree_prepared:
+            clone_cache.reset_worktree(checkout)
+        _emit(
+            "log",
+            "Expectation change still wrong after the correction budget; "
+            "not opening a PR: " + " ".join(plan.expectation_hard_problems),
+        )
+        return TaskResult(
+            mode=req.mode,
+            no_change=True,
+            pr_number=req.pr_number if req.mode == "existing_pr" else None,
+            message=(
+                "The patch re-records test expectations with values that are not "
+                "hardware drift, and the correction budget ran out before it "
+                "found acceptable ones, so no PR was opened:\n\n"
+                + "\n".join(f"- {p}" for p in plan.expectation_hard_problems)
+            ),
         )
 
     if plan.worktree_prepared:
