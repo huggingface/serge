@@ -172,6 +172,45 @@ def test_thread_files_flag(env):
     assert "--files" not in _argv(env, "history_thread", number=1)
 
 
+def test_thread_after_pages_the_thread(env):
+    # Without it the model re-ranked one thread with new focus words 16 times
+    # (blt, #48534) and once passed a comment id as `focus`.
+    argv = _argv(env, "history_thread", number=48536, after="5566525365")
+    assert argv[argv.index("--after") + 1] == "5566525365"
+    assert "--after" not in _argv(env, "history_thread", number=1)
+
+
+def test_tracking_issue_number_comes_from_the_relates_to_line():
+    context = (
+        "Also include the line `Relates to #49506` in the PR body so the PR "
+        "links back to the nightly triage tracking issue."
+    )
+    assert relore_tool.tracking_issue_number(context) == 49506
+    assert relore_tool.tracking_issue_number("no such line") is None
+
+
+@pytest.mark.parametrize("name", ["history_thread", "history_inflight"])
+def test_the_tracking_issue_is_answered_locally(monkeypatch, env, name):
+    def run(*a, **kw):
+        raise AssertionError("relore must not be called for the tracking issue")
+
+    monkeypatch.setattr(relore_tool.subprocess, "run", run)
+    out = run_relore_tool(replace(env, tracking_issue=49506), name, {"number": 49506})
+    assert "tracking issue that dispatched this task" in out
+
+
+def test_other_threads_still_reach_relore_when_a_tracking_issue_is_set(
+    monkeypatch, env
+):
+    record = {}
+    _fake_run(monkeypatch, _Proc(stdout="page"), record)
+    out = run_relore_tool(
+        replace(env, tracking_issue=49506), "history_thread", {"number": 48534}
+    )
+    assert out == "page"
+    assert "48534" in record["argv"]
+
+
 def test_why_argv_joins_path_and_line(env):
     argv = _argv(env, "history_why", path="src/m.py", line=90)
     assert argv == [
@@ -905,6 +944,30 @@ class TestPriorArtQualityFilter:
         result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
         assert result.threads == []
         assert result.dropped == 1
+
+    def test_a_tracking_issue_is_dropped_without_a_header_lookup(self, monkeypatch):
+        # The nightly table of every failure group matches any failing test id
+        # (#49506 on the 2026-10-11 nightly). It is counted, not silently lost,
+        # and dropped on its title so its header is never fetched.
+        run = _FakeRun(
+            [
+                {
+                    "hits": [
+                        _hit(
+                            49506,
+                            type="issue",
+                            title="[serge] integration failure triage - 2026-10-11",
+                        ),
+                        _hit(2),
+                    ]
+                }
+            ]
+        )
+        monkeypatch.setattr(relore_tool.subprocess, "run", run)
+        result = relore_tool.prior_art(self.ENV, node_ids=[self.NODE_ID])
+        assert [t.number for t in result.threads] == [2]
+        assert result.dropped == 1
+        assert ["49506"] not in [c[3:4] for c in run.calls if c[2] == "thread"]
 
     def test_a_closed_issue_is_kept(self, monkeypatch):
         """The filter's one dangerous false positive, guarded.

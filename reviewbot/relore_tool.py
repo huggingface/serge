@@ -163,6 +163,10 @@ class ReloreEnv:
     api: Optional[str] = None
     timeout: int = DEFAULT_RELORE_TIMEOUT
     executable: str = RELORE_BIN
+    #: The ITF tracking issue that dispatched this task, when the task says so
+    #: (:func:`tracking_issue_number`). A thread/inflight call on it is answered
+    #: locally: see :func:`_tracking_issue_reply`.
+    tracking_issue: Optional[int] = None
 
 
 def make_relore_env(cfg: Any, repo_full_name: Optional[str]) -> Optional[ReloreEnv]:
@@ -312,7 +316,8 @@ RELORE_TOOL_SPECS: list[dict[str, Any]] = [
                 "Read one issue or pull request by number: the opening post "
                 "and its comments. Use it after `history_search` returns a hit "
                 "worth reading in full, or when a diff or commit message "
-                "references '#1234'."
+                "references '#1234'. A page holds ten comments: on a long "
+                "thread, take `outline` first, then page with `after`."
             ),
             "parameters": {
                 "type": "object",
@@ -341,6 +346,16 @@ RELORE_TOOL_SPECS: list[dict[str, Any]] = [
                         "description": (
                             "Also list a pull request's changed-file paths. The "
                             "count and any truncation notice are always shown."
+                        ),
+                    },
+                    "after": {
+                        "type": "string",
+                        "description": (
+                            "A comment id (from an outline line or a comment URL): "
+                            "start the page after it. To read a long thread, ask "
+                            "for the outline, then page through it with `after`; "
+                            "re-asking with different `focus` words re-ranks the "
+                            "same comments instead of reaching new ones."
                         ),
                     },
                 },
@@ -567,6 +582,9 @@ def _build_argv(env: ReloreEnv, name: str, args: dict[str, Any]) -> list[str]:
             argv.append("--outline")
         if _flag(args.get("files")):
             argv.append("--files")
+        after = _text(args.get("after"), "after")
+        if after:
+            argv += ["--after", after]
         argv += ["--repo", env.repo]
         return argv
 
@@ -650,6 +668,48 @@ def _truncate(text: str, budget: int = MAX_RELORE_OUTPUT_CHARS) -> str:
     return text[:head_chars] + marker + text[-tail_chars:]
 
 
+# -- the tracking issue that dispatched the task ----------------------------
+#
+# An ITF task's context tells it to write `Relates to #N` in its PR body, N being
+# the nightly tracking issue. On the 2026-10-11 nightly tasks then looked that
+# number up (`history_inflight 49506`, `history_thread 49506`): it is the table of
+# the night's failure groups, everything in it about this group is already in the
+# task, and every other row is a different failure. So those two calls are
+# answered here, and the issues are kept out of prior art by title (they are all
+# named by `integration_failure_triage.py`, `[serge] integration failure triage -
+# <date>`), which also covers the other nights' issues the number cannot.
+
+_RELATES_TO = re.compile(r"Relates to #(\d+)")
+TRACKING_ISSUE_TITLE_PREFIX = "[serge] integration failure triage"
+
+
+def tracking_issue_number(context: str) -> Optional[int]:
+    """The tracking issue an ITF task context names, or ``None``."""
+    match = _RELATES_TO.search(context or "")
+    return int(match.group(1)) if match else None
+
+
+def is_tracking_issue_title(title: str) -> bool:
+    return (title or "").strip().lower().startswith(TRACKING_ISSUE_TITLE_PREFIX)
+
+
+def _tracking_issue_reply(env: ReloreEnv, name: str, arguments: dict[str, Any]) -> str:
+    if env.tracking_issue is None or name not in ("history_thread", "history_inflight"):
+        return ""
+    try:
+        number = _number(arguments.get("number"), "number")
+    except ReloreToolError:
+        return ""
+    if number != env.tracking_issue:
+        return ""
+    return (
+        f"#{number} is the nightly triage tracking issue that dispatched this task: "
+        "a table of the night's failure groups. What it says about this group is "
+        "already in your task, and the other rows are different failures, so it "
+        "was not fetched. Look up the threads about the failing tests instead."
+    )
+
+
 def run_relore_tool(env: ReloreEnv, name: str, arguments: dict[str, Any]) -> str:
     """Dispatch one history tool. Always returns a string the model can act on.
 
@@ -664,6 +724,9 @@ def run_relore_tool(env: ReloreEnv, name: str, arguments: dict[str, Any]) -> str
     stale client, and each takes a different next action. Swallowing them into
     "history unavailable" is how an agent concludes the project has no history.
     """
+    local = _tracking_issue_reply(env, name, arguments)
+    if local:
+        return local
     try:
         argv = _build_argv(env, name, arguments)
     except ReloreToolError as exc:
@@ -962,7 +1025,7 @@ def junk_label(labels: Iterable[str]) -> str:
 def rejection_reason(thread: PriorThread) -> str:
     """Why this thread must not appear under a "trusted" heading, or ``""``.
 
-    Two rejections, and only two. A pull request **closed without merging** is a
+    Three rejections, and only three. A pull request **closed without merging** is a
     proposal the project turned down: presenting it as project history invites
     the agent to re-derive a patch maintainers have already rejected, and on the
     mistral4 task of run 35971338918 one of the four hits was exactly that. A
@@ -979,9 +1042,16 @@ def rejection_reason(thread: PriorThread) -> str:
     through the dispatcher's context, which lists them as ``- PR #N (…) — closed
     unmerged``; a second, unlabelled copy in a block headed "trusted" is the
     thing this filter exists to stop.
+
+    The third is serge's own **nightly tracking issue**, by title
+    (:data:`TRACKING_ISSUE_TITLE_PREFIX`): a table of every group that night,
+    which matches any failing test id and says nothing about this group that the
+    task does not already carry.
     """
     if thread.kind == "pr" and thread.state == "closed" and not thread.merged:
         return "closed without merging"
+    if is_tracking_issue_title(thread.title):
+        return "a nightly triage tracking issue"
     label = junk_label(thread.labels)
     return f"labelled {label!r}" if label else ""
 
@@ -1182,7 +1252,10 @@ def _collect(
                 query=query,
             )
             considered += 1
-            if time.monotonic() < deadline:
+            # A tracking issue is rejected on its title, so do not pay for its header.
+            if time.monotonic() < deadline and not is_tracking_issue_title(
+                candidate.title
+            ):
                 candidate = _with_header(env, candidate)
             reason = rejection_reason(candidate)
             if reason:

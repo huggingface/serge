@@ -49,6 +49,7 @@ from .relore_tool import (
     failure_art,
     prior_art,
     prior_art_note,
+    tracking_issue_number,
     verify_feedback_block,
 )
 from .tools import ToolEnv
@@ -1767,6 +1768,10 @@ def prepare_task(
 
     _emit("log", f"Preparing task for {req.repo_full_name} (base={req.base_ref})")
     tool_env = _make_tool_env(cfg, helper_tools=[], repo_full_name=req.repo_full_name)
+    if tool_env is not None and tool_env.relore is not None:
+        tool_env.relore = dataclasses.replace(
+            tool_env.relore, tracking_issue=tracking_issue_number(req.context)
+        )
     # Before the prompt is built and before the first turn — the whole point.
     history_note, culprit_note = _history_notes(req, tool_env, _emit, history_cache)
 
