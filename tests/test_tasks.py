@@ -504,6 +504,75 @@ class PublishTaskTests(unittest.TestCase):
         self.assertEqual(result.changed_files, ["hello.txt"])
         notify.assert_called_once()
 
+    _HARD = (
+        '`tests/models/x/test_modeling_x.py` (line 3): the ("cuda", 8) values '
+        "move by 45% of the block's scale; hardware drift is about 1%, so this "
+        "looks like a regression, not a new baseline."
+    )
+    _SOFT = (
+        "`tests/models/x/test_modeling_x.py` (line 3): changed the "
+        "(None, None) value, which is not the CI runner's key."
+    )
+
+    def _publish_with_problems(self, problems, hard, **cfg):
+        co = self._checkout("main")
+        req = TaskRequest(
+            owner="acme",
+            repo="widget",
+            base_ref="main",
+            instruction="fix",
+            context="",
+            mode="new_pr",
+        )
+        plan = TaskPlan(
+            title="Fix hello",
+            body="desc",
+            patch=self._PATCH,
+            expectation_problems=problems,
+            expectation_hard_problems=hard,
+        )
+        gh = _FakeGH()
+        with patch("reviewbot.tasks.post_task_pr_created_notification"):
+            result = publish_task(
+                _make_cfg(**cfg),
+                gh,
+                req,
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+        return result, gh
+
+    def test_a_hard_expectation_problem_opens_no_pr(self):
+        # 2026-10-12: a value still wrong after the correction budget is not
+        # worth a maintainer's review. No branch, no PR, and the reason reaches
+        # the tracking issue's recap through `message`.
+        result, gh = self._publish_with_problems([self._HARD, self._SOFT], [self._HARD])
+        self.assertTrue(result.no_change)
+        self.assertIsNone(result.pr_number)
+        self.assertIsNone(result.branch)
+        self.assertIsNone(gh.created_pr)
+        self.assertEqual(gh.created_refs, [])
+        self.assertIn("no PR was opened", result.message)
+        self.assertIn("45%", result.message)
+        self.assertNotIn(self._SOFT, result.message)
+
+    def test_a_soft_expectation_problem_still_opens_with_the_warning(self):
+        result, gh = self._publish_with_problems([self._SOFT], [])
+        self.assertFalse(result.no_change)
+        self.assertEqual(result.pr_number, 99)
+        self.assertIn("not in the maintainer shape", gh.created_pr["body"])
+        self.assertIn(self._SOFT, gh.created_pr["body"])
+
+    def test_hard_block_kill_switch_opens_with_the_warning(self):
+        result, gh = self._publish_with_problems(
+            [self._HARD], [self._HARD], task_expectation_hard_block=False
+        )
+        self.assertFalse(result.no_change)
+        self.assertIn("not in the maintainer shape", gh.created_pr["body"])
+        self.assertIn("45%", gh.created_pr["body"])
+
     def test_new_pr_requests_the_reviewers_the_dispatcher_named(self):
         # The triage blames a commit for the regression; its author is the one
         # person who knows what that change meant to do, so the fix PR should
@@ -2422,6 +2491,19 @@ class ExpectationShapeValidationTests(unittest.TestCase):
         )
         self.assertIsNone(feedback)
         self.assertEqual(report["expectation_problems"], [])
+
+    def test_report_marks_which_problems_are_hard(self):
+        # A wrong key is soft (a maintainer moves a line); a runner value that
+        # moved 50% is hard (the value is wrong). Only the hard one blocks a PR.
+        _, report = self._validate(
+            "(None, None): [0.9989, 0.1953],",
+            '(None, None): [0.9950, 0.1953],\n        ("cuda", 8): [0.4989, 0.1953],',
+        )
+        problems = report["expectation_problems"]
+        self.assertEqual(len(problems), 2)
+        hard = tasks_module.hard_problems(problems)
+        self.assertEqual(len(hard), 1)
+        self.assertIn("50%", hard[0])
 
     def test_kill_switch(self):
         feedback, _ = self._validate(

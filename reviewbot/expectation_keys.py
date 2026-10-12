@@ -42,6 +42,17 @@ plain literal just converted into a block, #49243):
 * text may not gain a control character or a stutter
   (:func:`reviewbot.expectation_guard.degenerate_text`; #49244, #47983).
 
+Each problem is a :class:`Problem`: a ``str`` (the sentence the model and the
+PR body read) carrying ``hard``. A **hard** problem says the *value* is wrong —
+drift past :data:`MAX_RUNNER_DRIFT`, a changed count, broken text, a loosened
+tolerance. A **soft** one says the value sits in the wrong *place* — the wrong
+key, an extra key in a new block, an edit outside a block — which a maintainer
+can fix by moving a line. When the correction budget runs out with a hard
+problem left, serge opens no PR (:func:`reviewbot.tasks.publish_task`); a soft
+one still opens with a warning. The operator's call on 2026-10-12: the review
+queue is overwhelmed, and a wrong value that survived three attempts is not
+worth a maintainer's time.
+
 This only reads the two versions of a test file. It cannot tell whether a new
 value is *right* (see :mod:`reviewbot.expectation_guard` for degenerate values);
 it checks that the change is shaped so a reviewer can see what the new hardware
@@ -57,7 +68,13 @@ from dataclasses import dataclass
 
 from .expectation_guard import degenerate_text
 
-__all__ = ["RUNNER_KEYS", "expectation_key_problems", "RULE_TEXT"]
+__all__ = [
+    "RUNNER_KEYS",
+    "Problem",
+    "expectation_key_problems",
+    "hard_problems",
+    "RULE_TEXT",
+]
 
 RUNNER_KEYS = frozenset({("cuda", 8), ("cuda", (8, 6))})
 GENERIC_KEY = (None, None)
@@ -103,6 +120,22 @@ _OUTPUT_NAME = re.compile(
 _GLUE = re.compile(
     r"get_expectation\(|^\s*Expectations,?\s*$|import\b.*\bExpectations\b"
 )
+
+
+class Problem(str):
+    """One problem sentence, plus whether it makes the value itself wrong."""
+
+    hard: bool
+
+    def __new__(cls, text: str, *, hard: bool = False) -> "Problem":
+        obj = super().__new__(cls, text)
+        obj.hard = hard
+        return obj
+
+
+def hard_problems(problems) -> list[str]:
+    """The problems that block publishing (see the module docstring)."""
+    return [str(p) for p in problems if getattr(p, "hard", False)]
 
 
 @dataclass
@@ -194,7 +227,7 @@ def _drift(old_src: str, new_src: str) -> float | None:
     return max(abs(a - b) for a, b in zip(old, new)) / scale
 
 
-def _runner_value_problems(where: str, key, before: str, after: str) -> list[str]:
+def _runner_value_problems(where: str, key, before: str, after: str) -> list[Problem]:
     """What is wrong with a runner-key value given the value it replaces."""
     old_text, new_text = _strings(before), _strings(after)
     if old_text is None or new_text is None:
@@ -203,19 +236,21 @@ def _runner_value_problems(where: str, key, before: str, after: str) -> list[str
         old_n, new_n = _numbers(before), _numbers(after)
         if old_n and new_n and len(old_n) != len(new_n):
             return [
-                (
+                Problem(
                     f"{where}: the {_fmt(key)} value has {len(new_n)} numbers where "
                     f"it had {len(old_n)}; a different count is a different result, "
-                    "not hardware drift."
+                    "not hardware drift.",
+                    hard=True,
                 )
             ]
         drift = _drift(before, after)
         if drift is not None and drift > MAX_RUNNER_DRIFT:
             return [
-                (
+                Problem(
                     f"{where}: the {_fmt(key)} values move by {drift:.0%} of the "
                     f"block's scale; hardware drift is about 1%, so this looks like "
-                    "a regression, not a new baseline."
+                    "a regression, not a new baseline.",
+                    hard=True,
                 )
             ]
         return []
@@ -224,8 +259,11 @@ def _runner_value_problems(where: str, key, before: str, after: str) -> list[str
         why = degenerate_text(text)
         if why and not any(degenerate_text(t) == why for t in old_text):
             out.append(
-                f"{where}: the new {_fmt(key)} text {why}; that is broken "
-                "output, not a new baseline."
+                Problem(
+                    f"{where}: the new {_fmt(key)} text {why}; that is broken "
+                    "output, not a new baseline.",
+                    hard=True,
+                )
             )
             break
     return out
@@ -268,7 +306,7 @@ def _within(line: int, blocks: list[_Block]) -> bool:
 
 def expectation_key_problems(
     path: str, old_src: str, new_src: str, *, expectation_only: bool = False
-) -> list[str]:
+) -> list[Problem]:
     """What is wrong with how one test file's expectations were changed, as
     one sentence per problem; ``[]`` when the change has the accepted shape.
 
@@ -278,7 +316,7 @@ def expectation_key_problems(
     old_blocks, new_blocks = _blocks(old_src), _blocks(new_src)
     if old_blocks is None or new_blocks is None:
         return []
-    problems: list[str] = []
+    problems: list[Problem] = []
     old_by_scope = {b.scope: b for b in old_blocks}
 
     for new in new_blocks:
@@ -290,8 +328,10 @@ def expectation_key_problems(
             ]
             if extra:
                 problems.append(
-                    f"{where}: a new Expectations block may only hold `(None, None)` "
-                    f"and the runner key, not {', '.join(_fmt(k) for k in extra)}."
+                    Problem(
+                        f"{where}: a new Expectations block may only hold `(None, None)` "
+                        f"and the runner key, not {', '.join(_fmt(k) for k in extra)}."
+                    )
                 )
             before = new.entries.get(GENERIC_KEY)
             for key in RUNNER_KEYS & new.entries.keys():
@@ -313,7 +353,9 @@ def expectation_key_problems(
                 continue
             verb = "changed" if key in new.entries else "removed"
             problems.append(
-                f"{where}: {verb} the {_fmt(key)} value, which is not the CI runner's key."
+                Problem(
+                    f"{where}: {verb} the {_fmt(key)} value, which is not the CI runner's key."
+                )
             )
         for key in RUNNER_KEYS & new.entries.keys():
             before = old.entries.get(key) or new.entries.get(GENERIC_KEY)
@@ -329,7 +371,9 @@ def expectation_key_problems(
                 if key == GENERIC_KEY
                 else f"a {_fmt(key)} entry"
             )
-            problems.append(f"{where}: added {what}; only the runner key may be added.")
+            problems.append(
+                Problem(f"{where}: added {what}; only the runner key may be added.")
+            )
 
     old_lines, new_lines = old_src.splitlines(), new_src.splitlines()
     matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
@@ -338,8 +382,11 @@ def expectation_key_problems(
             loosened = _loosened(old_lines[i1:i2], new_lines[j1:j2])
             if loosened:
                 problems.append(
-                    f"`{path}` (line {j1 + 1}): loosened a tolerance "
-                    f"({', '.join(loosened)})."
+                    Problem(
+                        f"`{path}` (line {j1 + 1}): loosened a tolerance "
+                        f"({', '.join(loosened)}).",
+                        hard=True,
+                    )
                 )
     if expectation_only:
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -369,7 +416,9 @@ def expectation_key_problems(
                 continue
             sample = flagged[0].strip()
             problems.append(
-                f"`{path}` (line {j1 + 1}): changed `{sample[:80]}` outside any "
-                "Expectations block."
+                Problem(
+                    f"`{path}` (line {j1 + 1}): changed `{sample[:80]}` outside any "
+                    "Expectations block."
+                )
             )
     return problems

@@ -396,6 +396,10 @@ class Config:
     # (reviewbot/expectation_keys.py). Rides the same retry budget as the
     # normalizer; a violation that survives it is flagged in the PR body.
     task_expectation_key_check: bool = True
+    # A *hard* violation (the value itself is wrong: drift, a changed count,
+    # broken text, a loosened tolerance) that survives the budget opens no PR
+    # and ends the task no_fix. Off: it opens with the warning, like a soft one.
+    task_expectation_hard_block: bool = True
     # Optional free-text guidance injected into the task system prompt and the
     # normalize-failure feedback, alongside the normalize command. Use it to
     # encode policy the command itself can't express — e.g. "prefer root-cause
@@ -742,6 +746,7 @@ class Config:
             or None,
             task_normalize_max_retries=_int_env("TASK_NORMALIZE_MAX_RETRIES", 2),
             task_expectation_key_check=_bool_env("TASK_EXPECTATION_KEY_CHECK", True),
+            task_expectation_hard_block=_bool_env("TASK_EXPECTATION_HARD_BLOCK", True),
             task_preflight_command=(
                 shlex.split(os.environ.get("TASK_PREFLIGHT_COMMAND") or "") or None
             ),
