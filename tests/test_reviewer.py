@@ -33,6 +33,7 @@ from reviewbot.reviewer import (
     _needs_final_salvage,
     _prose_outside_json,
     _recovery_message_for,
+    _salvage_recovery_message,
     _run_agentic_loop,
     _salvage_decision,
     _summarize_rejected_comments,
@@ -1135,6 +1136,56 @@ class TruncationRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(len(llm.calls), 2)
         self.assertEqual(chat.content, '{"summary": "ok", "comments": []}')
+
+    def test_empty_re_ask_quotes_the_reasoning_back(self) -> None:
+        """Task 0a2cfdaf: Qwen3.8-27B drafted the JSON inside its reasoning and
+        ended the turn empty. The bare re-ask re-derived it all and came back
+        empty again; quoting the tail back is what made it write the answer."""
+        cfg = _CfgStub()
+        empty = ChatResult(
+            content="",
+            usage={"prompt_tokens": 10},
+            finish_reason="stop",
+            reasoning_chars=40000,
+            reasoning_tail="The edit is old -> new. Let me finalize the JSON.",
+        )
+        good = ChatResult(
+            content='{"summary": "ok", "comments": []}',
+            usage={"prompt_tokens": 10},
+            finish_reason="stop",
+        )
+        llm = _FakeLLM([empty, good])
+        chat, _ = _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "go"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=None,
+        )
+        self.assertEqual(chat.content, '{"summary": "ok", "comments": []}')
+        reask = llm.calls[1]["messages"][-1]
+        self.assertEqual(reask["role"], "user")
+        self.assertIn(
+            "<your-reasoning>\nThe edit is old -> new. Let me finalize the JSON.\n"
+            "</your-reasoning>",
+            reask["content"],
+        )
+
+    def test_reasoning_is_quoted_only_when_the_answer_never_arrived(self) -> None:
+        tail = "I will patch modular_kimi_k25.py."
+        with_tail = ChatResult(content="", reasoning_tail=tail)
+        for defect in ("empty", "truncated"):
+            self.assertIn(tail, _salvage_recovery_message(defect, with_tail))
+        # These have content to correct; the reasoning would compete with it.
+        for defect in ("markup", "unparseable"):
+            self.assertEqual(
+                _salvage_recovery_message(defect, with_tail),
+                _recovery_message_for(defect),
+            )
+        # No reasoning (a non-reasoning model): the plain re-ask, unchanged.
+        self.assertEqual(
+            _salvage_recovery_message("empty", ChatResult(content="")),
+            _recovery_message_for("empty"),
+        )
 
     def test_salvage_decision_rule(self) -> None:
         self.assertEqual(_salvage_decision("empty", None, 0), "reask")

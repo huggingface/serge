@@ -1205,6 +1205,36 @@ def _recovery_message_for(defect: Optional[str]) -> str:
     return _RECOVERY_MESSAGES.get(defect or "", _TRUNCATION_RECOVERY_MESSAGE)
 
 
+# Defects where the content never arrived, so whatever the model decided is
+# still in its reasoning. Not "markup" or "unparseable": those have content to
+# correct, and quoting the reasoning back would only compete with it.
+_REASONING_SALVAGE_DEFECTS = ("empty", "truncated")
+
+
+def _salvage_recovery_message(defect: Optional[str], chat: ChatResult) -> str:
+    """The re-ask text, plus the tail of the turn's own reasoning when the
+    answer never left it.
+
+    Measured 2026-10-18 replaying task 0a2cfdaf (Qwen3.8-27B on deepinfra): the
+    model drafted the full JSON inside its reasoning ("Let me finalize the
+    JSON.") and ended the turn with no content. The bare re-ask carried none of
+    that back, so it re-derived everything — 41.8k reasoning chars — and
+    stopped at the same place, empty again. The same re-ask with this tail
+    quoted wrote the parseable answer in 28s with 207 reasoning chars.
+    """
+    message = _recovery_message_for(defect)
+    tail = (chat.reasoning_tail or "").strip()
+    if defect not in _REASONING_SALVAGE_DEFECTS or not tail:
+        return message
+    return (
+        f"{message}\n\nYour reply ended inside your reasoning, so the answer you "
+        "had worked out never came through. This is the end of that reasoning, "
+        "verbatim:\n\n<your-reasoning>\n"
+        f"{tail}\n</your-reasoning>\n\nDo not investigate again: write out the "
+        "answer you had settled on."
+    )
+
+
 def _salvage_decision(
     defect: Optional[str], last_defect: Optional[str], attempts: int
 ) -> str:
@@ -1559,7 +1589,7 @@ def _run_agentic_loop(
                 _emit_final_salvage(emit, chat, truncation_retries, defect)
                 messages.append({"role": "assistant", "content": chat.content or None})
                 messages.append(
-                    {"role": "user", "content": _recovery_message_for(defect)}
+                    {"role": "user", "content": _salvage_recovery_message(defect, chat)}
                 )
                 force_json_only = True
                 continue
@@ -1771,7 +1801,9 @@ def _run_agentic_loop(
             last_defect = defect
             _emit_final_salvage(emit, chat, truncation_retries, defect)
             messages.append({"role": "assistant", "content": chat.content or None})
-            messages.append({"role": "user", "content": _recovery_message_for(defect)})
+            messages.append(
+                {"role": "user", "content": _salvage_recovery_message(defect, chat)}
+            )
             continue
 
         # The verification gate must run on the forced final answer too —

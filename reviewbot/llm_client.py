@@ -119,6 +119,12 @@ class ToolCall:
     thought_signature: Optional[str] = None
 
 
+# How much of a turn's reasoning ChatResult keeps. 12k chars held the whole
+# drafted answer on the measured failures (the drafted JSON plus the reasoning
+# that settled it) and keeps a re-ask well clear of any context limit.
+REASONING_TAIL_CHARS = 12000
+
+
 @dataclass
 class ChatResult:
     content: str
@@ -132,6 +138,12 @@ class ChatResult:
     # tool-using turn" from "blind tool chaining". 0 for non-reasoning
     # models, which is fine — they're expected to emit content.
     reasoning_chars: int = 0
+    # The last REASONING_TAIL_CHARS of that chain of thought. Kept for one
+    # reader: the agent loop's salvage re-ask. A reasoning model can draft its
+    # whole answer inside the reasoning and end the turn with no content
+    # (Qwen3.8-27B on deepinfra, 2026-10-17); quoting this back lets it write
+    # the answer out instead of re-deriving it.
+    reasoning_tail: str = ""
 
     @property
     def prompt_tokens(self) -> Optional[int]:
@@ -714,6 +726,7 @@ class ChatCompletionClient:
                         tool_calls,
                         finish_reason,
                         reasoning_chars,
+                        reasoning_tail,
                     ) = self._consume_stream(
                         r,
                         chunk_callback=chunk_callback,
@@ -743,9 +756,10 @@ class ChatCompletionClient:
                         or message.get("reasoning")
                         or ""
                     )
-                    reasoning_chars = (
-                        len(reasoning_text) if isinstance(reasoning_text, str) else 0
-                    )
+                    if not isinstance(reasoning_text, str):
+                        reasoning_text = ""
+                    reasoning_chars = len(reasoning_text)
+                    reasoning_tail = reasoning_text[-REASONING_TAIL_CHARS:]
                     if chunk_callback is not None and content:
                         # Non-streaming path: still emit the full content
                         # in one piece so callers don't need a separate
@@ -813,6 +827,7 @@ class ChatCompletionClient:
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
                 reasoning_chars=reasoning_chars,
+                reasoning_tail=reasoning_tail,
             )
         raise RuntimeError("unreachable")  # loop always returns or raises
 
@@ -845,7 +860,7 @@ class ChatCompletionClient:
         *,
         chunk_callback: Optional[Callable[[str, str], None]] = None,
         est_input_tokens: int = 0,
-    ) -> tuple[str, dict[str, Any], list[ToolCall], Optional[str], int]:
+    ) -> tuple[str, dict[str, Any], list[ToolCall], Optional[str], int, str]:
         """Parse an OpenAI-style SSE chat-completions stream.
 
         Each event is a `data: {json}` line; the terminal event is `data: [DONE]`.
@@ -1092,7 +1107,14 @@ class ChatCompletionClient:
             finish_reason,
             cls._format_field_counts(delta_field_chars),
         )
-        return "".join(parts), usage, tool_calls, finish_reason, len(joined_reasoning)
+        return (
+            "".join(parts),
+            usage,
+            tool_calls,
+            finish_reason,
+            len(joined_reasoning),
+            joined_reasoning[-REASONING_TAIL_CHARS:],
+        )
 
     @staticmethod
     def _format_field_counts(counts: dict[str, int]) -> str:
