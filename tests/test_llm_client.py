@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from reviewbot.llm_client import (
+    REASONING_TAIL_CHARS,
     ChatCompletionClient,
     ChatResult,
     LLMResponseError,
@@ -500,6 +501,33 @@ class ChatCompletionClientTests(unittest.TestCase):
         self.assertTrue(payload["stream"])
         self.assertEqual(payload["stream_options"], {"include_usage": True})
         self.assertTrue(mock_post.call_args.kwargs["stream"])
+
+    def test_stream_keeps_the_tail_of_the_reasoning(self) -> None:
+        """A reasoning-only turn must keep what it reasoned: the salvage re-ask
+        quotes it back, because the answer is often drafted in there."""
+        long_head = "x" * (REASONING_TAIL_CHARS + 50)
+        sse_lines = [
+            "data: "
+            + json.dumps({"choices": [{"delta": {"reasoning_content": long_head}}]}),
+            'data: {"choices":[{"delta":{"reasoning_content":"Let me finalize the JSON."}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        with patch("reviewbot.llm_client.requests.post") as mock_post:
+            mock_post.return_value = Mock(
+                status_code=200,
+                raise_for_status=Mock(),
+                iter_lines=Mock(return_value=iter(sse_lines)),
+            )
+            client = ChatCompletionClient(
+                "https://example.com/v1", "token", "fixed-model", stream=True
+            )
+            result = client.complete([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(result.content, "")
+        self.assertEqual(result.reasoning_chars, len(long_head) + 25)
+        self.assertEqual(len(result.reasoning_tail), REASONING_TAIL_CHARS)
+        self.assertTrue(result.reasoning_tail.endswith("Let me finalize the JSON."))
 
     def test_complete_retries_on_stream_interruption_then_succeeds(self) -> None:
         sse_full = [

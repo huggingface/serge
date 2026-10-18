@@ -40,7 +40,7 @@ RUN python -m venv /opt/app/.venv \
 # The repo publishes no tags, and its own deployment pins `image.tag:
 # sha-<short>`, so this is the same commit spelled the way pip takes it.
 # Keep it equal to relore/env/prod.yaml's image.tag in the playbooks repo.
-ARG RELORE_REF=e0cbec92155e02b3a3bf495767e5a209b6f6e50c  # relore 0.3.17, the deployed daemon
+ARG RELORE_REF=4d1794cd2ac69bbad8e52d6612fb4016c01f5168  # relore 0.3.18, the deployed daemon
 RUN /opt/app/.venv/bin/pip install --no-cache-dir \
       "relore @ git+https://github.com/huggingface/relore@${RELORE_REF}"
 
