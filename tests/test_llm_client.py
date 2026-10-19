@@ -866,6 +866,49 @@ class ChatCompletionClientTests(unittest.TestCase):
         self.assertIn("tools", first_payload)
         self.assertNotIn("tools", second_payload)
 
+    def test_a_rejected_reasoning_effort_value_is_dropped(self) -> None:
+        """The salvage re-ask sends reasoning_effort="none"; a model that does
+        not take that value must still get the re-ask, at its default effort."""
+        rejected = Mock(
+            status_code=400,
+            ok=False,
+            reason="Bad Request",
+            text=(
+                '{"error":{"message":"Invalid value \'none\' for reasoning_effort: '
+                'must be one of low, medium, high"}}'
+            ),
+            raise_for_status=Mock(side_effect=AssertionError("should not be reached")),
+        )
+        ok = Mock(
+            status_code=200,
+            ok=True,
+            json=Mock(
+                return_value={
+                    "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+                }
+            ),
+            raise_for_status=Mock(),
+        )
+        with (
+            patch("reviewbot.llm_client.time.sleep"),
+            patch(
+                "reviewbot.llm_client.requests.post", side_effect=[rejected, ok]
+            ) as mock_post,
+        ):
+            client = ChatCompletionClient(
+                "https://example.com/v1", "token", "fixed-model"
+            )
+            result = client.complete(
+                [{"role": "user", "content": "hi"}],
+                extra={"reasoning_effort": "none"},
+            )
+
+        self.assertEqual(result.content, "ok")
+        second_payload = json.loads(mock_post.call_args_list[1].kwargs["data"])
+        self.assertNotIn("reasoning_effort", second_payload)
+        # The rest of the request is untouched.
+        self.assertIn("temperature", second_payload)
+
     def test_complete_falls_back_when_endpoint_rejects_temperature(self) -> None:
         # First call (with temperature) returns 400 complaining the
         # parameter is deprecated; the retry drops temperature and succeeds.

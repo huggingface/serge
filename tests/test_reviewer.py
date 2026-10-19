@@ -1187,6 +1187,33 @@ class TruncationRecoveryTests(unittest.TestCase):
             _recovery_message_for("empty"),
         )
 
+    def test_quoted_re_ask_turns_reasoning_off(self) -> None:
+        """2026-10-18 nightly: 3 of 9 quoted re-asks at "low" re-investigated
+        for 58k-82k chars and ended empty again. With the answer quoted back
+        there is nothing left to reason about."""
+        cfg = _CfgStub()
+        empty = ChatResult(
+            content="", finish_reason="stop", reasoning_tail="Let me finalize."
+        )
+        good = ChatResult(content='{"summary": "ok"}', finish_reason="stop")
+        llm = _FakeLLM([empty, good])
+        _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "go"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=None,
+        )
+        self.assertEqual(llm.calls[1]["extra"], {"reasoning_effort": "none"})
+        # Nothing to quote (a non-reasoning model): the plain low re-ask.
+        llm = _FakeLLM([ChatResult(content="", finish_reason="stop"), good])
+        _run_agentic_loop(
+            llm,  # type: ignore[arg-type]
+            [{"role": "user", "content": "go"}],
+            cfg=cfg,  # type: ignore[arg-type]
+            tool_env=None,
+        )
+        self.assertEqual(llm.calls[1]["extra"], {"reasoning_effort": "low"})
+
     def test_salvage_decision_rule(self) -> None:
         self.assertEqual(_salvage_decision("empty", None, 0), "reask")
         self.assertEqual(_salvage_decision("empty", "empty", 1), "repeated")

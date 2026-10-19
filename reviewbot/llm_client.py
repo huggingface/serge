@@ -41,6 +41,12 @@ def _is_parameter_rejection(param: str, body_preview: str) -> bool:
     text = body_preview.lower()
     if param.lower() not in text:
         return False
+    # Its VALUE is the usual complaint ("invalid value 'none'"): the values a
+    # model takes vary by model, so a rejected one is as good as unsupported.
+    if param == "reasoning_effort" and any(
+        signal in text for signal in ("invalid", "must be one of", "not one of")
+    ):
+        return True
     return any(
         signal in text
         for signal in (
@@ -412,6 +418,10 @@ class ChatCompletionClient:
         "top_k",
         "frequency_penalty",
         "presence_penalty",
+        # Last: serge sends "none" on a salvage re-ask (reviewer._salvage_effort)
+        # and not every model takes it. Dropped, the provider uses its default
+        # effort — slower, but the re-ask still runs.
+        "reasoning_effort",
     )
 
     def complete(

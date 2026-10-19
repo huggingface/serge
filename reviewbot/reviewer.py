@@ -1235,6 +1235,24 @@ def _salvage_recovery_message(defect: Optional[str], chat: ChatResult) -> str:
     )
 
 
+def _salvage_effort(defect: Optional[str], chat: ChatResult) -> str:
+    """``reasoning_effort`` for a salvage re-ask: ``"none"`` when the re-ask
+    quotes the turn's reasoning back, ``"low"`` otherwise.
+
+    The quoted re-ask exists to make the model write out an answer it already
+    worked out, and "low" still let it re-investigate: in the 2026-10-18
+    nightly 3 of 9 quoted re-asks reasoned another 58k-82k chars and ended
+    empty again (a8a227d4, ccd04c28, d656ba11). With thinking off the only thing
+    it can produce is content: replayed on five captured empty turns, 15/15
+    re-asks came back parseable in 10-30s with zero reasoning. A provider that
+    rejects the value has the parameter dropped by the client
+    (``_REMOVABLE_PARAMS``).
+    """
+    if defect in _REASONING_SALVAGE_DEFECTS and (chat.reasoning_tail or "").strip():
+        return "none"
+    return "low"
+
+
 def _salvage_decision(
     defect: Optional[str], last_defect: Optional[str], attempts: int
 ) -> str:
@@ -1422,6 +1440,8 @@ def _run_agentic_loop(
     # Set for one turn to recover a truncated final answer: disable tools and
     # force minimal reasoning so the whole output budget goes to the JSON.
     force_json_only = False
+    # That turn's reasoning_effort (see _salvage_effort).
+    salvage_effort = "low"
 
     def _add_validation_feedback(chat: ChatResult, feedback: str) -> bool:
         """Set up the correction turn. Returns True when the conversation was
@@ -1518,7 +1538,7 @@ def _run_agentic_loop(
             emit("step", f"llm:{label}")
             emit("log", f"LLM turn (blind={label})")
         turn_tools = None if force_json_only else tools_arg
-        turn_effort = "low" if force_json_only else cfg.llm_reasoning_effort
+        turn_effort = salvage_effort if force_json_only else cfg.llm_reasoning_effort
         # Window the transcript for browse turns only. `force_json_only` is the
         # salvage turn that has to *produce* the patch out of what it read, so
         # it gets the full transcript however big it is — one wide request is
@@ -1557,6 +1577,9 @@ def _run_agentic_loop(
             extra={"reasoning_effort": turn_effort} if turn_effort else None,
         )
         force_json_only = False
+        # A validation retry also sets force_json_only, and must not inherit a
+        # salvage turn's "none".
+        salvage_effort = "low"
         metrics.record_call(chat)
         _emit_metrics(emit, metrics)
         # Log what the model emitted this turn (content + finish_reason +
@@ -1591,6 +1614,7 @@ def _run_agentic_loop(
                 messages.append(
                     {"role": "user", "content": _salvage_recovery_message(defect, chat)}
                 )
+                salvage_effort = _salvage_effort(defect, chat)
                 force_json_only = True
                 continue
             if validate is None:
@@ -1763,6 +1787,8 @@ def _run_agentic_loop(
         }
     )
     final_extra = {"reasoning_effort": cfg.llm_reasoning_effort or "low"}
+    # A salvage re-ask's own effort, for that one call (see _salvage_effort).
+    reask_extra: Optional[dict[str, Any]] = None
     # Do NOT pass `response_format` here — same reason as the main loop
     # above (Anthropic's OpenAI shim and others reject
     # `{"type": "json_object"}`, accepting only `"json_schema"`). The
@@ -1773,8 +1799,9 @@ def _run_agentic_loop(
             messages,
             max_tokens=cfg.llm_max_tokens,
             chunk_callback=chunk_cb,
-            extra=final_extra,
+            extra=reask_extra or final_extra,
         )
+        reask_extra = None
         metrics.record_call(chat)
         _emit_metrics(emit, metrics)
         _emit_chat_message(
@@ -1804,6 +1831,7 @@ def _run_agentic_loop(
             messages.append(
                 {"role": "user", "content": _salvage_recovery_message(defect, chat)}
             )
+            reask_extra = {"reasoning_effort": _salvage_effort(defect, chat)}
             continue
 
         # The verification gate must run on the forced final answer too —
