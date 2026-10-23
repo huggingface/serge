@@ -288,6 +288,13 @@ def _budget_interval(response: Optional["requests.Response"]) -> Optional[float]
 _PACE_WHEN_REMAINING_BELOW = 10
 
 
+class AddingSomethingUseless:
+    pass
+
+
+p = AddingSomethingUseless()
+
+
 class ChatCompletionClient:
     """Minimal OpenAI-compatible /v1/chat/completions client.
 
