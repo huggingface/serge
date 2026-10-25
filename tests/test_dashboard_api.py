@@ -268,6 +268,51 @@ class DashboardRouteTests(unittest.TestCase):
         self.assertEqual(r.status_code, 401)
         self.assertIn("oidc_verification_failed", r.json()["detail"])
 
+    def test_mic_progress_requires_oidc_and_relays_verified_run_identity(self):
+        from types import SimpleNamespace
+        from reviewbot import mic_progress
+
+        webapp = self._webapp(
+            DASHBOARD_API_TOKEN="secret",
+            DASHBOARD_MIC_PROGRESS_URL="http://dashboard/mic-jobs/progress",
+        )
+        client = TestClient(webapp.app)
+        body = {
+            "job_id": "a" * 32,
+            "profile": "cuda",
+            "stage": "recording",
+            "completed": 2,
+            "total": 10,
+            "detail": "Demo/default",
+            "sequence": 3,
+        }
+        self.assertEqual(
+            client.post("/dashboard/mic-progress", json=body).status_code, 401
+        )
+        verified = SimpleNamespace(
+            repository=mic_progress.REPOSITORY,
+            workflow_ref=mic_progress.WORKFLOW_REF,
+            raw={
+                "run_id": "123",
+                "run_attempt": "1",
+                "ref": "refs/heads/main",
+                "event_name": "workflow_dispatch",
+            },
+        )
+        with (
+            patch.object(webapp, "verify_token", return_value=verified) as verify,
+            patch.object(mic_progress, "relay", return_value={"status": "ok"}) as relay,
+        ):
+            response = client.post(
+                "/dashboard/mic-progress",
+                json=body,
+                headers={"Authorization": "Bearer oidc-token"},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(verify.call_args.kwargs["audience"], "serge-mic-baselines")
+            self.assertEqual(relay.call_args.args[2]["run_id"], 123)
+            self.assertEqual(relay.call_args.args[1], "secret")
+
 
 if __name__ == "__main__":
     unittest.main()

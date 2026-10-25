@@ -6,6 +6,7 @@ GitHub App identity — OAuth is only used for access control.
 """
 
 import asyncio
+import json
 import dataclasses
 import hashlib
 import html as _html
@@ -37,7 +38,14 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import __version__, build_info, dashboard_api, git_sha, task_pr_close
+from . import (
+    __version__,
+    build_info,
+    dashboard_api,
+    git_sha,
+    task_pr_close,
+    mic_progress,
+)
 from .billing import fetch_session_cost
 from .clone_cache import CloneCache, Checkout
 from .config import Config
@@ -3438,6 +3446,40 @@ async def dashboard_permission(request: Request) -> JSONResponse:
             client, target, _dashboard_roles
         ),
     )
+
+
+@app.post("/dashboard/mic-progress")
+async def dashboard_mic_progress(request: Request) -> JSONResponse:
+    if not (cfg.dashboard_api_token and cfg.dashboard_mic_progress_url):
+        raise HTTPException(status_code=404, detail="progress_disabled")
+    authorization = request.headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="missing_oidc_token")
+    try:
+        claims = await asyncio.to_thread(
+            verify_token,
+            authorization[7:],
+            issuer="https://token.actions.githubusercontent.com",
+            audience=mic_progress.AUDIENCE,
+        )
+        raw = await request.body()
+        if len(raw) > 8192:
+            raise ValueError("progress_too_large")
+        payload = mic_progress.verified_progress(claims, json.loads(raw))
+    except OIDCError:
+        raise HTTPException(status_code=401, detail="invalid_oidc_token") from None
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=403, detail="invalid_progress") from None
+    try:
+        result = await asyncio.to_thread(
+            mic_progress.relay,
+            cfg.dashboard_mic_progress_url,
+            cfg.dashboard_api_token,
+            payload,
+        )
+    except Exception:
+        raise HTTPException(status_code=503, detail="progress_unavailable") from None
+    return JSONResponse(result)
 
 
 @app.post("/dashboard/runs/cancel")

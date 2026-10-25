@@ -230,7 +230,11 @@ class Config:
     # operation is allowlisted: these repositories, cancelling only runs of
     # these workflow paths, dispatching only these workflow files.
     dashboard_api_token: str = ""
-    dashboard_repositories: tuple[str, ...] = ("huggingface/transformers",)
+    dashboard_mic_progress_url: str = ""
+    dashboard_repositories: tuple[str, ...] = (
+        "huggingface/transformers",
+        "huggingface/transformers-mic",
+    )
     dashboard_cancel_workflows: tuple[str, ...] = (
         ".github/workflows/pr-ci-caller.yml",
         ".github/workflows/self-comment-ci.yml",
@@ -238,6 +242,7 @@ class Config:
     dashboard_dispatch_workflows: tuple[str, ...] = (
         "rerun-failed-cpu.yml",
         "rerun-failed-gpu.yml",
+        "cloud-baselines.yml",
     )
     # Completion-token budget for the cheap product-vs-test classifier
     # (reviewbot/classify.py). Reasoning models (Kimi) burn tokens on reasoning
@@ -701,6 +706,9 @@ class Config:
             dashboard_repositories=_csv_env(
                 "DASHBOARD_REPOSITORIES", Config.dashboard_repositories
             ),
+            dashboard_mic_progress_url=(
+                os.environ.get("DASHBOARD_MIC_PROGRESS_URL") or ""
+            ).strip(),
             dashboard_cancel_workflows=_csv_env(
                 "DASHBOARD_CANCEL_WORKFLOWS", Config.dashboard_cancel_workflows
             ),
