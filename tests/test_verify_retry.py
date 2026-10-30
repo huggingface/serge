@@ -213,7 +213,7 @@ class _VerdictGH:
         return list(reviewers)
 
 
-def _commit(mode, verdict, monkeypatch):
+def _commit(mode, verdict, monkeypatch, defer_pr=False):
     from reviewbot.clone_cache import FileChange
 
     monkeypatch.setattr(
@@ -227,6 +227,7 @@ def _commit(mode, verdict, monkeypatch):
         instruction="fix",
         context="",
         mode=mode,
+        defer_pr=defer_pr,
         pr_number=7 if mode == "existing_pr" else None,
         head_branch="serge/fix-old" if mode == "existing_pr" else None,
     )
@@ -421,3 +422,15 @@ def test_runner_lost_is_distinct_from_never_running_the_loop():
     # Counters stay zero either way; the stop_reason is what says whether zero
     # means "spent nothing" or "we do not know what it spent".
     assert no_llm_session_record(STOP_RUNNER_LOST)["turns"] == 0
+
+
+def test_interactive_approval_is_only_offered_after_verification(monkeypatch):
+    result, gh = _commit("new_pr", "fixed", monkeypatch, defer_pr=True)
+    assert result.awaiting_approval
+    assert result.verify_verdict == "fixed"
+    assert gh.created_pr is None
+    result, gh = _commit("new_pr", "not_fixed", monkeypatch, defer_pr=True)
+    assert result.no_change
+    assert not result.awaiting_approval
+    assert gh.created_pr is None
+    assert gh.deleted

@@ -1344,7 +1344,11 @@ def _run_task_worker(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         # safe patch the task still completes cleanly but produces nothing —
         # surface that as "no_fix" so the journal/dashboard doesn't conflate a
         # group serge couldn't fix with one that produced a PR.
-        job.status = "no_fix" if result.no_change else "published"
+        job.status = (
+            "awaiting_approval"
+            if result.awaiting_approval
+            else ("no_fix" if result.no_change else "published")
+        )
         emit("log", result.message)
         emit("step", "done")
         emit("done", "")
@@ -3436,6 +3440,303 @@ async def _dashboard_call(request: Request, operation) -> JSONResponse:
         result,
     )
     return JSONResponse(result)
+
+
+_dashboard_investigation_lock = threading.Lock()
+
+
+def _queue_dashboard_investigation(client, target, body, loop):
+    """Start an idempotent draft review; publishing remains a human action."""
+    number, key = body.get("pr"), body.get("idempotency_key")
+    if (
+        isinstance(number, bool)
+        or not isinstance(number, int)
+        or not 0 < number < 10**10
+    ):
+        raise dashboard_api.DashboardError(400, "bad_pr")
+    if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9.-]{8,64}", key):
+        raise dashboard_api.DashboardError(400, "bad_idempotency_key")
+    dashboard_api._require_write(client, target, _dashboard_roles)
+    job_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"dashboard-investigate:{target.repository}:{target.actor}:{number}:{key}",
+    ).hex
+    url = f"/reviews/{target.owner}/{target.repo}/{number}/{job_id}"
+    with _dashboard_investigation_lock:
+        if _store.load(job_id):
+            return {"id": job_id, "url": url}
+        recent = _store.list_for_user(target.actor)
+        if sum(row["created_at"] > time.time() - 3600 for row in recent) >= 5:
+            raise dashboard_api.DashboardError(429, "rate_limited")
+        if any(row["status"] == "running" for row in recent):
+            raise dashboard_api.DashboardError(409, "investigation_busy")
+        if client.get_pr(target.owner, target.repo, number).get("state") != "open":
+            raise dashboard_api.DashboardError(409, "pr_not_open")
+        req = ReviewRequest(
+            owner=target.owner,
+            repo=target.repo,
+            number=number,
+            trigger_comment_id=0,
+            commenter=target.actor,
+            trigger_comment_body=(
+                f"{cfg.mention_trigger} Investigate this PR's CI failures. "
+                "Explain the likely causes and suggest fixes, using available CI evidence. "
+                "Clearly distinguish verified findings from hypotheses."
+            ),
+        )
+        resolved = _resolve_webhook_worker_cfg(req)
+        if resolved is None:
+            raise dashboard_api.DashboardError(503, "no_provider_config")
+        worker_cfg, provider, base, model = resolved
+        job = Job(
+            id=job_id,
+            user=target.actor,
+            target_owner=target.owner,
+            target_repo=target.repo,
+            target_number=number,
+            trigger_comment=req.trigger_comment_body,
+            llm_provider=provider,
+            llm_api_base=base,
+            llm_model=model,
+            llm_api_key=worker_cfg.llm_api_key,
+            created_at=time.time(),
+        )
+        _enable_job_billing(
+            job,
+            _store.find_provider_config_for_repo(owner=target.owner, repo=target.repo),
+        )
+        job.loop = loop
+        _store.insert_job(
+            id=job.id,
+            user=job.user,
+            target_owner=job.target_owner,
+            target_repo=job.target_repo,
+            target_number=job.target_number,
+            trigger_comment=job.trigger_comment,
+            llm_provider=job.llm_provider,
+            llm_api_base=job.llm_api_base,
+            llm_model=job.llm_model,
+            created_at=job.created_at,
+            status=job.status,
+            task_spec_json=_json.dumps(job.task_spec),
+        )
+        with _jobs_lock:
+            _jobs[job.id] = job
+        _WEBHOOK_REVIEW_POOL.submit(_run_review_worker, job)
+    return {"id": job.id, "url": url}
+
+
+@app.post("/dashboard/traceback")
+async def dashboard_traceback(request: Request) -> JSONResponse:
+    loop = asyncio.get_running_loop()
+    return await _dashboard_call(
+        request,
+        lambda client, target, body: _start_traceback_task(client, target, body, loop),
+    )
+
+
+def _start_traceback_task(client, target, body, loop):
+    if not cfg.dashboard_interactive_tasks_enabled:
+        raise dashboard_api.DashboardError(404, "interactive_tasks_disabled")
+    if not cfg.task_api_enabled:
+        raise dashboard_api.DashboardError(404, "tasks_api_disabled")
+    context, key = body.get("context"), body.get("idempotency_key")
+    if not isinstance(context, str) or not 1 <= len(context) <= 50000:
+        raise dashboard_api.DashboardError(400, "bad_context")
+    if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9.-]{8,64}", key):
+        raise dashboard_api.DashboardError(400, "bad_idempotency_key")
+    dashboard_api._require_write(client, target, _dashboard_roles)
+    job_id = uuid.uuid5(
+        uuid.NAMESPACE_URL, f"slack-task:{target.repository}:{target.actor}:{key}"
+    ).hex
+    url = f"/tasks/{target.owner}/{target.repo}/{job_id}"
+    with _dashboard_investigation_lock:
+        if _store.load(job_id):
+            return {"id": job_id, "url": url}
+        recent = _store.list_for_user(target.actor)
+        if sum(row["created_at"] > time.time() - 3600 for row in recent) >= 5:
+            raise dashboard_api.DashboardError(429, "rate_limited")
+        if any(row["status"] == "running" for row in recent):
+            raise dashboard_api.DashboardError(409, "investigation_busy")
+        try:
+            worker_cfg, provider, base, model = _resolve_task_worker_cfg(
+                target.owner, target.repo
+            )
+        except HTTPException as exc:
+            raise dashboard_api.DashboardError(
+                exc.status_code, str(exc.detail)
+            ) from exc
+        # Repository and intent are server-owned; Slack supplies only untrusted evidence.
+        default_branch = client.get_repo(target.owner, target.repo).get(
+            "default_branch"
+        )
+        if not default_branch:
+            raise dashboard_api.DashboardError(502, "no_default_branch")
+        req = build_task_request(
+            {
+                "base_ref": default_branch,
+                "instruction": "Investigate the reported CI failure using the normal task investigation, reproduce, patch and verification flow. Explain the cause and propose the smallest safe fix. If evidence is insufficient, explain what is missing and propose no patch.",
+                "context": context,
+                "output": {"mode": "new_pr", "branch_prefix": "serge/slack"},
+                "notifications": {"pr_created": False},
+            },
+            owner=target.owner,
+            repo=target.repo,
+        )
+        req = dataclasses.replace(req, defer_pr=True)
+        job = Job(
+            id=job_id,
+            user=target.actor,
+            target_owner=target.owner,
+            target_repo=target.repo,
+            target_number=0,
+            trigger_comment=req.instruction,
+            llm_provider=provider,
+            llm_api_base=base,
+            llm_model=model,
+            llm_api_key=worker_cfg.llm_api_key,
+            created_at=time.time(),
+            source="task",
+            kind="task",
+            task_spec={"interactive": True, "actor": target.actor},
+        )
+        _enable_job_billing(
+            job,
+            _store.find_provider_config_for_repo(owner=target.owner, repo=target.repo),
+        )
+        worker_cfg = dataclasses.replace(
+            worker_cfg, llm_billing_session_id=_billing_session_id(job)
+        )
+        job.loop = loop
+        _store.insert_job(
+            id=job.id,
+            user=job.user,
+            target_owner=job.target_owner,
+            target_repo=job.target_repo,
+            target_number=0,
+            trigger_comment=job.trigger_comment,
+            llm_provider=provider,
+            llm_api_base=base,
+            llm_model=model,
+            created_at=job.created_at,
+            status=job.status,
+            source="task",
+            kind="task",
+            task_spec_json=_json.dumps(job.task_spec),
+        )
+        with _jobs_lock:
+            _jobs[job.id] = job
+        worker = (
+            _run_task_worker if cfg.task_execution == "inprocess" else _launch_task_pod
+        )
+        _TASK_POOL.submit(worker, job, worker_cfg, req)
+    return {"id": job.id, "url": url}
+
+
+def _owned_interactive_job(target, body):
+    job_id = body.get("id")
+    if not isinstance(job_id, str) or not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        raise dashboard_api.DashboardError(400, "bad_job_id")
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    job = job or _load_job_from_store(job_id)
+    if (
+        job is None
+        or job.user != target.actor
+        or job.target_owner != target.owner
+        or job.target_repo != target.repo
+        or not job.task_spec.get("interactive")
+    ):
+        raise dashboard_api.DashboardError(404, "task_not_found")
+    return job
+
+
+@app.post("/dashboard/traceback/status")
+async def dashboard_traceback_status(request: Request) -> JSONResponse:
+    def operation(client, target, body):
+        job = _owned_interactive_job(target, body)
+        after = body.get("after", -1)
+        if not isinstance(after, int):
+            raise dashboard_api.DashboardError(400, "bad_cursor")
+        with job.history_lock:
+            steps = [
+                dict(e) for e in job.history if e["kind"] == "step" and e["seq"] > after
+            ]
+        return {
+            "id": job.id,
+            "status": job.status,
+            "steps": steps,
+            "result": job.task_result,
+            "error": job.error,
+        }
+
+    return await _dashboard_call(request, operation)
+
+
+@app.post("/dashboard/traceback/decision")
+async def dashboard_traceback_decision(request: Request) -> JSONResponse:
+    return await _dashboard_call(request, _decide_traceback_task)
+
+
+def _decide_traceback_task(client, target, body):
+    if not (cfg.task_api_enabled and cfg.dashboard_interactive_tasks_enabled):
+        raise dashboard_api.DashboardError(404, "interactive_tasks_disabled")
+    dashboard_api._require_write(client, target, dashboard_api.RoleCache(ttl=0))
+    if body.get("decision") not in {"approve", "decline"}:
+        raise dashboard_api.DashboardError(400, "bad_decision")
+    with _dashboard_investigation_lock:
+        job = _owned_interactive_job(target, body)
+        if job.status in {"published", "declined"}:
+            return {"status": job.status, "result": job.task_result}
+        if job.status != "awaiting_approval" or time.time() - job.created_at > 86400:
+            raise dashboard_api.DashboardError(409, "approval_not_available")
+        if body["decision"] == "decline":
+            job.status = "declined"
+            _store.update_status(job.id, job.status)
+            return {"status": "declined"}
+        result = dict(job.task_result or {})
+        branch, sha = result.get("branch"), result.get("commit_sha")
+        if (
+            not isinstance(branch, str)
+            or not branch.startswith("serge/slack-")
+            or not sha
+        ):
+            raise dashboard_api.DashboardError(409, "invalid_candidate")
+        if client.get_ref_sha(target.owner, target.repo, f"heads/{branch}") != sha:
+            raise dashboard_api.DashboardError(409, "candidate_changed")
+        proposal = result["proposal"]
+        # Recover an HTTP timeout or process crash after GitHub created the PR.
+        found = client.find_pull_request_by_head(target.owner, target.repo, branch)
+        pr = found or client.create_pull_request(
+            target.owner,
+            target.repo,
+            title=proposal["title"],
+            head=branch,
+            base=proposal["base"],
+            body=proposal["body"],
+            draft=True,
+        )
+        if pr.get("draft"):
+            client.mark_pull_request_ready(pr["node_id"])
+        result.update(
+            pr_number=pr["number"], url=pr["html_url"], awaiting_approval=False
+        )
+        job.task_result = result
+        job.status = "published"
+        _store.save_task_result(job.id, _json.dumps(result))
+        _store.update_status(job.id, job.status)
+        return {"status": job.status, "result": result}
+
+
+@app.post("/dashboard/investigate")
+async def dashboard_investigate(request: Request) -> JSONResponse:
+    loop = asyncio.get_running_loop()
+    return await _dashboard_call(
+        request,
+        lambda client, target, body: _queue_dashboard_investigation(
+            client, target, body, loop
+        ),
+    )
 
 
 @app.post("/dashboard/permission")

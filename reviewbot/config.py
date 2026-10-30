@@ -230,6 +230,7 @@ class Config:
     # operation is allowlisted: these repositories, cancelling only runs of
     # these workflow paths, dispatching only these workflow files.
     dashboard_api_token: str = ""
+    dashboard_interactive_tasks_enabled: bool = False
     dashboard_mic_progress_url: str = ""
     dashboard_repositories: tuple[str, ...] = (
         "huggingface/transformers",
@@ -703,6 +704,10 @@ class Config:
             task_oidc_audience=(os.environ.get("TASK_OIDC_AUDIENCE") or "").strip()
             or "serge",
             dashboard_api_token=(os.environ.get("DASHBOARD_API_TOKEN") or "").strip(),
+            dashboard_interactive_tasks_enabled=os.environ.get(
+                "DASHBOARD_INTERACTIVE_TASKS_ENABLED", ""
+            )
+            == "1",
             dashboard_repositories=_csv_env(
                 "DASHBOARD_REPOSITORIES", Config.dashboard_repositories
             ),

@@ -369,7 +369,7 @@ class JobStore:
             cur = self._conn.execute(
                 """
                 DELETE FROM jobs
-                 WHERE status != 'running'
+                 WHERE status NOT IN ('running', 'awaiting_approval')
                    AND id NOT IN (
                        SELECT id FROM jobs
                         ORDER BY created_at DESC

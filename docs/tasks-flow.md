@@ -227,3 +227,42 @@ counts); anything malformed is dropped, never fatal. Absent field, no section.
 | `TASK_TOOL_MAX_ITERATIONS` | unset | Task-only tool-loop cap. Unset means tasks use `TOOL_MAX_ITERATIONS`; normal reviews are unchanged. |
 | `TASK_MAX_FOLLOWUPS` | `5` | Max serge-authored commits per fix branch. Set `0` to disable the cap. |
 | `TASK_MAX_WORKERS` | `2` | Concurrent task workers (separate pool from reviews). |
+
+## Interactive dashboard / Slack investigations
+
+The dashboard's `@askserge` bot and its **Fix it!** / **Deeper investigation**
+buttons can start the same task runner through `POST /dashboard/traceback`.
+This is an additional, explicitly enabled dashboard service API; `/tasks` still
+requires GitHub Actions OIDC. Enable it with
+`DASHBOARD_INTERACTIVE_TASKS_ENABLED=1` only after deploying matching web and
+runner images that support `TaskRequest.defer_pr`. It also requires
+`TASK_API_ENABLED`, a task-enabled provider configuration, an allowlisted
+repository, and the acting GitHub user's repository write permission.
+
+The server fixes the task intent and repository, treats the supplied traceback as
+untrusted context, and forces `defer_pr=True`. Existing reproduction,
+normalization, GPU verification and retry behavior remains in the task pipeline.
+After a successful candidate is committed and verified (when configured), the
+runner returns `awaiting_approval` with the branch, commit SHA, title and PR body.
+It does not open a PR. The pod exits normally; approval does not keep a runner
+waiting. Existing ITF/OIDC tasks continue to publish normally.
+
+The dashboard polls `POST /dashboard/traceback/status` for phase events and the
+result, and sends updates to the requester's Slack DM. Its signed Slack button
+handler calls `POST /dashboard/traceback/decision` with `approve` or `decline`.
+The server checks task ownership and repository identity, rechecks current write
+permission, rejects approvals after 24 hours, and requires the candidate branch
+still to point at the reviewed commit. Approval creates a draft PR then marks it
+ready, as ordinary tasks do. A retry recovers the existing PR by its unique head
+branch instead of creating another one. Decline creates no PR and retains the
+candidate branch. Pending approvals are excluded from ordinary job pruning.
+
+The separate `POST /dashboard/investigate` command starts a PR-focused draft
+review; it is not the traceback-to-fix pipeline. Its result remains a human-reviewed
+draft and never publishes automatically.
+
+The dashboard owns native Slack agent sessions and private investigation threads.
+For infra prerequisites, Slack app setup, deployment order, and acceptance checks,
+see the [askserge rollout guide](https://github.com/huggingface/transformers-ci/blob/main/docs/askserge-deployment.md).
+The Slack Stop control is currently disabled; disabling the interactive API does
+not cancel already-running tasks.

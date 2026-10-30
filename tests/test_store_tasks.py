@@ -39,6 +39,15 @@ class StoreTaskTests(unittest.TestCase):
         self.assertEqual(json.loads(row["task_spec_json"])["mode"], "new_pr")
         self.assertEqual(json.loads(row["result_json"])["pr_number"], 99)
 
+    def test_pending_approval_survives_job_pruning(self):
+        self.test_insert_task_job_and_result()
+        self.store.update_status("j1", "awaiting_approval")
+        self.store.prune(0)
+        self.assertEqual(self.store.load("j1")["status"], "awaiting_approval")
+        self.store.update_status("j1", "declined")
+        self.store.prune(0)
+        self.assertIsNone(self.store.load("j1"))
+
     def test_default_kind_is_review(self):
         self.store.insert_job(
             id="j2",

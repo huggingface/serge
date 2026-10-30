@@ -211,6 +211,10 @@ class DashboardRouteTests(unittest.TestCase):
     def test_routes_are_404_without_a_token(self):
         client = TestClient(self._webapp().app)
         for path in (
+            "/dashboard/investigate",
+            "/dashboard/traceback",
+            "/dashboard/traceback/status",
+            "/dashboard/traceback/decision",
             "/dashboard/permission",
             "/dashboard/runs/cancel",
             "/dashboard/workflows/dispatch",
@@ -256,6 +260,202 @@ class DashboardRouteTests(unittest.TestCase):
             self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(gh.cancelled, [120])
         self.assertEqual(gh.dispatched[0][0], "rerun-failed-gpu.yml")
+
+    def test_investigation_is_authorized_idempotent_and_draft_only(self):
+        from unittest.mock import Mock
+
+        webapp = self._webapp(DASHBOARD_API_TOKEN="secret")
+        gh = FakeGitHub()
+        gh.get_pr = Mock(return_value={"state": "open"})
+        client = TestClient(webapp.app)
+        body = {
+            "repository": REPO,
+            "actor": "maintainer",
+            "pr": 42,
+            "idempotency_key": "slack-12345678",
+        }
+        with (
+            patch.object(webapp, "installation_token_for_repo", return_value="t"),
+            patch.object(webapp, "GitHubClient", return_value=gh),
+            patch.object(webapp._WEBHOOK_REVIEW_POOL, "submit") as submit,
+        ):
+            self.assertEqual(
+                client.post("/dashboard/investigate", json=body).status_code, 401
+            )
+            headers = {"Authorization": "Bearer secret"}
+            first = client.post("/dashboard/investigate", json=body, headers=headers)
+            self.assertEqual(first.status_code, 200, first.text)
+            second = client.post("/dashboard/investigate", json=body, headers=headers)
+            self.assertEqual(second.json(), first.json())
+            self.assertEqual(submit.call_count, 1)
+            worker, job = submit.call_args.args
+            self.assertIs(worker, webapp._run_review_worker)
+            self.assertEqual(job.source, "web")
+            self.assertEqual(job.user, "maintainer")
+            self.assertIn("CI failures", job.trigger_comment)
+            # FakeGitHub now reflects permission removal for a different actor.
+            gh.role = "read"
+            denied = client.post(
+                "/dashboard/investigate",
+                json={**body, "actor": "other-reader"},
+                headers=headers,
+            )
+            self.assertEqual(denied.status_code, 403)
+
+    def test_traceback_approval_is_owner_bound_and_candidate_bound(self):
+        from unittest.mock import Mock
+        import json
+        import time
+
+        webapp = self._webapp(
+            DASHBOARD_API_TOKEN="secret", DASHBOARD_INTERACTIVE_TASKS_ENABLED="1"
+        )
+        gh = FakeGitHub()
+        gh.get_ref_sha = Mock(return_value="a" * 40)
+        gh.find_pull_request_by_head = Mock(return_value=None)
+        gh.create_pull_request = Mock(
+            return_value={
+                "number": 99,
+                "html_url": "https://github.com/huggingface/transformers/pull/99",
+                "draft": True,
+                "node_id": "N99",
+            }
+        )
+        gh.mark_pull_request_ready = Mock()
+        job = webapp.Job(
+            id="b" * 32,
+            user="maintainer",
+            target_owner="huggingface",
+            target_repo="transformers",
+            target_number=0,
+            trigger_comment="Investigate",
+            llm_provider="custom",
+            llm_api_base="https://llm",
+            llm_model="test",
+            created_at=time.time(),
+            source="task",
+            kind="task",
+            task_spec={"interactive": True},
+        )
+        job.status = "awaiting_approval"
+        job.task_result = {
+            "branch": "serge/slack-bbbbbbbb",
+            "commit_sha": "a" * 40,
+            "awaiting_approval": True,
+            "proposal": {"title": "Fix", "body": "Verified fix", "base": "main"},
+        }
+        webapp._jobs[job.id] = job
+        webapp._store.insert_job(
+            id=job.id,
+            user=job.user,
+            target_owner=job.target_owner,
+            target_repo=job.target_repo,
+            target_number=0,
+            trigger_comment=job.trigger_comment,
+            llm_provider=job.llm_provider,
+            llm_api_base=job.llm_api_base,
+            llm_model=job.llm_model,
+            created_at=job.created_at,
+            status=job.status,
+            source=job.source,
+            kind=job.kind,
+            task_spec_json=json.dumps(job.task_spec),
+        )
+        webapp._store.save_task_result(job.id, json.dumps(job.task_result))
+        target = _target()
+        body = {"id": job.id, "decision": "approve"}
+        with self.assertRaises(dashboard_api.DashboardError) as error:
+            webapp._decide_traceback_task(gh, _target("another-writer"), body)
+        self.assertEqual(error.exception.status, 404)
+        gh.role = "read"
+        with self.assertRaises(dashboard_api.DashboardError) as error:
+            webapp._decide_traceback_task(gh, target, body)
+        self.assertEqual(error.exception.detail, "no_write_access")
+        gh.role = "write"
+        gh.get_ref_sha.return_value = "changed"
+        with self.assertRaises(dashboard_api.DashboardError) as error:
+            webapp._decide_traceback_task(gh, target, body)
+        self.assertEqual(error.exception.detail, "candidate_changed")
+        gh.create_pull_request.assert_not_called()
+        gh.get_ref_sha.return_value = "a" * 40
+        created = job.created_at
+        job.created_at -= 90000
+        with self.assertRaises(dashboard_api.DashboardError) as error:
+            webapp._decide_traceback_task(gh, target, body)
+        self.assertEqual(error.exception.detail, "approval_not_available")
+        job.created_at = created
+        result = webapp._decide_traceback_task(gh, target, body)
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(webapp._decide_traceback_task(gh, target, body), result)
+        gh.create_pull_request.assert_called_once()
+        # A process restart reloads the persisted published outcome.
+        webapp._jobs.pop(job.id)
+        self.assertEqual(webapp._decide_traceback_task(gh, target, body), result)
+        gh.create_pull_request.assert_called_once()
+
+    def test_decline_never_creates_a_pr(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import time
+
+        webapp = self._webapp(
+            DASHBOARD_API_TOKEN="secret", DASHBOARD_INTERACTIVE_TASKS_ENABLED="1"
+        )
+        job = SimpleNamespace(
+            id="a" * 32,
+            status="awaiting_approval",
+            created_at=time.time(),
+            task_result={},
+        )
+        gh = FakeGitHub()
+        gh.create_pull_request = Mock()
+        with (
+            patch.object(webapp, "_owned_interactive_job", return_value=job),
+            patch.object(webapp._store, "update_status"),
+        ):
+            result = webapp._decide_traceback_task(
+                gh, _target(), {"id": job.id, "decision": "decline"}
+            )
+            self.assertEqual(result["status"], "declined")
+            self.assertEqual(
+                webapp._decide_traceback_task(
+                    gh, _target(), {"id": job.id, "decision": "approve"}
+                )["status"],
+                "declined",
+            )
+        gh.create_pull_request.assert_not_called()
+
+    def test_traceback_task_uses_existing_worker_and_forces_approval(self):
+        import asyncio
+
+        webapp = self._webapp(
+            DASHBOARD_API_TOKEN="secret", DASHBOARD_INTERACTIVE_TASKS_ENABLED="1"
+        )
+        gh = FakeGitHub()
+        with (
+            patch.object(
+                webapp,
+                "_resolve_task_worker_cfg",
+                return_value=(webapp.cfg, "custom", "https://llm", "test"),
+            ),
+            patch.object(webapp._TASK_POOL, "submit") as submit,
+        ):
+            loop = asyncio.new_event_loop()
+            self.addCleanup(loop.close)
+            body = {
+                "context": "Traceback: test_demo.py::test_x failed",
+                "idempotency_key": "slack-abcdefgh",
+            }
+            first = webapp._start_traceback_task(gh, _target(), body, loop)
+            self.assertEqual(
+                webapp._start_traceback_task(gh, _target(), body, loop), first
+            )
+            self.assertEqual(submit.call_count, 1)
+            worker, job, config, req = submit.call_args.args
+            self.assertTrue(req.defer_pr)
+            self.assertEqual(req.mode, "new_pr")
+            self.assertTrue(job.task_spec["interactive"])
+            self.assertIn("Traceback", req.context)
 
     def test_tasks_still_requires_oidc_with_the_dashboard_token_set(self):
         # The dashboard token is not a /tasks credential: backward compatible.

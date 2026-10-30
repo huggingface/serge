@@ -194,6 +194,7 @@ class TaskRequest:
     instruction: str
     context: str
     mode: str = "new_pr"
+    defer_pr: bool = False
     pr_number: Optional[int] = None
     title: Optional[str] = None
     branch_prefix: str = "serge/fix"
@@ -270,6 +271,8 @@ class TaskResult:
 
     mode: str
     no_change: bool = False
+    awaiting_approval: bool = False
+    proposal: dict[str, Any] = field(default_factory=dict)
     message: str = ""
     pr_number: Optional[int] = None
     branch: Optional[str] = None
@@ -298,6 +301,8 @@ class TaskResult:
         return {
             "mode": self.mode,
             "no_change": self.no_change,
+            "awaiting_approval": self.awaiting_approval,
+            "proposal": self.proposal,
             "message": self.message,
             "pr_number": self.pr_number,
             "branch": self.branch,
@@ -2474,6 +2479,7 @@ def _commit_changes(
         # "the gate never ran" exactly where it had run and passed.
         verdict: Optional[str] = None
         if verify is not None:
+            emit_fn("step", "verify")
             outcome = verify(parent_sha, commit_sha)
             verdict = outcome.verdict
             if not outcome.is_fixed:
@@ -2534,6 +2540,7 @@ def _commit_changes(
     verify_runs: Optional[int] = None
     verdict = None
     if verify is not None:
+        emit_fn("step", "verify")
         outcome = verify(parent_sha, commit_sha)
         verdict = outcome.verdict
         if gate_did_not_run(verdict):
@@ -2588,6 +2595,36 @@ def _commit_changes(
             )
         verify_run_url = outcome.run_url
         verify_runs = (outcome.result or {}).get("runs")
+
+    if req.defer_pr:
+        emit_fn("step", "awaiting_approval")
+        return TaskResult(
+            mode=req.mode,
+            awaiting_approval=True,
+            branch=branch,
+            commit_sha=commit_sha,
+            changed_files=changed_files,
+            message="Investigation and patch preparation complete. Waiting for your approval to create a PR.",
+            verify_verdict=verdict,
+            expectation_only=classification.expectation_only,
+            expectation_note=classification.reason(),
+            proposal={
+                "title": plan.title,
+                "base": req.base_ref,
+                "body": _decorate_body(
+                    cfg,
+                    plan,
+                    req,
+                    verification_footer=_verification_footer(
+                        verify_run_url,
+                        req.reproduce_run_url,
+                        runs=verify_runs,
+                        classification=classification,
+                    ),
+                    gh=gh,
+                ),
+            },
+        )
 
     # Open as a draft, then immediately mark ready-for-review. The
     # draft->ready transition is what fires the `ready_for_review` webhook that
@@ -3113,6 +3150,7 @@ def _maybe_reproduce_first(
         )
         return None, req
 
+    emit("step", "reproduce")
     outcome = run_gpu_reproduce(
         gh,
         owner=req.owner,

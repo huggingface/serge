@@ -504,6 +504,38 @@ class PublishTaskTests(unittest.TestCase):
         self.assertEqual(result.changed_files, ["hello.txt"])
         notify.assert_called_once()
 
+    def test_interactive_task_prepares_candidate_without_creating_pr(self):
+        co = self._checkout("main")
+        req = TaskRequest(
+            owner="acme",
+            repo="widget",
+            base_ref="main",
+            instruction="fix",
+            context="",
+            defer_pr=True,
+            branch_prefix="serge/slack",
+        )
+        plan = TaskPlan(title="Fix hello", body="Diagnosis", patch=self._PATCH)
+        gh = _FakeGH()
+        with patch("reviewbot.tasks.post_task_pr_created_notification") as notify:
+            result = publish_task(
+                self.cfg,
+                gh,
+                req,
+                plan,
+                checkout=co,
+                clone_cache=self.cache,
+                job_id="abcd1234",
+            )
+        self.assertTrue(result.awaiting_approval)
+        self.assertFalse(result.no_change)
+        self.assertIsNone(gh.created_pr)
+        self.assertEqual(result.branch, "serge/slack-abcd1234")
+        self.assertEqual(result.proposal["title"], "Fix hello")
+        self.assertIn("Diagnosis", result.proposal["body"])
+        self.assertTrue(result.to_json()["awaiting_approval"])
+        notify.assert_not_called()
+
     _HARD = (
         '`tests/models/x/test_modeling_x.py` (line 3): the ("cuda", 8) values '
         "move by 45% of the block's scale; hardware drift is about 1%, so this "

@@ -597,6 +597,18 @@ class GitHubClient:
         r.raise_for_status()
         return r.content
 
+    def find_pull_request_by_head(
+        self, owner: str, repo: str, branch: str
+    ) -> Optional[dict]:
+        response = self.session.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls",
+            params={"head": f"{owner}:{branch}", "state": "all", "per_page": 1},
+            timeout=30,
+        )
+        response.raise_for_status()
+        rows = response.json()
+        return rows[0] if rows else None
+
     def create_pull_request(
         self,
         owner: str,

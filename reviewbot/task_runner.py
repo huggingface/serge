@@ -441,7 +441,11 @@ def run(spec: RunnerSpec) -> int:
                 message="No candidate produced a safe fix.",
             )
 
-        status = "no_fix" if result.no_change else "published"
+        status = (
+            "awaiting_approval"
+            if result.awaiting_approval
+            else ("no_fix" if result.no_change else "published")
+        )
         emit("log", result.message)
         emit("step", "done")
         emit("done", "")
