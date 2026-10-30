@@ -263,6 +263,6 @@ draft and never publishes automatically.
 
 The dashboard owns native Slack agent sessions and private investigation threads.
 For infra prerequisites, Slack app setup, deployment order, and acceptance checks,
-see the [askserge rollout guide](https://github.com/huggingface/transformers-ci/blob/main/docs/askserge-deployment.md).
+see the [askserge rollout guide](https://github.com/huggingface/transformers-ci-playbooks/blob/main/dashboard/playbooks/askserge-deployment.md).
 The Slack Stop control is currently disabled; disabling the interactive API does
 not cancel already-running tasks.
