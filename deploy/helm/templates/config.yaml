@@ -13,6 +13,9 @@ data:
   {{- $egress := printf "%s-egress" (include "name" .) }}
   TASK_EXECUTION: "kubernetes"
   TASK_RUNNER_IMAGE: {{ $t.image | quote }}
+  {{- with $t.toolchainSuffix }}
+  TASK_RUNNER_TOOLCHAIN_SUFFIX: {{ . | quote }}
+  {{- end }}
   TASK_RUNNER_TIMEOUT: {{ $t.timeout | quote }}
   TASK_TAIL_RESERVE: {{ $t.tailReserve | default 0 | quote }}
   {{- with $t.memory }}

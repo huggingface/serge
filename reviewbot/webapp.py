@@ -108,6 +108,7 @@ from .tasks import (
     resolve_existing_pr,
     task_candidate_requests,
 )
+from .toolchain_refresh import RefreshDispatcher, is_gate_broken, resolve_runner_image
 from .triggers import build_review_request
 
 logging.basicConfig(
@@ -117,6 +118,12 @@ logging.basicConfig(
 log = logging.getLogger("serge.web")
 
 cfg = Config.from_env(require_app=False, require_web=True)
+_toolchain_dispatcher = RefreshDispatcher(
+    token=cfg.toolchain_refresh_token,
+    repo=cfg.toolchain_refresh_repo,
+    workflow=cfg.toolchain_refresh_workflow,
+    serge_ref=git_sha() or "",
+)
 log.info(
     "Config: llm_stream=%s, llm_max_tokens=%d, tool_max_iterations=%s, "
     "llm_max_input_tokens=%s, tool_result_window=%s, max_diff_chars=%d, "
@@ -1610,10 +1617,18 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
                 f"{cfg.task_callback_base_url}/internal/tasks/{job.id}/github-token"
             ),
         )
+        # serge#126: prefer the toolchain-refreshed build of this serge commit
+        # when the refresh workflow has published one; else the pinned image.
+        resolved = resolve_runner_image(
+            cfg.task_runner_image, cfg.task_runner_toolchain_suffix
+        )
+        runner_image = resolved.image
         emit("step", "launch")
+        if resolved.note:
+            emit("log", resolved.note)
         emit(
             "log",
-            f"Launching task runner ({cfg.task_execution}: {cfg.task_runner_image})…",
+            f"Launching task runner ({cfg.task_execution}: {runner_image})…",
         )
 
         if cfg.task_execution == "kubernetes":
@@ -1623,7 +1638,7 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
             job_name, namespace = create_kubernetes(
                 spec,
                 K8sLaunchOptions(
-                    image=cfg.task_runner_image,
+                    image=runner_image,
                     namespace=cfg.task_k8s_namespace,
                     service_account=cfg.task_k8s_service_account,
                     node_selector=parse_node_selector(cfg.task_k8s_node_selector),
@@ -1648,7 +1663,7 @@ def _launch_task_pod(job: Job, worker_cfg: Config, req: TaskRequest) -> None:
         code, _out = launch_docker(
             spec,
             DockerLaunchOptions(
-                image=cfg.task_runner_image,
+                image=runner_image,
                 network=cfg.task_runner_network,
                 proxy=cfg.task_runner_proxy,
                 memory=cfg.task_runner_memory,
@@ -3389,11 +3404,16 @@ async def ingest_task_event(job_id: str, request: Request) -> JSONResponse:
         # terminal outcome arrives as this callback, not an SSE "done".
         _push_event(job, "done", "")
     else:
-        _push_event(
-            job,
-            str(payload.get("kind") or "log"),
-            str(payload.get("text") or ""),
-        )
+        kind = str(payload.get("kind") or "log")
+        text = str(payload.get("text") or "")
+        _push_event(job, kind, text)
+        if is_gate_broken(kind, text):
+            # The image has drifted from the target repo's pins: every task
+            # tonight will fail the same way. Ask for a rebuild now rather than
+            # at the next scheduled refresh (serge#126). Fire and forget.
+            asyncio.get_running_loop().run_in_executor(
+                None, _toolchain_dispatcher.request, f"task {job_id}"
+            )
     return JSONResponse({"ok": True})
 
 

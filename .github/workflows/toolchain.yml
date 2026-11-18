@@ -1,0 +1,143 @@
+name: Refresh task-runner toolchain
+
+# serge#126. The task-runner image freezes transformers' quality toolchain at
+# build time and the normalize gate cannot refresh it (`--no-deps`: a task pod
+# has no PyPI), so every pin transformers moves broke every serge task until an
+# operator rebuilt and redeployed by hand (2026-08-17, 08-18, 09-12, 11-16).
+#
+# This rebuilds the task-runner image for a serge commit whenever transformers'
+# pins change, proves the result passes the real gate on a pristine checkout,
+# and only then moves `sha-<serge>-toolchain` onto it. serge launches that tag
+# (pinned by digest) when `taskExecution.kubernetes.toolchainSuffix` is set, so
+# a refresh reaches prod with no deploy and no serge restart.
+#
+# Tags (ghcr.io/huggingface/serge-task-runner):
+#   sha-<serge>                   docker.yml, immutable — never touched here
+#   sha-<serge>-tc-<pins hash>    this workflow, immutable, one per pin set
+#   sha-<serge>-toolchain         this workflow, MOVING: the latest verified one
+#
+# Runs hourly for main's tip (deploys ship main's tip), and on dispatch for any
+# commit — serge dispatches it for its own commit when a task finds the gate
+# broken on the pristine checkout (TOOLCHAIN_REFRESH_TOKEN).
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      serge_ref:
+        description: serge commit to refresh (default main's tip)
+        required: false
+        default: ''
+      force:
+        description: rebuild even if an image for the current pins exists
+        type: boolean
+        default: false
+
+concurrency:
+  group: toolchain-refresh-${{ inputs.serge_ref || 'main' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}-task-runner
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.serge_ref || 'main' }}
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Work out what to build
+        id: plan
+        env:
+          FORCE: ${{ inputs.force && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          serge=$(git rev-parse --short=7 HEAD)
+          tf=$(git ls-remote https://github.com/huggingface/transformers refs/heads/main | cut -f1)
+          # Key on what the gate's environment is made of: the pin table and the
+          # extras that select from it. Any pin change re-keys; nothing else does.
+          raw="https://raw.githubusercontent.com/huggingface/transformers/$tf"
+          key=$( { curl -fsSL "$raw/setup.py"; curl -fsSL "$raw/src/transformers/dependency_versions_table.py"; } \
+                 | sha256sum | cut -c1-12)
+          tag="sha-$serge-tc-$key"
+          {
+            echo "serge=$serge"
+            echo "tf=$tf"
+            echo "tag=$tag"
+            echo "pointer=sha-$serge-toolchain"
+          } >> "$GITHUB_OUTPUT"
+          echo "serge $serge, transformers $tf, pins key $key"
+          if ! docker manifest inspect "$IMAGE:sha-$serge" >/dev/null 2>&1; then
+            # docker.yml has not published this commit (yet): nothing to refresh.
+            echo "No $IMAGE:sha-$serge; skipping." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "action=skip" >> "$GITHUB_OUTPUT"
+          elif [ "$FORCE" != true ] && docker manifest inspect "$IMAGE:$tag" >/dev/null 2>&1; then
+            echo "$tag exists (pins unchanged); re-pointing only." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "action=point" >> "$GITHUB_OUTPUT"
+          else
+            echo "Building $tag against transformers $tf." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "action=build" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Docker Buildx
+        if: steps.plan.outputs.action == 'build'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build task-runner image
+        if: steps.plan.outputs.action == 'build'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile.task-runner
+          load: true
+          push: false
+          pull: true
+          platforms: 'linux/amd64'
+          build-args: |
+            TRANSFORMERS_REF=${{ steps.plan.outputs.tf }}
+          tags: ${{ env.IMAGE }}:${{ steps.plan.outputs.tag }}
+          cache-from: type=gha
+      # The image is only published if the gate passes on an UNPATCHED checkout
+      # of the exact transformers commit it was built against — the same
+      # install + `make fix-repo` serge's normalize gate runs. A pointer that
+      # moves onto a broken image would break prod as surely as a stale one.
+      - name: Prove the gate passes on a pristine checkout
+        if: steps.plan.outputs.action == 'build'
+        env:
+          TF: ${{ steps.plan.outputs.tf }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          docker run --rm -e TF="$TF" "$IMAGE:$TAG" bash -c '
+            set -euo pipefail
+            git init -q /tmp/t && cd /tmp/t
+            git fetch -q --depth 1 https://github.com/huggingface/transformers "$TF"
+            git checkout -q FETCH_HEAD
+            uv pip install -e . --system --no-deps --no-build-isolation
+            python -m reviewbot.toolchain_check --dist transformers --extra quality
+            export TRANSFORMERS_SKIP_CHECKER_REQUIREMENTS=1
+            make fix-repo
+          '
+      - name: Publish
+        if: steps.plan.outputs.action == 'build'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: docker push "$IMAGE:$TAG"
+      - name: Move the pointer
+        if: steps.plan.outputs.action != 'skip'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          POINTER: ${{ steps.plan.outputs.pointer }}
+        run: |
+          docker buildx imagetools create -t "$IMAGE:$POINTER" "$IMAGE:$TAG"
+          echo "$POINTER -> $TAG" | tee -a "$GITHUB_STEP_SUMMARY"
