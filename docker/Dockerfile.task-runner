@@ -44,11 +44,17 @@ RUN if ! (command -v git >/dev/null && command -v make >/dev/null); then \
 #               -> 6 checkers dead on the version guard, 3 groups lost, ~3.5M tokens
 #   2026-08-18  transformers-mlinter 0.1.2 in-image vs main's 0.1.4 rule schema
 #               -> "Invalid rule spec for TRF054: default_enabled must be bool"
+#   2026-11-16  transformers-mlinter 0.1.5 in-image vs main's ==0.1.6 (#50071)
+#               -> "Rule TRF001 is marked deprecated but trf001.py still exists"
 # Resolving here makes the gate's env only as stale as *this* image, which a
 # rebuild fixes on demand — instead of waiting for the base's next nightly.
+# docker.yml passes TRANSFORMERS_REF as main's resolved COMMIT, not `main`: a
+# constant `@main` string lets the build cache replay this layer unchanged.
+# The ref is recorded in /opt/serge-toolchain-ref for provenance.
 ARG TRANSFORMERS_REF=main
 RUN pip install --no-cache-dir --upgrade \
-      "transformers[quality] @ git+https://github.com/huggingface/transformers@${TRANSFORMERS_REF}"
+      "transformers[quality] @ git+https://github.com/huggingface/transformers@${TRANSFORMERS_REF}" \
+    && mkdir -p /opt && echo "${TRANSFORMERS_REF}" > /opt/serge-toolchain-ref
 
 # Layer serge on top of the toolchain, into the base image's Python environment
 # so `reviewbot-task-runner` is on PATH and its imports resolve. Only the base
