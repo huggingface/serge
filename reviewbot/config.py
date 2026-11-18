@@ -314,6 +314,20 @@ class Config:
     # Runner image for review pods. Reviews don't run ``make fix-repo``, so this
     # can be a slimmer serge-base image; falls back to task_runner_image when unset.
     review_runner_image: Optional[str] = None
+    # Toolchain auto-refresh (serge#126). When set, each task launch first looks
+    # for ``<task_runner_image tag><suffix>`` in the registry — a moving tag the
+    # scheduled ``toolchain.yml`` workflow points at a rebuild of the SAME serge
+    # commit with the target repo's current pins, published only after it passes
+    # the gate — and launches that, pinned by digest. Missing or unreachable =
+    # ``task_runner_image`` as configured. Empty = off.
+    task_runner_toolchain_suffix: str = ""
+    # When a task finds the normalize gate broken on the pristine checkout, ask
+    # GitHub to run the refresh workflow now instead of at its next hourly run.
+    # Needs a token with ``actions: write`` on ``toolchain_refresh_repo``;
+    # unset token = the hourly schedule alone.
+    toolchain_refresh_token: Optional[str] = None
+    toolchain_refresh_repo: str = "huggingface/serge"
+    toolchain_refresh_workflow: str = "toolchain.yml"
     # Base URL the runner POSTs events + the terminal result back to
     # (``{base}/internal/tasks/{job_id}/events``). In k8s this is serge's
     # in-cluster Service URL; for docker-on-host it points at the serge host
@@ -733,6 +747,19 @@ class Config:
             or None,
             review_runner_image=(os.environ.get("REVIEW_RUNNER_IMAGE") or "").strip()
             or None,
+            task_runner_toolchain_suffix=(
+                os.environ.get("TASK_RUNNER_TOOLCHAIN_SUFFIX") or ""
+            ).strip(),
+            toolchain_refresh_token=(
+                os.environ.get("TOOLCHAIN_REFRESH_TOKEN") or ""
+            ).strip()
+            or None,
+            toolchain_refresh_repo=(
+                os.environ.get("TOOLCHAIN_REFRESH_REPO") or "huggingface/serge"
+            ).strip(),
+            toolchain_refresh_workflow=(
+                os.environ.get("TOOLCHAIN_REFRESH_WORKFLOW") or "toolchain.yml"
+            ).strip(),
             task_callback_base_url=(os.environ.get("TASK_CALLBACK_BASE_URL") or "")
             .strip()
             .rstrip("/")

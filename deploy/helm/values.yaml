@@ -122,6 +122,14 @@ taskExecution:
     # Runner image: reviewbot layered on the repo toolchain
     # (docker/Dockerfile.task-runner). REQUIRED when enabled.
     image: ""
+    # Toolchain auto-refresh (serge#126). When set (e.g. "-toolchain"), each
+    # task launches `<image tag><suffix>` pinned by digest if that tag exists —
+    # the rebuild of the SAME serge commit that .github/workflows/toolchain.yml
+    # publishes when the target repo's pins move, after it passes the gate —
+    # else `image` as given. Empty = always `image`. The optional
+    # TOOLCHAIN_REFRESH_TOKEN secret key (actions: write on huggingface/serge)
+    # also lets a broken-gate task trigger that workflow immediately.
+    toolchainSuffix: ""
     # Wall-clock cap (seconds) per task Job — this becomes the Job's
     # activeDeadlineSeconds, so it is a hard kill wherever the runner happens to
     # be. The runner bounds its own steps against it (reviewbot/budget.py).
