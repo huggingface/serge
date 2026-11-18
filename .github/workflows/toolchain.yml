@@ -128,9 +128,15 @@ jobs:
         run: |
           docker run --rm -e TF="$TF" "$IMAGE:$TAG" bash -c '
             set -euo pipefail
+            # Shaped like a clone, pinned to $TF: noisy_comments,
+            # modular_conversion and docstrings diff against `main` and
+            # `origin/main` (git merge-base main HEAD; GitPython refs.main) and
+            # fail without them, which a bare fetch of FETCH_HEAD does not have.
             git init -q /tmp/t && cd /tmp/t
-            git fetch -q --depth 1 https://github.com/huggingface/transformers "$TF"
-            git checkout -q FETCH_HEAD
+            git remote add origin https://github.com/huggingface/transformers
+            git fetch -q --depth 1 origin "$TF"
+            git checkout -q -b main FETCH_HEAD
+            git update-ref refs/remotes/origin/main HEAD
             uv pip install -e . --system --no-deps --no-build-isolation
             python -m reviewbot.toolchain_check --dist transformers --extra quality
             export TRANSFORMERS_SKIP_CHECKER_REQUIREMENTS=1
