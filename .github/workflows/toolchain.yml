@@ -49,10 +49,18 @@ jobs:
     env:
       IMAGE: ghcr.io/${{ github.repository }}-task-runner
     steps:
+      # Full history, then a plain `git checkout`: serge_ref is usually a SHORT
+      # sha (the deployed `sha-<7>` tag, or git_sha()'s 12 chars when serge
+      # dispatches this itself), which actions/checkout's `ref:` cannot fetch.
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.serge_ref || 'main' }}
+          fetch-depth: 0
+      - name: Select the serge commit
+        if: inputs.serge_ref != ''
+        env:
+          SERGE_REF: ${{ inputs.serge_ref }}
+        run: git checkout -q --detach "$SERGE_REF"
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
