@@ -24,6 +24,7 @@ import os
 import re
 import contextlib
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Optional
 
@@ -502,6 +503,71 @@ def resolve_existing_pr(gh: GitHubClient, req: TaskRequest, cfg: Config) -> str:
                 status_code=429,
             )
     return head_branch
+
+
+def sync_existing_pr_with_base(
+    gh: GitHubClient,
+    req: TaskRequest,
+    emit: Callable[[str, str], None],
+    *,
+    timeout: float = 120.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Merge ``req.base_ref`` into a stale serge fix branch before checkout.
+
+    The task-runner image is built for the base branch's tip, and the preflight
+    toolchain check compares the image against the CHECKED-OUT tree's pins. A
+    follow-up on a branch months behind main therefore fails preflight on pins
+    the branch never updated (transformers#49142: 788 commits behind, still
+    pinning transformers-mlinter==0.1.5 against an image built for 0.1.6).
+    Merging main in is also what a reviewer would need before merging anyway.
+
+    Best-effort: on a conflict or timeout the stale branch is used as before,
+    and the preflight decides."""
+    assert req.head_branch and req.pr_number is not None
+    owner, repo = req.owner, req.repo
+    try:
+        behind = gh.compare_behind_by(owner, repo, req.base_ref, req.head_branch)
+    except Exception:  # noqa: BLE001
+        log.warning("could not compare %s with %s", req.head_branch, req.base_ref)
+        return
+    if behind <= 0:
+        return
+    head_sha = gh.get_ref_sha(owner, repo, f"heads/{req.head_branch}")
+    emit(
+        "log",
+        f"{req.head_branch} is {behind} commit(s) behind {req.base_ref}; "
+        f"merging {req.base_ref} into it before checkout",
+    )
+    try:
+        accepted = gh.update_pr_branch(
+            owner, repo, req.pr_number, expected_head_sha=head_sha
+        )
+    except Exception as exc:  # noqa: BLE001
+        emit("log", f"Could not update {req.head_branch}: {exc}; using it as is")
+        return
+    if not accepted:
+        emit(
+            "log",
+            f"{req.head_branch} does not merge cleanly with {req.base_ref}; "
+            "using it as is (close the PR if the preflight rejects it)",
+        )
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sleep(3.0)
+        try:
+            new_sha = gh.get_ref_sha(owner, repo, f"heads/{req.head_branch}")
+        except Exception:  # noqa: BLE001
+            continue
+        if new_sha != head_sha:
+            emit("log", f"Merged {req.base_ref} into {req.head_branch} ({new_sha[:8]})")
+            return
+    emit(
+        "log",
+        f"GitHub accepted the update of {req.head_branch} but the branch did not "
+        f"move within {timeout:.0f}s; using it as is",
+    )
 
 
 def format_pr_files_diff(files: list[dict[str, Any]], *, limit: int = 30000) -> str:
