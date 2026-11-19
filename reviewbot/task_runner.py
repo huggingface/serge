@@ -52,6 +52,7 @@ from .tasks import (
     format_pr_files_diff,
     prepare_and_publish_candidate,
     resolve_existing_pr,
+    sync_existing_pr_with_base,
     round_reserve,
     task_candidate_requests,
 )
@@ -335,6 +336,7 @@ def run(spec: RunnerSpec) -> int:
         if req.mode == "existing_pr":
             emit("step", "resolve")
             head_branch = resolve_existing_pr(gh, req, cfg)
+            sync_existing_pr_with_base(gh, req, emit)
             emit(
                 "log",
                 f"Targeting serge branch {head_branch} (PR #{req.pr_number}), "

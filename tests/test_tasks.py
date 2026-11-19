@@ -34,6 +34,7 @@ from reviewbot.tasks import (
     prompt_prefix_summary,
     publish_task,
     resolve_existing_pr,
+    sync_existing_pr_with_base,
     task_candidate_requests,
 )
 
@@ -370,6 +371,78 @@ class ResolveExistingPrTests(unittest.TestCase):
         with self.assertRaises(TaskError) as ctx:
             resolve_existing_pr(gh, req, _make_cfg(task_max_followups=5))
         self.assertEqual(ctx.exception.status_code, 429)
+
+
+class _SyncGH:
+    def __init__(self, *, behind, accepted=True, moves_after=1, compare_raises=False):
+        self.behind = behind
+        self.accepted = accepted
+        self.moves_after = moves_after
+        self.compare_raises = compare_raises
+        self.ref_reads = 0
+        self.updates = []
+
+    def compare_behind_by(self, owner, repo, base, head):
+        if self.compare_raises:
+            raise RuntimeError("boom")
+        return self.behind
+
+    def get_ref_sha(self, owner, repo, ref):
+        self.ref_reads += 1
+        # first read = the head before the update; later reads move after N polls
+        return "old" if self.ref_reads <= self.moves_after else "merged"
+
+    def update_pr_branch(self, owner, repo, number, *, expected_head_sha):
+        self.updates.append((number, expected_head_sha))
+        return self.accepted
+
+
+class SyncExistingPrTests(unittest.TestCase):
+    def _req(self):
+        return TaskRequest(
+            owner="a",
+            repo="b",
+            base_ref="main",
+            instruction="x",
+            context="",
+            mode="existing_pr",
+            pr_number=7,
+            head_branch="serge/fix/itf-1",
+        )
+
+    def _run(self, gh, **kw):
+        logs = []
+        sync_existing_pr_with_base(
+            gh, self._req(), lambda k, t: logs.append(t), sleep=lambda s: None, **kw
+        )
+        return logs
+
+    def test_up_to_date_branch_is_left_alone(self):
+        gh = _SyncGH(behind=0)
+        self.assertEqual(self._run(gh), [])
+        self.assertEqual(gh.updates, [])
+
+    def test_stale_branch_is_merged_and_waited_for(self):
+        gh = _SyncGH(behind=788, moves_after=3)
+        logs = self._run(gh)
+        self.assertEqual(gh.updates, [(7, "old")])
+        self.assertIn("788 commit(s) behind main", logs[0])
+        self.assertIn("Merged main into serge/fix/itf-1", logs[-1])
+
+    def test_conflict_falls_back_to_stale_branch(self):
+        gh = _SyncGH(behind=5, accepted=False)
+        logs = self._run(gh)
+        self.assertIn("does not merge cleanly", logs[-1])
+
+    def test_ref_that_never_moves_times_out(self):
+        gh = _SyncGH(behind=5, moves_after=10**9)
+        logs = self._run(gh, timeout=0.0)
+        self.assertIn("did not move", logs[-1])
+
+    def test_compare_failure_is_not_fatal(self):
+        gh = _SyncGH(behind=5, compare_raises=True)
+        self.assertEqual(self._run(gh), [])
+        self.assertEqual(gh.updates, [])
 
 
 class TaskCandidateRequestTests(unittest.TestCase):

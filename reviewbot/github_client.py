@@ -363,6 +363,36 @@ class GitHubClient:
             )
         return r.json()["object"]["sha"]
 
+    def compare_behind_by(self, owner: str, repo: str, base: str, head: str) -> int:
+        """How many commits ``head`` is missing from ``base``."""
+        r = self.session.get(
+            f"https://api.github.com/repos/{owner}/{repo}/compare/{base}...{head}",
+            params={"per_page": 1},
+            timeout=60,
+        )
+        r.raise_for_status()
+        return int(r.json().get("behind_by") or 0)
+
+    def update_pr_branch(
+        self, owner: str, repo: str, number: int, *, expected_head_sha: str
+    ) -> bool:
+        """Merge the PR's base into its head, server side ("Update branch").
+        Asynchronous: GitHub answers 202 and moves the ref shortly after.
+        Returns False on 422 (merge conflict, or the head moved meanwhile)."""
+        r = self.session.put(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/update-branch",
+            json={"expected_head_sha": expected_head_sha},
+            timeout=60,
+        )
+        if r.status_code == 422:
+            return False
+        if not r.ok:
+            raise requests.HTTPError(
+                f"{r.status_code} updating PR #{number} branch on {owner}/{repo}: {r.text}",
+                response=r,
+            )
+        return True
+
     def get_commit_tree_sha(self, owner: str, repo: str, commit_sha: str) -> str:
         """Return the tree SHA of a commit (the base tree for create_tree)."""
         r = self.session.get(
