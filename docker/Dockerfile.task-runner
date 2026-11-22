@@ -78,7 +78,7 @@ RUN pip install --no-cache-dir /opt/serge
 # The repo publishes no tags, and its own deployment pins `image.tag:
 # sha-<short>`, so this is the same commit spelled the way pip takes it.
 # Keep it equal to relore/env/prod.yaml's image.tag in the playbooks repo.
-ARG RELORE_REF=06a1c99c4653e9db899a18e96d8ff0ee6b419815  # relore 0.3.19, the deployed daemon
+ARG RELORE_REF=2e15ef09a22f1477b2c11b0d864913f55bf4fe0b  # relore 0.3.20, the deployed daemon
 RUN pip install --no-cache-dir \
       "relore @ git+https://github.com/huggingface/relore@${RELORE_REF}"
 
