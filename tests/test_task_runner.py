@@ -435,6 +435,20 @@ class RunnerConfigPassthroughTest(unittest.TestCase):
             f"verify_* Config fields not threaded to the runner pod: {missing}",
         )
 
+    def test_all_review_verify_fields_are_threaded_to_the_runner(self):
+        import dataclasses
+
+        from reviewbot import launcher
+        from reviewbot.config import Config
+
+        fields = {
+            f.name
+            for f in dataclasses.fields(Config)
+            if f.name.startswith("review_verify_")
+        }
+        self.assertTrue(fields)
+        self.assertEqual(fields - set(launcher.RUNNER_CONFIG_FIELDS), set())
+
     def test_runner_config_threads_reproduce_first(self):
         import types
 

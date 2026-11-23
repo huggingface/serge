@@ -65,6 +65,10 @@ RUNNER_CONFIG_FIELDS: tuple[str, ...] = (
     "helper_tools_path",
     "default_review_rules",
     "max_diff_chars",
+    # Off unless the deployment turns it on, so a runner rebuilding Config from
+    # its own empty env would never verify a finding.
+    "review_verify_findings",
+    "review_verify_max_findings",
     "persona_header",
     "context_script_path",
     "context_script_timeout",
