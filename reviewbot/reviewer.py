@@ -11,6 +11,12 @@ from .brevity import condense_review_bodies
 from .compression import MessageCompressor
 from .config import Config
 from .context_script import run_context_script
+from .diff_claims import (
+    DiffInventory,
+    absence_feedback,
+    find_absence_claims,
+    strip_absence_claims,
+)
 from .github_client import GitHubClient
 from .llm_client import (
     ChatCompletionClient,
@@ -171,6 +177,12 @@ def _extract_json(
     object, which is how ``{"path": ..., "start_line": ...}`` was once
     mistaken for a review and published as an empty summary (serge#79).
     Callers that know their JSON contract should always pass it.
+
+    Decoding is ``strict=False``: raw newlines and tabs inside a string are
+    accepted. Models write multi-paragraph review summaries that way (GLM-5.2
+    on peft#3401, 2026-11-23: a complete review rejected as unparseable for an
+    unescaped newline in ``"summary"``), and the strict decoder throws the
+    whole answer away over a character it could have kept.
     """
     if not content:
         raise ValueError("LLM response was empty")
@@ -178,7 +190,7 @@ def _extract_json(
     if not text:
         raise ValueError("LLM response was whitespace only")
 
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(strict=False)
 
     def accept(obj: Any) -> bool:
         if not isinstance(obj, dict):
@@ -197,7 +209,7 @@ def _extract_json(
         if not candidate:
             continue
         try:
-            result = json.loads(candidate)
+            result = decoder.decode(candidate)
         except json.JSONDecodeError:
             continue
         if accept(result):
@@ -223,6 +235,42 @@ def _extract_json(
 # The review JSON contract from prompts.py — at least one of these must be
 # present for a decoded object to be a review rather than incidental JSON.
 _REVIEW_JSON_KEYS = ("summary", "comments", "event")
+
+
+def _parses_as_review(text: str) -> bool:
+    try:
+        _extract_json(text, _REVIEW_JSON_KEYS)
+    except ValueError:
+        return False
+    return True
+
+
+def _review_absence_feedback(
+    chat: ChatResult,
+    inventory: DiffInventory,
+    emit: Optional[Callable[[str, str], None]] = None,
+) -> Optional[str]:
+    """Validation gate for a review: the correction to send back when the
+    review says something this PR changes is not in its diff, else None.
+
+    peft#3401 (2026-11-23) was told `EworaConfig` "is not in the diff at all"
+    when it was in the single chunk the model read. See reviewbot/diff_claims.py.
+    """
+    try:
+        review = _extract_json(chat.content, _REVIEW_JSON_KEYS)
+    except ValueError:
+        return None  # parse failures have their own recovery path
+    claims = find_absence_claims(review, inventory)
+    if not claims:
+        return None
+    if emit is not None:
+        emit(
+            "log",
+            "Review claims changed code is not in the diff: "
+            + ", ".join(sorted({c.name for c in claims})),
+        )
+    return absence_feedback(claims)
+
 
 # Chat-template special tokens (`<|im_end|>`, `<|tool_call_begin|>`, …) that a
 # model can leak into its content. `llm_client` recovers leaked tool calls, so
@@ -268,7 +316,8 @@ def _prose_outside_json(content: Optional[str]) -> str:
         return ""
     text = _LEADING_FENCE_RE.sub("", text, count=1)
 
-    decoder = json.JSONDecoder()
+    # Same leniency as _extract_json, or the two disagree on where the JSON ends.
+    decoder = json.JSONDecoder(strict=False)
     for idx in (i for i, ch in enumerate(text) if ch == "{"):
         try:
             _, end = decoder.raw_decode(text[idx:])
@@ -1324,6 +1373,7 @@ def _run_agentic_loop(
         Callable[[ChatResult, str, int], Optional[list[dict[str, Any]]]]
     ] = None,
     parses: Optional[Callable[[str], bool]] = None,
+    validation_label: str = "Patch validation failed",
 ) -> tuple[ChatResult, _AggregateMetrics]:
     """Run a tool-augmented chat loop until the model emits a final
     (non-tool) response, falling back to a final non-tool turn if the
@@ -1629,7 +1679,7 @@ def _run_agentic_loop(
             if emit is not None:
                 emit(
                     "log",
-                    f"Patch validation failed (correction "
+                    f"{validation_label} (correction "
                     f"{validation_retries}/{max_validation_retries}); "
                     "asking the model to fix it",
                 )
@@ -1849,7 +1899,7 @@ def _run_agentic_loop(
         if emit is not None:
             emit(
                 "log",
-                f"Patch validation failed (correction "
+                f"{validation_label} (correction "
                 f"{validation_retries}/{max_validation_retries}); "
                 "asking the model to fix it (no tools)",
             )
@@ -2240,6 +2290,7 @@ def prepare_review(
     diff_chunks, skipped = _build_annotated_diff_chunks(
         files, cfg.max_diff_chars, skip_paths
     )
+    diff_inventory = DiffInventory.from_files(files)
     if skipped:
         log.info(
             "Excluded %d file(s) per .ai/context-script: %s", len(skipped), skipped
@@ -2382,6 +2433,12 @@ def prepare_review(
             tool_env=tool_env,
             emit=_emit,
             prior_prompt_tokens=total_metrics.prompt_tokens,
+            # Without `parses`, a review that is not valid JSON skipped the
+            # salvage re-ask and failed the job outright.
+            parses=_parses_as_review,
+            validate=lambda c: _review_absence_feedback(c, diff_inventory, _emit),
+            max_validation_retries=1,
+            validation_label="Review check failed",
         )
         _merge_metrics(total_metrics, chunk_metrics)
 
@@ -2500,6 +2557,23 @@ def prepare_review(
             cfg, llm, summary, all_valid, metrics=total_metrics, emit=_emit
         )
         metrics_line = _format_aggregated_metrics(total_metrics)
+
+    # The model was already asked once to fix these (see _review_absence_feedback);
+    # anything still here is removed rather than published.
+    leftover = find_absence_claims(
+        {"summary": summary, "comments": all_valid}, diff_inventory
+    )
+    if leftover:
+        cleaned = strip_absence_claims(
+            {"summary": summary, "comments": all_valid}, leftover
+        )
+        summary, all_valid = cleaned["summary"], cleaned["comments"]
+        log.warning("Removed %d false 'not in the diff' finding(s)", len(leftover))
+        _emit(
+            "log",
+            f"Removed {len(leftover)} finding(s) claiming changed code is not in "
+            "the diff: " + ", ".join(sorted({c.name for c in leftover})),
+        )
 
     draft_comments: list[DraftComment] = []
     seen_comments: set[tuple[str, str, int, str]] = set()
