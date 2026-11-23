@@ -437,6 +437,11 @@ class Config:
     # is the un-condensed text we would have shipped anyway.
     task_comment_brevity: bool = True
     review_comment_brevity: bool = True
+    # One small tool-enabled check per review finding before the draft is
+    # stored; refuted findings are dropped (see :mod:`reviewbot.verify_findings`).
+    # Off by default: it costs one short agent loop per finding.
+    review_verify_findings: bool = False
+    review_verify_max_findings: int = 25
     # Column to wrap a rewritten comment at. Under ruff's line-length in both
     # repos we target, so the pass cannot introduce a line-too-long the
     # normalizer would then have to fix.
@@ -804,6 +809,8 @@ class Config:
             or None,
             task_comment_brevity=_bool_env("TASK_COMMENT_BREVITY", True),
             review_comment_brevity=_bool_env("REVIEW_COMMENT_BREVITY", True),
+            review_verify_findings=_bool_env("REVIEW_VERIFY_FINDINGS", False),
+            review_verify_max_findings=_int_env("REVIEW_VERIFY_MAX_FINDINGS", 25),
             comment_brevity_width=_int_env("COMMENT_BREVITY_WIDTH", 88),
             comment_brevity_min_chars=_int_env("COMMENT_BREVITY_MIN_CHARS", 100),
             comment_brevity_max_items=_int_env("COMMENT_BREVITY_MAX_ITEMS", 40),
