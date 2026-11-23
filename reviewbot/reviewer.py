@@ -1,6 +1,8 @@
+import copy
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
@@ -18,6 +20,17 @@ from .diff_claims import (
     strip_absence_claims,
 )
 from .github_client import GitHubClient
+from .verify_findings import (
+    VERIFY_SYSTEM_PROMPT,
+    Finding,
+    Verdict,
+    drop_refuted,
+    parse_verdict,
+    second_look,
+    split_findings,
+    verify_all,
+    verify_user_prompt,
+)
 from .llm_client import (
     ChatCompletionClient,
     ChatResult,
@@ -797,6 +810,89 @@ def merge_session_records(
     if part.get("stop_reason", STOP_ANSWERED) != STOP_ANSWERED:
         merged["stop_reason"] = part["stop_reason"]
     return merged
+
+
+def _verify_review_findings(
+    cfg: Config,
+    llm: ChatCompletionClient,
+    tool_env: ToolEnv,
+    summary: str,
+    comments: list[dict[str, Any]],
+    *,
+    repo: str,
+    number: int,
+    title: str,
+    changed_files: list[str],
+    metrics: "_AggregateMetrics",
+    emit: Optional[Callable[[str, str], None]] = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Check every finding against the code and drop the refuted ones (see
+    :mod:`reviewbot.verify_findings`). Fails open: any error keeps the review
+    as written."""
+    review = {"summary": summary, "comments": comments}
+    findings = split_findings(review)[: max(0, cfg.review_verify_max_findings)]
+    if not findings:
+        return summary, comments
+    if emit is not None:
+        emit("log", f"Verifying {len(findings)} finding(s) against the code…")
+    # A one-finding verdict needs a handful of reads, not a review's budget.
+    check_cfg = copy.copy(cfg)
+    check_cfg.tool_max_iterations = 8
+    check_cfg.llm_max_tokens = min(cfg.llm_max_tokens, 16384)
+    metrics_lock = threading.Lock()
+
+    def check(f: Finding) -> Optional[Verdict]:
+        chat, m = _run_agentic_loop(
+            llm,
+            [
+                {"role": "system", "content": VERIFY_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": verify_user_prompt(
+                        f,
+                        repo=repo,
+                        number=number,
+                        title=title,
+                        changed_files=changed_files,
+                    ),
+                },
+            ],
+            cfg=check_cfg,
+            tool_env=tool_env,
+            parses=lambda text: parse_verdict(text) is not None,
+        )
+        with metrics_lock:
+            _merge_metrics(metrics, m)
+        return parse_verdict(chat.content or "")
+
+    try:
+        verdicts = verify_all(findings, check)
+        again = second_look(findings, verdicts)
+        if again:
+            if emit is not None:
+                emit(
+                    "log",
+                    f"Re-checking {len(again)} finding(s) related to a refuted one…",
+                )
+            verdicts.update(verify_all(again, check))
+    except Exception:
+        log.warning("finding verification failed; keeping the review", exc_info=True)
+        return summary, comments
+    cleaned, dropped = drop_refuted(review, verdicts)
+    counts = {
+        v: sum(1 for x in verdicts.values() if x.verdict == v)
+        for v in ("confirmed", "refuted", "unverifiable")
+    }
+    log.info("finding verification: %s", counts)
+    if emit is not None:
+        emit(
+            "log",
+            f"Findings: {counts['confirmed']} confirmed, {counts['refuted']} refuted, "
+            f"{counts['unverifiable']} unverifiable; dropped {len(dropped)}",
+        )
+        for fid in dropped:
+            emit("log", f"Dropped {fid}: {verdicts[fid].evidence[:300]}")
+    return cleaned["summary"], cleaned["comments"]
 
 
 def _merge_metrics(total: "_AggregateMetrics", part: "_AggregateMetrics") -> None:
@@ -2551,6 +2647,22 @@ def prepare_review(
     _emit("log", f"LLM done: {metrics_line}")
 
     event = _merge_chunk_event(all_events, len(all_valid))
+
+    if cfg.review_verify_findings and tool_env is not None:
+        summary, all_valid = _verify_review_findings(
+            cfg,
+            llm,
+            tool_env,
+            summary,
+            all_valid,
+            repo=f"{req.owner}/{req.repo}",
+            number=req.number,
+            title=pr.get("title") or "",
+            changed_files=[f["filename"] for f in files if f.get("filename")],
+            metrics=total_metrics,
+            emit=_emit,
+        )
+        metrics_line = _format_aggregated_metrics(total_metrics)
 
     if cfg.review_comment_brevity and (summary.strip() or all_valid):
         summary = _condense_review(
