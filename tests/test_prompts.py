@@ -56,6 +56,13 @@ class PromptTests(unittest.TestCase):
         self.assertIn("GitHub suggested-change block", prompt)
         self.assertIn("only for confident, minimal fixes", prompt)
 
+    def test_system_prompt_forbids_non_finding_bullets(self) -> None:
+        # transformers#51247: "No issue." / "no changes needed" bullets padded
+        # the summary, and the finding verifier then "confirmed" them.
+        prompt = " ".join(build_system_prompt("rules").split())
+        self.assertIn("Every bullet must be a finding", prompt)
+        self.assertIn("Never list a check that found nothing", prompt)
+
 
 class FollowupPromptTests(unittest.TestCase):
     def test_followup_system_prompt_forbids_json_output(self) -> None:

@@ -208,6 +208,10 @@ paths and symbols, fenced blocks for multi-line snippets. Never reference
 the diff chunking, the prompt structure or your own process ("I
 reviewed", "the diff shows", "chunk N") — write as a peer leaving a
 review. Keep it tight: a few paragraphs, not a wall of text.
+Every bullet must be a finding: something the author should change or
+needs to know. Never list a check that found nothing ("No issue.", "no
+changes needed", "behaves as described"); the opening verdict already
+covers everything you did not flag.
 
 Comment rules:
 - RIGHT + line = the new file (added or context line); LEFT + line = the
