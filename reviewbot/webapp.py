@@ -1843,8 +1843,15 @@ def _webhook_publish_or_report(job: Job) -> None:
         )
         token = installation_token(cfg.github_app_id, cfg.github_private_key, iid)
         gh = GitHubClient(token)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         log.warning("webhook publish: token mint failed for %s", job.id, exc_info=True)
+        # No token, so no comment either; but the job must not look done.
+        if job.status != "error" and job.draft is not None:
+            job.status = "error"
+            job.error = (
+                f"review ready but not published: GitHub token mint failed "
+                f"({type(exc).__name__}); publish it from the review page"
+            )
         return
 
     if job.status == "error":
@@ -1868,8 +1875,55 @@ def _webhook_publish_or_report(job: Job) -> None:
             job.error = str(exc)
             if isinstance(req, ReviewRequest):
                 _post_webhook_failure_comment(gh, req, exc.user_message())
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # The draft is fine and can still be published from the UI; what
+            # must not happen is a job that looks done with nothing on the PR
+            # and nothing in the thread (transformers#51247, 2026-11-25: the
+            # trigger author waited six hours, then gave up).
             log.exception("webhook auto-publish failed for job %s", job.id)
+            job.status = "error"
+            job.error = (
+                f"review ready but publishing to GitHub failed "
+                f"({type(exc).__name__}); publish it from the review page"
+            )
+            _post_publish_failure_comment(gh, job, req)
+
+
+def _review_page_url(job: Job) -> Optional[str]:
+    """Absolute URL of the job's review page, from the OAuth callback's origin
+    (the one public URL serge is configured with). None when it is unset."""
+    base = cfg.github_oauth_callback_url or ""
+    parts = urllib.parse.urlsplit(base)
+    if not (parts.scheme and parts.netloc):
+        return None
+    return (
+        f"{parts.scheme}://{parts.netloc}/reviews/{job.target_owner}/"
+        f"{job.target_repo}/{job.target_number}/{job.id}"
+    )
+
+
+def _post_publish_failure_comment(
+    gh: GitHubClient, job: Job, req: Optional[ReviewRequest]
+) -> None:
+    """Tell the PR thread a finished review could not be posted. Works without
+    the in-memory request too (a serge restart between launch and callback
+    drops ``_pod_tasks``): the job row carries the target."""
+    url = _review_page_url(job)
+    message = job.error or "review ready but publishing to GitHub failed"
+    if url:
+        message += f": {url}"
+    if isinstance(req, ReviewRequest):
+        _post_webhook_failure_comment(gh, req, message)
+        return
+    try:
+        gh.post_issue_comment(
+            job.target_owner,
+            job.target_repo,
+            job.target_number,
+            f"⚠️ Serge review failed: {message}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("failed to post publish-failure comment for %s: %s", job.id, exc)
 
 
 def _notify_task_finished(worker_cfg: Config, req: TaskRequest, job: Job) -> None:

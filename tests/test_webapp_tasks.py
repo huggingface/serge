@@ -5,6 +5,7 @@ we assert the route's accept/reject behavior and that an accepted task is
 queued."""
 
 import contextlib
+import dataclasses
 import importlib
 import json
 import os
@@ -14,7 +15,7 @@ import tempfile
 import types
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 try:
     from fastapi.testclient import TestClient
@@ -1202,6 +1203,56 @@ class TaskLauncherTests(unittest.TestCase):
         task = webapp._pod_tasks[job.id]
         self.assertEqual(task.backend, "kubernetes")
         self.assertEqual(task.job_name, "serge-task-rev")
+
+    def _webhook_review_with_draft(self, webapp):
+        job = self._review_job(webapp)
+        job.source = "webhook"
+        job.status = "done"
+        job.draft = webapp.decode_draft(
+            '{"owner":"acme","repo":"widgets","number":7,"head_sha":"abc",'
+            '"summary":"looks fine","event":"COMMENT","comments":[]}'
+        )
+        return job
+
+    def test_webhook_publish_failure_marks_error_and_comments(self):
+        # transformers#51247: the draft was ready, publishing raised, and the
+        # job stayed "done" with nothing on the PR and nothing in the thread.
+        webapp = self._import_webapp(REVIEW_EXECUTION="kubernetes")
+        job = self._webhook_review_with_draft(webapp)
+        gh = MagicMock()
+        cfg = dataclasses.replace(
+            webapp.cfg,
+            github_oauth_callback_url="https://serge.example/auth/callback",
+        )
+        with (
+            patch.object(webapp, "cfg", cfg),
+            patch.object(webapp, "installation_id_for_repo", return_value=1),
+            patch.object(webapp, "installation_token", return_value="t"),
+            patch.object(webapp, "GitHubClient", return_value=gh),
+            patch.object(
+                webapp, "publish_review", side_effect=RuntimeError("422 boom")
+            ),
+        ):
+            webapp._webhook_publish_or_report(job)
+
+        self.assertEqual(job.status, "error")
+        self.assertIn("RuntimeError", job.error)
+        # No in-memory request (as after a serge restart): still comments,
+        # from the job row's target, with a link to the draft.
+        gh.post_issue_comment.assert_called_once()
+        owner, repo, number, body = gh.post_issue_comment.call_args.args
+        self.assertEqual((owner, repo, number), ("acme", "widgets", 7))
+        self.assertIn("https://serge.example/reviews/acme/widgets/7/rev123abc456", body)
+
+    def test_webhook_token_mint_failure_marks_error(self):
+        webapp = self._import_webapp(REVIEW_EXECUTION="kubernetes")
+        job = self._webhook_review_with_draft(webapp)
+        with patch.object(
+            webapp, "installation_id_for_repo", side_effect=RuntimeError("down")
+        ):
+            webapp._webhook_publish_or_report(job)
+        self.assertEqual(job.status, "error")
+        self.assertIn("token mint failed", job.error)
 
     def test_finalize_review_does_not_slack_notify(self):
         # Reviews carry a ReviewRequest (no slack fields); finalize must persist
